@@ -1991,6 +1991,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.0.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a261afc61b7a5e323933b402ca6a1765183687c614789b1e4db7762ed4230bca"
+dependencies = [
+ "compiler_builtins",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "lld-wrapper"
 version = "0.1.0"
 
@@ -4718,6 +4728,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "0.27.2-alpha.0"
+source = "git+https://github.com/bytecodealliance/rustix?branch=rustc-dep-of-std#077478c029b7f2b8e1288d4db62f9a059917dffb"
+dependencies = [
+ "bitflags",
+ "compiler_builtins",
+ "linux-raw-sys",
+ "rustc-std-workspace-alloc",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5015,6 +5037,7 @@ dependencies = [
  "profiler_builtins",
  "rand 0.7.3",
  "rustc-demangle",
+ "rustix",
  "std_detect",
  "unwind",
  "wasi",
