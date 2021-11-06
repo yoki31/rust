@@ -290,21 +290,21 @@ impl FileAttr {
 #[cfg(target_os = "netbsd")]
 impl FileAttr {
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_mtime as libc::time_t,
             tv_nsec: self.stat.st_mtimensec as libc::c_long,
         }))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_atime as libc::time_t,
             tv_nsec: self.stat.st_atimensec as libc::c_long,
         }))
     }
 
     pub fn created(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_birthtime as libc::time_t,
             tv_nsec: self.stat.st_birthtimensec as libc::c_long,
         }))
@@ -315,7 +315,7 @@ impl FileAttr {
 impl FileAttr {
     #[cfg(all(not(target_os = "vxworks"), not(target_os = "espidf")))]
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_mtime as libc::time_t,
             tv_nsec: self.stat.st_mtime_nsec as _,
         }))
@@ -323,7 +323,7 @@ impl FileAttr {
 
     #[cfg(any(target_os = "vxworks", target_os = "espidf"))]
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_mtime as libc::time_t,
             tv_nsec: 0,
         }))
@@ -331,7 +331,7 @@ impl FileAttr {
 
     #[cfg(all(not(target_os = "vxworks"), not(target_os = "espidf")))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_atime as libc::time_t,
             tv_nsec: self.stat.st_atime_nsec as _,
         }))
@@ -339,7 +339,7 @@ impl FileAttr {
 
     #[cfg(any(target_os = "vxworks", target_os = "espidf"))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_atime as libc::time_t,
             tv_nsec: 0,
         }))
@@ -352,7 +352,7 @@ impl FileAttr {
         target_os = "ios"
     ))]
     pub fn created(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::from(libc::timespec {
+        Ok(SystemTime::from(rustix::time::Timespec {
             tv_sec: self.stat.st_birthtime as libc::time_t,
             tv_nsec: self.stat.st_birthtime_nsec as libc::c_long,
         }))
@@ -368,7 +368,7 @@ impl FileAttr {
         cfg_has_statx! {
             if let Some(ext) = &self.statx_extra_fields {
                 return if (ext.stx_mask & libc::STATX_BTIME) != 0 {
-                    Ok(SystemTime::from(libc::timespec {
+                    Ok(SystemTime::from(rustix::time::Timespec {
                         tv_sec: ext.stx_btime.tv_sec as libc::time_t,
                         tv_nsec: ext.stx_btime.tv_nsec as _,
                     }))

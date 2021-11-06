@@ -10,12 +10,12 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 #[derive(Copy, Clone)]
 struct Timespec {
-    t: libc::timespec,
+    t: rustix::time::Timespec,
 }
 
 impl Timespec {
     const fn zero() -> Timespec {
-        Timespec { t: libc::timespec { tv_sec: 0, tv_nsec: 0 } }
+        Timespec { t: rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 } }
     }
 
     fn sub_timespec(&self, other: &Timespec) -> Result<Duration, Duration> {
@@ -65,7 +65,7 @@ impl Timespec {
             nsec -= NSEC_PER_SEC as u32;
             secs = secs.checked_add(1)?;
         }
-        Some(Timespec { t: libc::timespec { tv_sec: secs, tv_nsec: nsec as _ } })
+        Some(Timespec { t: rustix::time::Timespec { tv_sec: secs, tv_nsec: nsec as _ } })
     }
 
     fn checked_sub_duration(&self, other: &Duration) -> Option<Timespec> {
@@ -81,7 +81,7 @@ impl Timespec {
             nsec += NSEC_PER_SEC as i32;
             secs = secs.checked_sub(1)?;
         }
-        Some(Timespec { t: libc::timespec { tv_sec: secs, tv_nsec: nsec as _ } })
+        Some(Timespec { t: rustix::time::Timespec { tv_sec: secs, tv_nsec: nsec as _ } })
     }
 }
 
@@ -202,15 +202,15 @@ mod inner {
 
     impl From<libc::timeval> for SystemTime {
         fn from(t: libc::timeval) -> SystemTime {
-            SystemTime::from(libc::timespec {
+            SystemTime::from(rustix::time::Timespec {
                 tv_sec: t.tv_sec,
                 tv_nsec: (t.tv_usec * 1000) as libc::c_long,
             })
         }
     }
 
-    impl From<libc::timespec> for SystemTime {
-        fn from(t: libc::timespec) -> SystemTime {
+    impl From<rustix::time::Timespec> for SystemTime {
+        fn from(t: rustix::time::Timespec) -> SystemTime {
             SystemTime { t: Timespec { t } }
         }
     }
@@ -274,7 +274,6 @@ mod inner {
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 mod inner {
     use crate::fmt;
-    use crate::sys::cvt;
     use crate::time::Duration;
 
     use super::Timespec;
@@ -293,7 +292,7 @@ mod inner {
 
     impl Instant {
         pub fn now() -> Instant {
-            Instant { t: now(libc::CLOCK_MONOTONIC) }
+            Instant { t: now(rustix::time::ClockId::Monotonic) }
         }
 
         pub const fn zero() -> Instant {
@@ -331,7 +330,7 @@ mod inner {
 
     impl SystemTime {
         pub fn now() -> SystemTime {
-            SystemTime { t: now(libc::CLOCK_REALTIME) }
+            SystemTime { t: now(rustix::time::ClockId::Realtime) }
         }
 
         pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
@@ -347,8 +346,8 @@ mod inner {
         }
     }
 
-    impl From<libc::timespec> for SystemTime {
-        fn from(t: libc::timespec) -> SystemTime {
+    impl From<rustix::time::Timespec> for SystemTime {
+        fn from(t: rustix::time::Timespec) -> SystemTime {
             SystemTime { t: Timespec { t } }
         }
     }
@@ -362,14 +361,7 @@ mod inner {
         }
     }
 
-    #[cfg(not(any(target_os = "dragonfly", target_os = "espidf")))]
-    pub type clock_t = libc::c_int;
-    #[cfg(any(target_os = "dragonfly", target_os = "espidf"))]
-    pub type clock_t = libc::c_ulong;
-
-    fn now(clock: clock_t) -> Timespec {
-        let mut t = Timespec { t: libc::timespec { tv_sec: 0, tv_nsec: 0 } };
-        cvt(unsafe { libc::clock_gettime(clock, &mut t.t) }).unwrap();
-        t
+    fn now(clock: rustix::time::ClockId) -> Timespec {
+        Timespec { t: rustix::time::clock_gettime(clock) }
     }
 }
