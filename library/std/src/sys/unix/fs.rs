@@ -46,7 +46,7 @@ use libc::fstatat64;
 use libc::readdir_r as readdir64_r;
 #[cfg(target_os = "android")]
 use libc::{
-    dirent as dirent64, fstat as fstat64, fstatat as fstatat64, lseek64, lstat as lstat64,
+    dirent as dirent64, fstat as fstat64, fstatat as fstatat64, lstat as lstat64,
     open as open64, stat as stat64,
 };
 #[cfg(not(any(
@@ -56,12 +56,12 @@ use libc::{
     target_os = "android"
 )))]
 use libc::{
-    dirent as dirent64, fstat as fstat64, ftruncate as ftruncate64, lseek as lseek64,
+    dirent as dirent64, fstat as fstat64, ftruncate as ftruncate64,
     lstat as lstat64, off_t as off64_t, open as open64, stat as stat64,
 };
 #[cfg(any(target_os = "linux", target_os = "emscripten", target_os = "l4re"))]
 use libc::{
-    dirent64, fstat64, ftruncate64, lseek64, lstat64, off64_t, open64, readdir64_r, stat64,
+    dirent64, fstat64, ftruncate64, lstat64, off64_t, open64, readdir64_r, stat64,
 };
 
 pub use crate::sys_common::fs::{remove_dir_all, try_exists};
@@ -886,14 +886,7 @@ impl File {
     }
 
     pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
-        let (whence, pos) = match pos {
-            // Casting to `i64` is fine, too large values will end up as
-            // negative which will cause an error in `lseek64`.
-            SeekFrom::Start(off) => (libc::SEEK_SET, off as i64),
-            SeekFrom::End(off) => (libc::SEEK_END, off),
-            SeekFrom::Current(off) => (libc::SEEK_CUR, off),
-        };
-        let n = cvt(unsafe { lseek64(self.as_raw_fd(), pos, whence) })?;
+        let n = rustix::fs::seek(self, pos)?;
         Ok(n as u64)
     }
 
