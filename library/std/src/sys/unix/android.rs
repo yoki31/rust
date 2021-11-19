@@ -82,34 +82,6 @@ pub unsafe fn signal(signum: c_int, handler: sighandler_t) -> sighandler_t {
     f(signum, handler)
 }
 
-// The `ftruncate64` symbol apparently appeared in android-12, so we do some
-// dynamic detection to see if we can figure out whether `ftruncate64` exists.
-//
-// If it doesn't we just fall back to `ftruncate`, generating an error for
-// too-large values.
-#[cfg(target_pointer_width = "32")]
-pub fn ftruncate64(fd: c_int, size: u64) -> io::Result<()> {
-    weak!(fn ftruncate64(c_int, i64) -> c_int);
-
-    unsafe {
-        match ftruncate64.get() {
-            Some(f) => cvt_r(|| f(fd, size as i64)).map(drop),
-            None => {
-                if size > i32::MAX as u64 {
-                    Err(io::Error::new_const(io::ErrorKind::InvalidInput, &"cannot truncate >2GB"))
-                } else {
-                    cvt_r(|| ftruncate(fd, size as i32)).map(drop)
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-pub fn ftruncate64(fd: c_int, size: u64) -> io::Result<()> {
-    unsafe { cvt_r(|| ftruncate(fd, size as i64)).map(drop) }
-}
-
 #[cfg(target_pointer_width = "32")]
 pub unsafe fn cvt_pread64(
     fd: c_int,
