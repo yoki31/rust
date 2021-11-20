@@ -304,13 +304,15 @@ impl Command {
             if let Some(u) = self.get_uid() {
                 // When dropping privileges from root, the `setgroups` call
                 // will remove any extraneous groups. We only drop groups
-                // if the current uid is 0 and we weren't given an explicit
+                // if the current uid is ROOT and we weren't given an explicit
                 // set of groups. If we don't call this, then even though our
                 // uid has dropped, we may still have groups that enable us to
                 // do super-user things.
                 //FIXME: Redox kernel does not support setgroups yet
                 #[cfg(not(target_os = "redox"))]
-                if libc::getuid() == 0 && self.get_groups().is_none() {
+                if rustix::process::getuid() == rustix::process::Uid::ROOT
+                    && self.get_groups().is_none()
+                {
                     cvt(libc::setgroups(0, ptr::null()))?;
                 }
                 cvt(libc::setuid(u as uid_t))?;
@@ -513,7 +515,7 @@ impl Command {
                 ))?;
             }
             if let Some((f, cwd)) = addchdir {
-                cvt_nz(f(file_actions.0.as_mut_ptr(), cwd.as_ptr()))?;
+                cvt_nz(f(file_actions.0.as_mut_ptr(), cwd.as_ptr().cast()))?;
             }
 
             let mut set = MaybeUninit::<libc::sigset_t>::uninit();

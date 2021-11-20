@@ -81,29 +81,23 @@ pub unsafe fn init(argc: isize, argv: *const *const u8) {
                 target_os = "ios",
                 target_os = "redox",
             )))] {
-                use crate::sys::os::errno;
-                let pfds: &mut [_] = &mut [
-                    libc::pollfd { fd: 0, events: 0, revents: 0 },
-                    libc::pollfd { fd: 1, events: 0, revents: 0 },
-                    libc::pollfd { fd: 2, events: 0, revents: 0 },
+                use rustix::io::{PollFd, PollFlags};
+                use rustix::fs::{OFlags, Mode};
+                let mut pfds = [
+                    PollFd::from_borrowed_fd(rustix::io::stdin(), PollFlags::empty()),
+                    PollFd::from_borrowed_fd(rustix::io::stdout(), PollFlags::empty()),
+                    PollFd::from_borrowed_fd(rustix::io::stderr(), PollFlags::empty()),
                 ];
-                while libc::poll(pfds.as_mut_ptr(), 3, 0) == -1 {
-                    if errno() == libc::EINTR {
-                        continue;
-                    }
-                    libc::abort();
-                }
+                rustix::io::with_retrying(|| rustix::io::poll(&mut pfds, 0)).unwrap();
                 for pfd in pfds {
-                    if pfd.revents & libc::POLLNVAL == 0 {
+                    if !pfd.revents().contains(PollFlags::NVAL) {
                         continue;
                     }
-                    if libc::open("/dev/null\0".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
-                        // If the stream is closed but we failed to reopen it, abort the
-                        // process. Otherwise we wouldn't preserve the safety of
-                        // operations on the corresponding Rust object Stdin, Stdout, or
-                        // Stderr.
-                        libc::abort();
-                    }
+                    // If the stream is closed but we failed to reopen it, abort the
+                    // process. Otherwise we wouldn't preserve the safety of
+                    // operations on the corresponding Rust object Stdin, Stdout, or
+                    // Stderr.
+                    rustix::fs::openat(&rustix::fs::cwd(), rustix::zstr!("/dev/null"), OFlags::RDWR, Mode::empty()).unwrap();
                 }
             } else if #[cfg(any(target_os = "macos", target_os = "ios", target_os = "redox"))] {
                 use crate::sys::os::errno;
