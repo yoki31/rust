@@ -48,7 +48,10 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+mod fd;
+mod raw;
+
 #[unstable(feature = "io_safety", issue = "87074")]
-pub use crate::os::fd::owned::{AsFd, BorrowedFd, OwnedFd};
+pub use fd::*;
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::os::fd::raw::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+pub use raw::*;

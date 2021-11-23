@@ -308,6 +308,12 @@ impl IntoInner<OwnedFd> for FileDesc {
     }
 }
 
+impl FromInner<rustix::io::OwnedFd> for FileDesc {
+    fn from_inner(owned_fd: rustix::io::OwnedFd) -> Self {
+        Self(OwnedFd::from_inner(owned_fd))
+    }
+}
+
 impl FromInner<OwnedFd> for FileDesc {
     fn from_inner(owned_fd: OwnedFd) -> Self {
         Self(owned_fd)

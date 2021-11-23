@@ -315,6 +315,7 @@ pub mod iter;
 pub mod lazy;
 pub mod net;
 pub mod option;
+pub mod os;
 pub mod panic;
 pub mod panicking;
 pub mod pin;
