@@ -91,7 +91,7 @@ impl Command {
             // we want to be sure we *don't* run at_exit destructors as
             // we're being torn down regardless
             rtassert!(output.write(&bytes).is_ok());
-            unsafe { libc::_exit(1) }
+            rustix::process::exit_group(1);
         }
 
         drop(env_lock);
