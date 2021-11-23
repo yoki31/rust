@@ -119,6 +119,7 @@
 #![feature(receiver_trait)]
 #![feature(set_ptr_value)]
 #![feature(slice_group_by)]
+#![feature(slice_internals)]
 #![feature(slice_ptr_get)]
 #![feature(slice_ptr_len)]
 #![feature(slice_range)]
@@ -194,6 +195,7 @@ mod boxed {
 }
 pub mod borrow;
 pub mod collections;
+pub mod ffi;
 pub mod fmt;
 pub mod rc;
 pub mod slice;

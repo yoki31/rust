@@ -404,3 +404,25 @@ extern "rust-intrinsic" {
     /// argument `ap` points to.
     fn va_arg<T: sealed_trait::VaArgSafe>(ap: &mut VaListImpl<'_>) -> T;
 }
+
+mod z_str;
+
+#[stable(feature = "cstr_from_bytes", since = "1.10.0")]
+pub use z_str::FromBytesWithNulError;
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use z_str::ZStr;
+
+/// C-like `strlen`.
+unsafe fn strlen(mut s: *const u8) -> usize {
+    // In theory, compilers should be able to pattern-match this and replace
+    // it with whatever's optimal on the platform, so that we don't need to
+    // explicitly depend on libc.
+    let mut len = 0;
+    unsafe {
+        while *s != b'\0' {
+            len += 1;
+            s = s.add(1);
+        }
+    }
+    len
+}
