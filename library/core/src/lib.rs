@@ -311,6 +311,7 @@ pub mod cell;
 pub mod char;
 pub mod ffi;
 pub mod iter;
+pub mod io;
 #[unstable(feature = "once_cell", issue = "74465")]
 pub mod lazy;
 pub mod net;

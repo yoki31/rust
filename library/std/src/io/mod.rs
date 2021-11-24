@@ -1897,7 +1897,7 @@ pub trait Seek {
 ///
 /// It is used by the [`Seek`] trait.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use rustix::io::SeekFrom;
+pub use core::io::SeekFrom;
 
 fn read_until<R: BufRead + ?Sized>(r: &mut R, delim: u8, buf: &mut Vec<u8>) -> Result<usize> {
     let mut read = 0;
