@@ -1,6 +1,11 @@
-// run-rustfix
 #![warn(clippy::option_if_let_else)]
-#![allow(clippy::redundant_closure, clippy::ref_option_ref, clippy::equatable_if_let)]
+#![allow(
+    unused_tuple_struct_fields,
+    clippy::ref_option_ref,
+    clippy::equatable_if_let,
+    clippy::let_unit_value,
+    clippy::redundant_locals
+)]
 
 fn bad1(string: Option<&str>) -> (bool, &str) {
     if let Some(x) = string {
@@ -27,7 +32,7 @@ fn unop_bad(string: &Option<&str>, mut num: Option<i32>) {
         *s += 1;
         s
     } else {
-        &mut 0
+        &0
     };
     let _ = if let Some(ref s) = num { s } else { &0 };
     let _ = if let Some(mut s) = num {
@@ -40,7 +45,7 @@ fn unop_bad(string: &Option<&str>, mut num: Option<i32>) {
         *s += 1;
         s
     } else {
-        &mut 0
+        &0
     };
 }
 
@@ -94,6 +99,43 @@ fn negative_tests(arg: Option<u32>) -> u32 {
     7
 }
 
+// #7973
+fn pattern_to_vec(pattern: &str) -> Vec<String> {
+    pattern
+        .trim_matches('/')
+        .split('/')
+        .flat_map(|s| {
+            if let Some(idx) = s.find('.') {
+                vec![s[..idx].to_string(), s[idx..].to_string()]
+            } else {
+                vec![s.to_string()]
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+// #10335
+fn test_result_impure_else(variable: Result<u32, &str>) {
+    if let Ok(binding) = variable {
+        println!("Ok {binding}");
+    } else {
+        println!("Err");
+    }
+}
+
+enum DummyEnum {
+    One(u8),
+    Two,
+}
+
+// should not warn since there is a complex subpat
+// see #7991
+fn complex_subpat() -> DummyEnum {
+    let x = Some(DummyEnum::One(1));
+    let _ = if let Some(_one @ DummyEnum::One(..)) = x { 1 } else { 2 };
+    DummyEnum::Two
+}
+
 fn main() {
     let optional = Some(5);
     let _ = if let Some(x) = optional { x + 2 } else { 5 };
@@ -102,6 +144,7 @@ fn main() {
     unop_bad(&None, None);
     let _ = longer_body(None);
     test_map_or_else(None);
+    test_result_impure_else(Ok(42));
     let _ = negative_tests(None);
     let _ = impure_else(None);
 
@@ -171,4 +214,77 @@ fn main() {
         // Don't lint. `await` can't be moved into a closure.
         let _ = if let Some(x) = Some(0) { _f1(x).await } else { 0 };
     }
+
+    let _ = pattern_to_vec("hello world");
+    let _ = complex_subpat();
+
+    // issue #8492
+    let _ = match s {
+        Some(string) => string.len(),
+        None => 1,
+    };
+    let _ = match Some(10) {
+        Some(a) => a + 1,
+        None => 5,
+    };
+
+    let res: Result<i32, i32> = Ok(5);
+    let _ = match res {
+        Ok(a) => a + 1,
+        _ => 1,
+    };
+    let _ = match res {
+        Err(_) => 1,
+        Ok(a) => a + 1,
+    };
+    let _ = if let Ok(a) = res { a + 1 } else { 5 };
+}
+
+#[allow(dead_code)]
+fn issue9742() -> Option<&'static str> {
+    // should not lint because of guards
+    match Some("foo  ") {
+        Some(name) if name.starts_with("foo") => Some(name.trim()),
+        _ => None,
+    }
+}
+
+mod issue10729 {
+    #![allow(clippy::unit_arg, dead_code)]
+
+    pub fn reproduce(initial: &Option<String>) {
+        // 👇 needs `.as_ref()` because initial is an `&Option<_>`
+        match initial {
+            Some(value) => do_something(value),
+            None => {},
+        }
+    }
+
+    pub fn reproduce2(initial: &mut Option<String>) {
+        match initial {
+            Some(value) => do_something2(value),
+            None => {},
+        }
+    }
+
+    fn do_something(_value: &str) {}
+    fn do_something2(_value: &mut str) {}
+}
+
+fn issue11429() {
+    use std::collections::HashMap;
+
+    macro_rules! new_map {
+        () => {{ HashMap::new() }};
+    }
+
+    let opt: Option<HashMap<u8, u8>> = None;
+
+    let mut _hashmap = if let Some(hm) = &opt {
+        hm.clone()
+    } else {
+        HashMap::new()
+    };
+
+    let mut _hm = if let Some(hm) = &opt { hm.clone() } else { new_map!() };
 }

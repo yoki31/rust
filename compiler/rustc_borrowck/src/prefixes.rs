@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 //! From the NLL RFC: "The deep [aka 'supporting'] prefixes for an
 //! place are formed by stripping away fields and derefs, except that
 //! we stop when we reach the deref of a shared reference. [...] "
@@ -81,10 +83,14 @@ impl<'cx, 'tcx> Iterator for Prefixes<'cx, 'tcx> {
                         }
                         ProjectionElem::Downcast(..)
                         | ProjectionElem::Subslice { .. }
+                        | ProjectionElem::OpaqueCast { .. }
                         | ProjectionElem::ConstantIndex { .. }
                         | ProjectionElem::Index(_) => {
                             cursor = cursor_base;
                             continue 'cursor;
+                        }
+                        ProjectionElem::Subtype(..) => {
+                            panic!("Subtype projection is not allowed before borrow check")
                         }
                         ProjectionElem::Deref => {
                             // (handled below)

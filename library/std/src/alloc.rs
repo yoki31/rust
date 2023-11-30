@@ -42,8 +42,6 @@
 //! [`GlobalAlloc`] trait. This type can be provided by an external library:
 //!
 //! ```rust,ignore (demonstrates crates.io usage)
-//! extern crate jemallocator;
-//!
 //! use jemallocator::Jemalloc;
 //!
 //! #[global_allocator]
@@ -70,7 +68,10 @@ pub use alloc_crate::alloc::*;
 /// The default memory allocator provided by the operating system.
 ///
 /// This is based on `malloc` on Unix platforms and `HeapAlloc` on Windows,
-/// plus related functions.
+/// plus related functions. However, it is not valid to mix use of the backing
+/// system allocator with `System`, as this implementation may include extra
+/// work, such as to serve alignment requests greater than the alignment
+/// provided directly by the backing system allocator.
 ///
 /// This type implements the `GlobalAlloc` trait and Rust programs by default
 /// work as if they had this definition:
@@ -83,7 +84,7 @@ pub use alloc_crate::alloc::*;
 ///
 /// fn main() {
 ///     let a = Box::new(4); // Allocates from the system allocator.
-///     println!("{}", a);
+///     println!("{a}");
 /// }
 /// ```
 ///
@@ -92,7 +93,7 @@ pub use alloc_crate::alloc::*;
 ///
 /// ```rust
 /// use std::alloc::{System, GlobalAlloc, Layout};
-/// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+/// use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 ///
 /// struct Counter;
 ///
@@ -102,14 +103,14 @@ pub use alloc_crate::alloc::*;
 ///     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 ///         let ret = System.alloc(layout);
 ///         if !ret.is_null() {
-///             ALLOCATED.fetch_add(layout.size(), SeqCst);
+///             ALLOCATED.fetch_add(layout.size(), Relaxed);
 ///         }
-///         return ret
+///         ret
 ///     }
 ///
 ///     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 ///         System.dealloc(ptr, layout);
-///         ALLOCATED.fetch_sub(layout.size(), SeqCst);
+///         ALLOCATED.fetch_sub(layout.size(), Relaxed);
 ///     }
 /// }
 ///
@@ -117,7 +118,7 @@ pub use alloc_crate::alloc::*;
 /// static A: Counter = Counter;
 ///
 /// fn main() {
-///     println!("allocated bytes before main: {}", ALLOCATED.load(SeqCst));
+///     println!("allocated bytes before main: {}", ALLOCATED.load(Relaxed));
 /// }
 /// ```
 ///
@@ -189,7 +190,7 @@ impl System {
             old_size => unsafe {
                 let new_ptr = self.alloc_impl(new_layout, zeroed)?;
                 ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_mut_ptr(), old_size);
-                Allocator::deallocate(&self, ptr, old_layout);
+                Allocator::deallocate(self, ptr, old_layout);
                 Ok(new_ptr)
             },
         }
@@ -256,7 +257,7 @@ unsafe impl Allocator for System {
         match new_layout.size() {
             // SAFETY: conditions must be upheld by the caller
             0 => unsafe {
-                Allocator::deallocate(&self, ptr, old_layout);
+                Allocator::deallocate(self, ptr, old_layout);
                 Ok(NonNull::slice_from_raw_parts(new_layout.dangling(), 0))
             },
 
@@ -276,9 +277,9 @@ unsafe impl Allocator for System {
             // `new_ptr`. Thus, the call to `copy_nonoverlapping` is safe. The safety contract
             // for `dealloc` must be upheld by the caller.
             new_size => unsafe {
-                let new_ptr = Allocator::allocate(&self, new_layout)?;
+                let new_ptr = Allocator::allocate(self, new_layout)?;
                 ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_mut_ptr(), new_size);
-                Allocator::deallocate(&self, ptr, old_layout);
+                Allocator::deallocate(self, ptr, old_layout);
                 Ok(new_ptr)
             },
         }
@@ -289,15 +290,43 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Registers a custom allocation error hook, replacing any that was previously registered.
 ///
-/// The allocation error hook is invoked when an infallible memory allocation fails, before
-/// the runtime aborts. The default hook prints a message to standard error,
-/// but this behavior can be customized with the [`set_alloc_error_hook`] and
-/// [`take_alloc_error_hook`] functions.
+/// The allocation error hook is invoked when an infallible memory allocation fails — that is,
+/// as a consequence of calling [`handle_alloc_error`] — before the runtime aborts.
 ///
-/// The hook is provided with a `Layout` struct which contains information
+/// The allocation error hook is a global resource. [`take_alloc_error_hook`] may be used to
+/// retrieve a previously registered hook and wrap or discard it.
+///
+/// # What the provided `hook` function should expect
+///
+/// The hook function is provided with a [`Layout`] struct which contains information
 /// about the allocation that failed.
 ///
-/// The allocation error hook is a global resource.
+/// The hook function may choose to panic or abort; in the event that it returns normally, this
+/// will cause an immediate abort.
+///
+/// Since [`take_alloc_error_hook`] is a safe function that allows retrieving the hook, the hook
+/// function must be _sound_ to call even if no memory allocations were attempted.
+///
+/// # The default hook
+///
+/// The default hook, used if [`set_alloc_error_hook`] is never called, prints a message to
+/// standard error (and then returns, causing the runtime to abort the process).
+/// Compiler options may cause it to panic instead, and the default behavior may be changed
+/// to panicking in future versions of Rust.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(alloc_error_hook)]
+///
+/// use std::alloc::{Layout, set_alloc_error_hook};
+///
+/// fn custom_alloc_error_hook(layout: Layout) {
+///    panic!("memory allocation of {} bytes failed", layout.size());
+/// }
+///
+/// set_alloc_error_hook(custom_alloc_error_hook);
+/// ```
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn set_alloc_error_hook(hook: fn(Layout)) {
     HOOK.store(hook as *mut (), Ordering::SeqCst);
@@ -315,7 +344,17 @@ pub fn take_alloc_error_hook() -> fn(Layout) {
 }
 
 fn default_alloc_error_hook(layout: Layout) {
-    rtprintpanic!("memory allocation of {} bytes failed\n", layout.size());
+    extern "Rust" {
+        // This symbol is emitted by rustc next to __rust_alloc_error_handler.
+        // Its value depends on the -Zoom={panic,abort} compiler option.
+        static __rust_alloc_error_handler_should_panic: u8;
+    }
+
+    if unsafe { __rust_alloc_error_handler_should_panic != 0 } {
+        panic!("memory allocation of {} bytes failed", layout.size());
+    } else {
+        rtprintpanic!("memory allocation of {} bytes failed\n", layout.size());
+    }
 }
 
 #[cfg(not(test))]

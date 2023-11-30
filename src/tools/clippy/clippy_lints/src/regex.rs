@@ -1,13 +1,15 @@
+use std::fmt::Display;
+
 use clippy_utils::consts::{constant, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
-use clippy_utils::{match_def_path, paths};
-use if_chain::if_chain;
+use clippy_utils::source::snippet_opt;
+use clippy_utils::{def_path_def_ids, path_def_id, paths};
 use rustc_ast::ast::{LitKind, StrStyle};
+use rustc_hir::def_id::DefIdMap;
 use rustc_hir::{BorrowKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::source_map::{BytePos, Span};
-use std::convert::TryFrom;
+use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -20,8 +22,9 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```ignore
-    /// Regex::new("|")
+    /// Regex::new("(")
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub INVALID_REGEX,
     correctness,
     "invalid regular expressions"
@@ -46,79 +49,138 @@ declare_clippy_lint! {
     /// ```ignore
     /// Regex::new("^foobar")
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub TRIVIAL_REGEX,
     nursery,
     "trivial regular expressions"
 }
 
-declare_lint_pass!(Regex => [INVALID_REGEX, TRIVIAL_REGEX]);
+#[derive(Copy, Clone)]
+enum RegexKind {
+    Unicode,
+    UnicodeSet,
+    Bytes,
+    BytesSet,
+}
+
+#[derive(Default)]
+pub struct Regex {
+    definitions: DefIdMap<RegexKind>,
+}
+
+impl_lint_pass!(Regex => [INVALID_REGEX, TRIVIAL_REGEX]);
 
 impl<'tcx> LateLintPass<'tcx> for Regex {
+    fn check_crate(&mut self, cx: &LateContext<'tcx>) {
+        // We don't use `match_def_path` here because that relies on matching the exact path, which changed
+        // between regex 1.8 and 1.9
+        //
+        // `def_path_def_ids` will resolve through re-exports but is relatively heavy, so we only perform
+        // the operation once and store the results
+        let mut resolve = |path, kind| {
+            for id in def_path_def_ids(cx, path) {
+                self.definitions.insert(id, kind);
+            }
+        };
+
+        resolve(&paths::REGEX_NEW, RegexKind::Unicode);
+        resolve(&paths::REGEX_BUILDER_NEW, RegexKind::Unicode);
+        resolve(&paths::REGEX_SET_NEW, RegexKind::UnicodeSet);
+        resolve(&paths::REGEX_BYTES_NEW, RegexKind::Bytes);
+        resolve(&paths::REGEX_BYTES_BUILDER_NEW, RegexKind::Bytes);
+        resolve(&paths::REGEX_BYTES_SET_NEW, RegexKind::BytesSet);
+    }
+
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if_chain! {
-            if let ExprKind::Call(fun, args) = expr.kind;
-            if let ExprKind::Path(ref qpath) = fun.kind;
-            if args.len() == 1;
-            if let Some(def_id) = cx.qpath_res(qpath, fun.hir_id).opt_def_id();
-            then {
-                if match_def_path(cx, def_id, &paths::REGEX_NEW) ||
-                   match_def_path(cx, def_id, &paths::REGEX_BUILDER_NEW) {
-                    check_regex(cx, &args[0], true);
-                } else if match_def_path(cx, def_id, &paths::REGEX_BYTES_NEW) ||
-                   match_def_path(cx, def_id, &paths::REGEX_BYTES_BUILDER_NEW) {
-                    check_regex(cx, &args[0], false);
-                } else if match_def_path(cx, def_id, &paths::REGEX_SET_NEW) {
-                    check_set(cx, &args[0], true);
-                } else if match_def_path(cx, def_id, &paths::REGEX_BYTES_SET_NEW) {
-                    check_set(cx, &args[0], false);
-                }
+        if let ExprKind::Call(fun, [arg]) = expr.kind
+            && let Some(def_id) = path_def_id(cx, fun)
+            && let Some(regex_kind) = self.definitions.get(&def_id)
+        {
+            match regex_kind {
+                RegexKind::Unicode => check_regex(cx, arg, true),
+                RegexKind::UnicodeSet => check_set(cx, arg, true),
+                RegexKind::Bytes => check_regex(cx, arg, false),
+                RegexKind::BytesSet => check_set(cx, arg, false),
             }
         }
     }
 }
 
-#[allow(clippy::cast_possible_truncation)] // truncation very unlikely here
-#[must_use]
-fn str_span(base: Span, c: regex_syntax::ast::Span, offset: u16) -> Span {
-    let offset = u32::from(offset);
-    let end = base.lo() + BytePos(u32::try_from(c.end.offset).expect("offset too large") + offset);
-    let start = base.lo() + BytePos(u32::try_from(c.start.offset).expect("offset too large") + offset);
-    assert!(start <= end);
-    Span::new(start, end, base.ctxt(), base.parent())
+fn lint_syntax_error(cx: &LateContext<'_>, error: &regex_syntax::Error, unescaped: &str, base: Span, offset: u8) {
+    let parts: Option<(_, _, &dyn Display)> = match &error {
+        regex_syntax::Error::Parse(e) => Some((e.span(), e.auxiliary_span(), e.kind())),
+        regex_syntax::Error::Translate(e) => Some((e.span(), None, e.kind())),
+        _ => None,
+    };
+
+    let convert_span = |regex_span: &regex_syntax::ast::Span| {
+        let offset = u32::from(offset);
+        let start = base.lo() + BytePos(u32::try_from(regex_span.start.offset).expect("offset too large") + offset);
+        let end = base.lo() + BytePos(u32::try_from(regex_span.end.offset).expect("offset too large") + offset);
+
+        Span::new(start, end, base.ctxt(), base.parent())
+    };
+
+    if let Some((primary, auxiliary, kind)) = parts
+        && let Some(literal_snippet) = snippet_opt(cx, base)
+        && let Some(inner) = literal_snippet.get(offset as usize..)
+        // Only convert to native rustc spans if the parsed regex matches the
+        // source snippet exactly, to ensure the span offsets are correct
+        && inner.get(..unescaped.len()) == Some(unescaped)
+    {
+        let spans = if let Some(auxiliary) = auxiliary {
+            vec![convert_span(primary), convert_span(auxiliary)]
+        } else {
+            vec![convert_span(primary)]
+        };
+
+        span_lint(cx, INVALID_REGEX, spans, &format!("regex syntax error: {kind}"));
+    } else {
+        span_lint_and_help(
+            cx,
+            INVALID_REGEX,
+            base,
+            &error.to_string(),
+            None,
+            "consider using a raw string literal: `r\"..\"`",
+        );
+    }
 }
 
 fn const_str<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> Option<String> {
-    constant(cx, cx.typeck_results(), e).and_then(|(c, _)| match c {
+    constant(cx, cx.typeck_results(), e).and_then(|c| match c {
         Constant::Str(s) => Some(s),
         _ => None,
     })
 }
 
 fn is_trivial_regex(s: &regex_syntax::hir::Hir) -> Option<&'static str> {
-    use regex_syntax::hir::Anchor::{EndText, StartText};
-    use regex_syntax::hir::HirKind::{Alternation, Anchor, Concat, Empty, Literal};
+    use regex_syntax::hir::HirKind::{Alternation, Concat, Empty, Literal, Look};
+    use regex_syntax::hir::Look as HirLook;
 
     let is_literal = |e: &[regex_syntax::hir::Hir]| e.iter().all(|e| matches!(*e.kind(), Literal(_)));
 
     match *s.kind() {
-        Empty | Anchor(_) => Some("the regex is unlikely to be useful as it is"),
+        Empty | Look(_) => Some("the regex is unlikely to be useful as it is"),
         Literal(_) => Some("consider using `str::contains`"),
         Alternation(ref exprs) => {
-            if exprs.iter().all(|e| e.kind().is_empty()) {
+            if exprs.iter().all(|e| matches!(e.kind(), Empty)) {
                 Some("the regex is unlikely to be useful as it is")
             } else {
                 None
             }
         },
         Concat(ref exprs) => match (exprs[0].kind(), exprs[exprs.len() - 1].kind()) {
-            (&Anchor(StartText), &Anchor(EndText)) if exprs[1..(exprs.len() - 1)].is_empty() => {
+            (&Look(HirLook::Start), &Look(HirLook::End)) if exprs[1..(exprs.len() - 1)].is_empty() => {
                 Some("consider using `str::is_empty`")
             },
-            (&Anchor(StartText), &Anchor(EndText)) if is_literal(&exprs[1..(exprs.len() - 1)]) => {
+            (&Look(HirLook::Start), &Look(HirLook::End)) if is_literal(&exprs[1..(exprs.len() - 1)]) => {
                 Some("consider using `==` on `str`s")
             },
-            (&Anchor(StartText), &Literal(_)) if is_literal(&exprs[1..]) => Some("consider using `str::starts_with`"),
-            (&Literal(_), &Anchor(EndText)) if is_literal(&exprs[1..(exprs.len() - 1)]) => {
+            (&Look(HirLook::Start), &Literal(_)) if is_literal(&exprs[1..]) => {
+                Some("consider using `str::starts_with`")
+            },
+            (&Literal(_), &Look(HirLook::End)) if is_literal(&exprs[1..(exprs.len() - 1)]) => {
                 Some("consider using `str::ends_with`")
             },
             _ if is_literal(exprs) => Some("consider using `str::contains`"),
@@ -129,26 +191,21 @@ fn is_trivial_regex(s: &regex_syntax::hir::Hir) -> Option<&'static str> {
 }
 
 fn check_set<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, utf8: bool) {
-    if_chain! {
-        if let ExprKind::AddrOf(BorrowKind::Ref, _, expr) = expr.kind;
-        if let ExprKind::Array(exprs) = expr.kind;
-        then {
-            for expr in exprs {
-                check_regex(cx, expr, utf8);
-            }
+    if let ExprKind::AddrOf(BorrowKind::Ref, _, expr) = expr.kind
+        && let ExprKind::Array(exprs) = expr.kind
+    {
+        for expr in exprs {
+            check_regex(cx, expr, utf8);
         }
     }
 }
 
 fn check_regex<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, utf8: bool) {
-    let mut parser = regex_syntax::ParserBuilder::new()
-        .unicode(true)
-        .allow_invalid_utf8(!utf8)
-        .build();
+    let mut parser = regex_syntax::ParserBuilder::new().unicode(true).utf8(utf8).build();
 
-    if let ExprKind::Lit(ref lit) = expr.kind {
+    if let ExprKind::Lit(lit) = expr.kind {
         if let LitKind::Str(ref r, style) = lit.node {
-            let r = &r.as_str();
+            let r = r.as_str();
             let offset = if let StrStyle::Raw(n) = style { 2 + n } else { 1 };
             match parser.parse(r) {
                 Ok(r) => {
@@ -156,25 +213,7 @@ fn check_regex<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, utf8: bool) {
                         span_lint_and_help(cx, TRIVIAL_REGEX, expr.span, "trivial regex", None, repl);
                     }
                 },
-                Err(regex_syntax::Error::Parse(e)) => {
-                    span_lint(
-                        cx,
-                        INVALID_REGEX,
-                        str_span(expr.span, *e.span(), offset),
-                        &format!("regex syntax error: {}", e.kind()),
-                    );
-                },
-                Err(regex_syntax::Error::Translate(e)) => {
-                    span_lint(
-                        cx,
-                        INVALID_REGEX,
-                        str_span(expr.span, *e.span(), offset),
-                        &format!("regex syntax error: {}", e.kind()),
-                    );
-                },
-                Err(e) => {
-                    span_lint(cx, INVALID_REGEX, expr.span, &format!("regex syntax error: {}", e));
-                },
+                Err(e) => lint_syntax_error(cx, &e, r, expr.span, offset),
             }
         }
     } else if let Some(r) = const_str(cx, expr) {
@@ -184,25 +223,7 @@ fn check_regex<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, utf8: bool) {
                     span_lint_and_help(cx, TRIVIAL_REGEX, expr.span, "trivial regex", None, repl);
                 }
             },
-            Err(regex_syntax::Error::Parse(e)) => {
-                span_lint(
-                    cx,
-                    INVALID_REGEX,
-                    expr.span,
-                    &format!("regex syntax error on position {}: {}", e.span().start.offset, e.kind()),
-                );
-            },
-            Err(regex_syntax::Error::Translate(e)) => {
-                span_lint(
-                    cx,
-                    INVALID_REGEX,
-                    expr.span,
-                    &format!("regex syntax error on position {}: {}", e.span().start.offset, e.kind()),
-                );
-            },
-            Err(e) => {
-                span_lint(cx, INVALID_REGEX, expr.span, &format!("regex syntax error: {}", e));
-            },
+            Err(e) => span_lint(cx, INVALID_REGEX, expr.span, &e.to_string()),
         }
     }
 }

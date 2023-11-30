@@ -292,6 +292,9 @@ fn guards() {
         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             if fooooooooooooooooooooo &&
                (bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb || cccccccccccccccccccccccccccccccccccccccc) => {}
+        Hi { friend } if let None = friend => {}
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa if let Some(foooooooooooooo) = hiiiiiiiiiiiiiii => {}
+        aaaaaaaaaaaaaaaaa if let Superman { powers: Some(goteem), .. } = all::get_random_being::<Super>() => {}
     }
 }
 
@@ -567,4 +570,23 @@ fn issue_3774() {
             }
         }
     }
+}
+
+// #4109
+fn issue_4109() {
+    match () {
+        _ => {
+#[cfg(debug_assertions)]
+{
+println!("Foo");
+}
+}
+}
+
+match () {
+_ => {
+#[allow(unsafe_code)]
+unsafe {}
+}
+}
 }

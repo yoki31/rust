@@ -8,6 +8,7 @@ use std::process::Command;
 /// Descriptions of rustc lint groups.
 static GROUP_DESCRIPTIONS: &[(&str, &str)] = &[
     ("unused", "Lints that detect things being declared but not used, or excess syntax"),
+    ("let-underscore", "Lints that detect wildcard let bindings that are likely to be invalid"),
     ("rustdoc", "Rustdoc-specific lints"),
     ("rust-2018-idioms", "Lints to nudge you toward idiomatic features of Rust 2018"),
     ("nonstandard-style", "Violation of standard naming conventions"),
@@ -42,7 +43,7 @@ impl<'a> LintExtractor<'a> {
         let output = cmd.output().map_err(|e| format!("failed to run command {:?}\n{}", cmd, e))?;
         if !output.status.success() {
             return Err(format!(
-                "failed to collect lint info: {:?}\n--- stderr\n{}--- stdout\n{}\n",
+                "failed to collect lint info: failed to run {cmd:?}: {:?}\n--- stderr\n{}--- stdout\n{}\n",
                 output.status,
                 std::str::from_utf8(&output.stderr).unwrap(),
                 std::str::from_utf8(&output.stdout).unwrap(),

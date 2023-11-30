@@ -1,6 +1,5 @@
-// run-rustfix
 #![allow(dead_code)]
-#![allow(unused_variables, clippy::unnecessary_wraps)]
+#![allow(unused_variables, clippy::unnecessary_wraps, clippy::unnecessary_literal_unwrap)]
 
 fn option_unwrap_or() {
     // int case
@@ -102,7 +101,7 @@ fn result_unwrap_or() {
     };
 
     // method call case, suggestion must not surround Result expr `s.method()` with parentheses
-    struct S {}
+    struct S;
     impl S {
         fn method(self) -> Option<i32> {
             Some(42)

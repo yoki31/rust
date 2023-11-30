@@ -1,13 +1,17 @@
-// run-rustfix
+//@aux-build: macro_rules.rs
 
 #![warn(clippy::all)]
 #![allow(
-    clippy::blacklisted_name,
+    clippy::disallowed_names,
     clippy::no_effect,
     clippy::redundant_clone,
     redundant_semicolons,
     dead_code,
-    unused_assignments
+    unused_assignments,
+    unused_variables,
+    clippy::let_and_return,
+    clippy::useless_vec,
+    clippy::redundant_locals
 )]
 
 struct Foo(u32);
@@ -143,4 +147,85 @@ fn main() {
     ; let t = c.0;
     c.0 = a;
     a = t;
+
+    let a = b;
+    let b = a;
+
+    let mut c = 1;
+    let mut d = 2;
+    d = c;
+    c = d;
+
+    let mut b = 1;
+    let a = b;
+    b = a;
+
+    let b = 1;
+    let a = 2;
+
+    let t = b;
+    let b = a;
+    let a = t;
+
+    let mut b = 1;
+    let mut a = 2;
+
+    let t = b;
+    b = a;
+    a = t;
+}
+
+fn issue_8154() {
+    struct S1 {
+        x: i32,
+        y: i32,
+    }
+    struct S2(S1);
+    struct S3<'a, 'b>(&'a mut &'b mut S1);
+
+    impl std::ops::Deref for S2 {
+        type Target = S1;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for S2 {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    // Don't lint. `s.0` is mutably borrowed by `s.x` and `s.y` via the deref impl.
+    let mut s = S2(S1 { x: 0, y: 0 });
+    let t = s.x;
+    s.x = s.y;
+    s.y = t;
+
+    // Accessing through a mutable reference is fine
+    let mut s = S1 { x: 0, y: 0 };
+    let mut s = &mut s;
+    let s = S3(&mut s);
+    let t = s.0.x;
+    s.0.x = s.0.y;
+    s.0.y = t;
+}
+
+const fn issue_9864(mut u: u32) -> u32 {
+    let mut v = 10;
+
+    let temp = u;
+    u = v;
+    v = temp;
+    u + v
+}
+
+#[macro_use]
+extern crate macro_rules;
+
+const fn issue_10421(x: u32) -> u32 {
+    issue_10421!();
+    let a = x;
+    let a = a;
+    let a = a;
+    a
 }

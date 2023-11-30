@@ -1,9 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #![forbid(unsafe_code)]/* This line is ignored by bash
 # This block is ignored by rustc
 pushd $(dirname "$0")/../
-source scripts/config.sh
-RUSTC="$(pwd)/build/bin/cg_clif"
+RUSTC="$(pwd)/dist/rustc-clif"
 popd
 PROFILE=$1 OUTPUT=$2 exec $RUSTC -Zunstable-options -Cllvm-args=mode=jit -Cprefer-dynamic $0
 #*/
@@ -101,9 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stack = &stack[..index + ENCODE_METADATA.len()];
         }
 
-        const SUBST_AND_NORMALIZE_ERASING_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::subst_and_normalize_erasing_regions";
-        if let Some(index) = stack.find(SUBST_AND_NORMALIZE_ERASING_REGIONS) {
-            stack = &stack[..index + SUBST_AND_NORMALIZE_ERASING_REGIONS.len()];
+        const INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::instantiate_and_normalize_erasing_regions";
+        if let Some(index) = stack.find(INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS) {
+            stack = &stack[..index + INSTANTIATE_AND_NORMALIZE_ERASING_REGIONS.len()];
         }
 
         const NORMALIZE_ERASING_LATE_BOUND_REGIONS: &str = "rustc_middle::ty::normalize_erasing_regions::<impl rustc_middle::ty::context::TyCtxt>::normalize_erasing_late_bound_regions";

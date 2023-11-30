@@ -1,17 +1,16 @@
-use clippy_utils::diagnostics::span_lint;
-use clippy_utils::ty::contains_ty;
-use rustc_hir::intravisit;
-use rustc_hir::{self, AssocItemKind, Body, FnDecl, HirId, HirIdSet, Impl, ItemKind, Node};
+use clippy_utils::diagnostics::span_lint_hir;
+use rustc_hir::{self, intravisit, AssocItemKind, Body, FnDecl, HirId, HirIdSet, Impl, ItemKind, Node, Pat, PatKind};
+use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::FakeReadCause;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, TraitRef, Ty};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::source_map::Span;
+use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::kw;
+use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
-use rustc_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 
 #[derive(Copy, Clone)]
 pub struct BoxedLocal {
@@ -29,18 +28,15 @@ declare_clippy_lint! {
     /// into something.
     ///
     /// ### Example
-    /// ```rust
-    /// # fn foo(bar: usize) {}
-    /// // Bad
-    /// let x = Box::new(1);
-    /// foo(*x);
-    /// println!("{}", *x);
-    ///
-    /// // Good
-    /// let x = 1;
-    /// foo(x);
-    /// println!("{}", x);
+    /// ```no_run
+    /// fn foo(x: Box<u32>) {}
     /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// fn foo(x: u32) {}
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub BOXED_LOCAL,
     perf,
     "using `Box<T>` where unnecessary"
@@ -67,7 +63,7 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
         _: &'tcx FnDecl<'_>,
         body: &'tcx Body<'_>,
         _: Span,
-        hir_id: HirId,
+        fn_def_id: LocalDefId,
     ) {
         if let Some(header) = fn_kind.header() {
             if header.abi != Abi::Rust {
@@ -75,8 +71,12 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
             }
         }
 
-        let parent_id = cx.tcx.hir().get_parent_item(hir_id);
-        let parent_node = cx.tcx.hir().find(parent_id);
+        let parent_id = cx
+            .tcx
+            .hir()
+            .get_parent_item(cx.tcx.local_def_id_to_hir_id(fn_def_id))
+            .def_id;
+        let parent_node = cx.tcx.hir().find_by_def_id(parent_id);
 
         let mut trait_self_ty = None;
         if let Some(Node::Item(item)) = parent_node {
@@ -88,14 +88,11 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
             // find `self` ty for this trait if relevant
             if let ItemKind::Trait(_, _, _, _, items) = item.kind {
                 for trait_item in items {
-                    if trait_item.id.hir_id() == hir_id {
+                    if trait_item.id.owner_id.def_id == fn_def_id {
                         // be sure we have `self` parameter in this function
                         if trait_item.kind == (AssocItemKind::Fn { has_self: true }) {
-                            trait_self_ty = Some(
-                                TraitRef::identity(cx.tcx, trait_item.id.def_id.to_def_id())
-                                    .self_ty()
-                                    .skip_binder(),
-                            );
+                            trait_self_ty =
+                                Some(TraitRef::identity(cx.tcx, trait_item.id.owner_id.to_def_id()).self_ty());
                         }
                     }
                 }
@@ -109,15 +106,14 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
             too_large_for_stack: self.too_large_for_stack,
         };
 
-        let fn_def_id = cx.tcx.hir().local_def_id(hir_id);
-        cx.tcx.infer_ctxt().enter(|infcx| {
-            ExprUseVisitor::new(&mut v, &infcx, fn_def_id, cx.param_env, cx.typeck_results()).consume_body(body);
-        });
+        let infcx = cx.tcx.infer_ctxt().build();
+        ExprUseVisitor::new(&mut v, &infcx, fn_def_id, cx.param_env, cx.typeck_results()).consume_body(body);
 
         for node in v.set {
-            span_lint(
+            span_lint_hir(
                 cx,
                 BOXED_LOCAL,
+                node,
                 cx.tcx.hir().span(node),
                 "local variable doesn't need to be boxed here",
             );
@@ -128,11 +124,14 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
 // TODO: Replace with Map::is_argument(..) when it's fixed
 fn is_argument(map: rustc_middle::hir::map::Map<'_>, id: HirId) -> bool {
     match map.find(id) {
-        Some(Node::Binding(_)) => (),
+        Some(Node::Pat(Pat {
+            kind: PatKind::Binding(..),
+            ..
+        })) => (),
         _ => return false,
     }
 
-    matches!(map.find(map.get_parent_node(id)), Some(Node::Param(_)))
+    matches!(map.find_parent(id), Some(Node::Param(_)))
 }
 
 impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
@@ -140,15 +139,6 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
         if cmt.place.projections.is_empty() {
             if let PlaceBase::Local(lid) = cmt.place.base {
                 self.set.remove(&lid);
-                let map = &self.cx.tcx.hir();
-                if let Some(Node::Binding(_)) = map.find(cmt.hir_id) {
-                    if self.set.contains(&lid) {
-                        // let y = x where x is known
-                        // remove x, insert y
-                        self.set.insert(cmt.hir_id);
-                        self.set.remove(&lid);
-                    }
-                }
             }
         }
     }
@@ -166,16 +156,15 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
             let map = &self.cx.tcx.hir();
             if is_argument(*map, cmt.hir_id) {
                 // Skip closure arguments
-                let parent_id = map.get_parent_node(cmt.hir_id);
-                if let Some(Node::Expr(..)) = map.find(map.get_parent_node(parent_id)) {
+                let parent_id = map.parent_id(cmt.hir_id);
+                if let Some(Node::Expr(..)) = map.find_parent(parent_id) {
                     return;
                 }
 
                 // skip if there is a `self` parameter binding to a type
                 // that contains `Self` (i.e.: `self: Box<Self>`), see #4804
                 if let Some(trait_self_ty) = self.trait_self_ty {
-                    if map.name(cmt.hir_id) == kw::SelfLower && contains_ty(self.cx.tcx, cmt.place.ty(), trait_self_ty)
-                    {
+                    if map.name(cmt.hir_id) == kw::SelfLower && cmt.place.ty().contains(trait_self_ty) {
                         return;
                     }
                 }
@@ -187,7 +176,7 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
         }
     }
 
-    fn fake_read(&mut self, _: rustc_typeck::expr_use_visitor::Place<'tcx>, _: FakeReadCause, _: HirId) {}
+    fn fake_read(&mut self, _: &rustc_hir_typeck::expr_use_visitor::PlaceWithHirId<'tcx>, _: FakeReadCause, _: HirId) {}
 }
 
 impl<'a, 'tcx> EscapeDelegate<'a, 'tcx> {

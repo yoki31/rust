@@ -1,5 +1,6 @@
-FROM ubuntu:16.04
+FROM ubuntu:22.04
 
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
   g++ \
   make \
@@ -11,20 +12,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3 \
   git \
   cmake \
+  bzip2 \
   xz-utils \
   sudo \
   gdb \
   patch \
   libssl-dev \
-  pkg-config
+  pkg-config \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/
 
-# Build cmake before musl toolchain, as we replace the compiler during that step.
-COPY scripts/cmake.sh /scripts/
-RUN /scripts/cmake.sh
-
-COPY scripts/musl-patch-configure.diff /build/
 COPY scripts/musl-toolchain.sh /build/
 # We need to mitigate rust-lang/rust#34978 when compiling musl itself as well
 RUN CFLAGS="-Wa,-mrelax-relocations=no -Wa,--compress-debug-sections=none -Wl,--compress-debug-sections=none" \

@@ -32,6 +32,7 @@ impl Drop for Handler {
     target_os = "macos",
     target_os = "dragonfly",
     target_os = "freebsd",
+    target_os = "hurd",
     target_os = "solaris",
     target_os = "illumos",
     target_os = "netbsd",
@@ -45,7 +46,10 @@ mod imp {
     use crate::thread;
 
     use libc::MAP_FAILED;
-    use libc::{mmap, munmap};
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    use libc::{mmap as mmap64, munmap};
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    use libc::{mmap64, munmap};
     use libc::{sigaction, sighandler_t, SA_ONSTACK, SA_SIGINFO, SIGBUS, SIG_DFL};
     use libc::{sigaltstack, SIGSTKSZ, SS_DISABLE};
     use libc::{MAP_ANON, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, SIGSEGV};
@@ -53,22 +57,6 @@ mod imp {
     use crate::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use crate::sys::unix::os::page_size;
     use crate::sys_common::thread_info;
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> usize {
-        #[repr(C)]
-        struct siginfo_t {
-            a: [libc::c_int; 3], // si_signo, si_errno, si_code
-            si_addr: *mut libc::c_void,
-        }
-
-        (*(info as *const siginfo_t)).si_addr as usize
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> usize {
-        (*info).si_addr as usize
-    }
 
     // Signal handler for the SIGSEGV and SIGBUS handlers. We've got guard pages
     // (unmapped pages) at the end of every thread's stack, so if a thread ends
@@ -97,7 +85,7 @@ mod imp {
         _data: *mut libc::c_void,
     ) {
         let guard = thread_info::stack_guard().unwrap_or(0..0);
-        let addr = siginfo_si_addr(info);
+        let addr = (*info).si_addr() as usize;
 
         // If the faulting address is within the guard page, then we print a
         // message saying so and abort.
@@ -146,12 +134,22 @@ mod imp {
         // OpenBSD requires this flag for stack mapping
         // otherwise the said mapping will fail as a no-op on most systems
         // and has a different meaning on FreeBSD
-        #[cfg(any(target_os = "openbsd", target_os = "netbsd", target_os = "linux",))]
+        #[cfg(any(
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "linux",
+            target_os = "dragonfly",
+        ))]
         let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_STACK;
-        #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", target_os = "linux",)))]
+        #[cfg(not(any(
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "linux",
+            target_os = "dragonfly",
+        )))]
         let flags = MAP_PRIVATE | MAP_ANON;
         let stackp =
-            mmap(ptr::null_mut(), SIGSTKSZ + page_size(), PROT_READ | PROT_WRITE, flags, -1, 0);
+            mmap64(ptr::null_mut(), SIGSTKSZ + page_size(), PROT_READ | PROT_WRITE, flags, -1, 0);
         if stackp == MAP_FAILED {
             panic!("failed to allocate an alternative stack: {}", io::Error::last_os_error());
         }
@@ -206,6 +204,7 @@ mod imp {
     target_os = "macos",
     target_os = "dragonfly",
     target_os = "freebsd",
+    target_os = "hurd",
     target_os = "solaris",
     target_os = "illumos",
     target_os = "netbsd",

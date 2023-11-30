@@ -1,5 +1,5 @@
 use crate::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule};
-use crate::back::write::{CodegenContext, FatLTOInput, ModuleConfig};
+use crate::back::write::{CodegenContext, FatLtoInput, ModuleConfig};
 use crate::{CompiledModule, ModuleCodegen};
 
 use rustc_errors::{FatalError, Handler};
@@ -8,8 +8,8 @@ use rustc_middle::dep_graph::WorkProduct;
 pub trait WriteBackendMethods: 'static + Sized + Clone {
     type Module: Send + Sync;
     type TargetMachine;
+    type TargetMachineError;
     type ModuleBuffer: ModuleBufferMethods;
-    type Context: ?Sized;
     type ThinData: Send + Sync;
     type ThinBuffer: ThinBufferMethods;
 
@@ -23,7 +23,7 @@ pub trait WriteBackendMethods: 'static + Sized + Clone {
     /// for further optimization.
     fn run_fat_lto(
         cgcx: &CodegenContext<Self>,
-        modules: Vec<FatLTOInput<Self>>,
+        modules: Vec<FatLtoInput<Self>>,
         cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
     ) -> Result<LtoModuleCodegen<Self>, FatalError>;
     /// Performs thin LTO by performing necessary global analysis and returning two
@@ -35,15 +35,20 @@ pub trait WriteBackendMethods: 'static + Sized + Clone {
         cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
     ) -> Result<(Vec<LtoModuleCodegen<Self>>, Vec<WorkProduct>), FatalError>;
     fn print_pass_timings(&self);
+    fn print_statistics(&self);
     unsafe fn optimize(
         cgcx: &CodegenContext<Self>,
         diag_handler: &Handler,
         module: &ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
     ) -> Result<(), FatalError>;
+    fn optimize_fat(
+        cgcx: &CodegenContext<Self>,
+        llmod: &mut ModuleCodegen<Self::Module>,
+    ) -> Result<(), FatalError>;
     unsafe fn optimize_thin(
         cgcx: &CodegenContext<Self>,
-        thin: &mut ThinModule<Self>,
+        thin: ThinModule<Self>,
     ) -> Result<ModuleCodegen<Self::Module>, FatalError>;
     unsafe fn codegen(
         cgcx: &CodegenContext<Self>,
@@ -53,12 +58,6 @@ pub trait WriteBackendMethods: 'static + Sized + Clone {
     ) -> Result<CompiledModule, FatalError>;
     fn prepare_thin(module: ModuleCodegen<Self::Module>) -> (String, Self::ThinBuffer);
     fn serialize_module(module: ModuleCodegen<Self::Module>) -> (String, Self::ModuleBuffer);
-    fn run_lto_pass_manager(
-        cgcx: &CodegenContext<Self>,
-        llmod: &ModuleCodegen<Self::Module>,
-        config: &ModuleConfig,
-        thin: bool,
-    ) -> Result<(), FatalError>;
 }
 
 pub trait ThinBufferMethods: Send + Sync {

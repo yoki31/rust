@@ -86,6 +86,46 @@
 /// }
 /// ```
 ///
+/// If we `derive`:
+///
+/// ```
+/// #[derive(Copy, Clone)]
+/// struct Generate<T>(fn() -> T);
+/// ```
+///
+/// the auto-derived implementations will have unnecessary `T: Copy` and `T: Clone` bounds:
+///
+/// ```
+/// # struct Generate<T>(fn() -> T);
+///
+/// // Automatically derived
+/// impl<T: Copy> Copy for Generate<T> { }
+///
+/// // Automatically derived
+/// impl<T: Clone> Clone for Generate<T> {
+///     fn clone(&self) -> Generate<T> {
+///         Generate(Clone::clone(&self.0))
+///     }
+/// }
+/// ```
+///
+/// The bounds are unnecessary because clearly the function itself should be
+/// copy- and cloneable even if its return type is not:
+///
+/// ```compile_fail,E0599
+/// #[derive(Copy, Clone)]
+/// struct Generate<T>(fn() -> T);
+///
+/// struct NotCloneable;
+///
+/// fn generate_not_cloneable() -> NotCloneable {
+///     NotCloneable
+/// }
+///
+/// Generate(generate_not_cloneable).clone(); // error: trait bounds were not satisfied
+/// // Note: With the manual implementations the above line will compile.
+/// ```
+///
 /// ## Additional implementors
 ///
 /// In addition to the [implementors listed below][impls],
@@ -93,7 +133,6 @@
 ///
 /// * Function item types (i.e., the distinct types defined for each function)
 /// * Function pointer types (e.g., `fn() -> i32`)
-/// * Tuple types, if each component also implements `Clone` (e.g., `()`, `(i32, bool)`)
 /// * Closure types, if they capture no value from the environment
 ///   or if all such captured values implement `Clone` themselves.
 ///   Note that variables captured by shared reference always implement `Clone`
@@ -171,7 +210,6 @@ pub struct AssertParamIsCopy<T: Copy + ?Sized> {
 /// are implemented in `traits::SelectionContext::copy_clone_conditions()`
 /// in `rustc_trait_selection`.
 mod impls {
-
     use super::Clone;
 
     macro_rules! impl_clone {
@@ -179,7 +217,7 @@ mod impls {
             $(
                 #[stable(feature = "rust1", since = "1.0.0")]
                 impl Clone for $t {
-                    #[inline]
+                    #[inline(always)]
                     fn clone(&self) -> Self {
                         *self
                     }
@@ -205,7 +243,7 @@ mod impls {
 
     #[stable(feature = "rust1", since = "1.0.0")]
     impl<T: ?Sized> Clone for *const T {
-        #[inline]
+        #[inline(always)]
         fn clone(&self) -> Self {
             *self
         }
@@ -213,7 +251,7 @@ mod impls {
 
     #[stable(feature = "rust1", since = "1.0.0")]
     impl<T: ?Sized> Clone for *mut T {
-        #[inline]
+        #[inline(always)]
         fn clone(&self) -> Self {
             *self
         }
@@ -222,7 +260,7 @@ mod impls {
     /// Shared references can be cloned, but mutable references *cannot*!
     #[stable(feature = "rust1", since = "1.0.0")]
     impl<T: ?Sized> Clone for &T {
-        #[inline]
+        #[inline(always)]
         #[rustc_diagnostic_item = "noop_method_clone"]
         fn clone(&self) -> Self {
             *self

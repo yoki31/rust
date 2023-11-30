@@ -1,119 +1,26 @@
+use crate::attributes;
 use crate::builder::Builder;
+use crate::common::Funclet;
 use crate::context::CodegenCx;
 use crate::llvm;
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
 
-use rustc_ast::LlvmAsmDialect;
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::mir::operand::OperandValue;
-use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir as hir;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::{bug, span_bug, ty::Instance};
-use rustc_span::{Pos, Span, Symbol};
+use rustc_span::{Pos, Span};
 use rustc_target::abi::*;
 use rustc_target::asm::*;
 
 use libc::{c_char, c_uint};
-use tracing::debug;
+use smallvec::SmallVec;
 
-impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
-    fn codegen_llvm_inline_asm(
-        &mut self,
-        ia: &hir::LlvmInlineAsmInner,
-        outputs: Vec<PlaceRef<'tcx, &'ll Value>>,
-        mut inputs: Vec<&'ll Value>,
-        span: Span,
-    ) -> bool {
-        let mut ext_constraints = vec![];
-        let mut output_types = vec![];
-
-        // Prepare the output operands
-        let mut indirect_outputs = vec![];
-        for (i, (out, &place)) in ia.outputs.iter().zip(&outputs).enumerate() {
-            if out.is_rw {
-                let operand = self.load_operand(place);
-                if let OperandValue::Immediate(_) = operand.val {
-                    inputs.push(operand.immediate());
-                }
-                ext_constraints.push(i.to_string());
-            }
-            if out.is_indirect {
-                let operand = self.load_operand(place);
-                if let OperandValue::Immediate(_) = operand.val {
-                    indirect_outputs.push(operand.immediate());
-                }
-            } else {
-                output_types.push(place.layout.llvm_type(self.cx));
-            }
-        }
-        if !indirect_outputs.is_empty() {
-            indirect_outputs.extend_from_slice(&inputs);
-            inputs = indirect_outputs;
-        }
-
-        let clobbers = ia.clobbers.iter().map(|s| format!("~{{{}}}", &s));
-
-        // Default per-arch clobbers
-        // Basically what clang does
-        let arch_clobbers = match &self.sess().target.arch[..] {
-            "x86" | "x86_64" => &["~{dirflag}", "~{fpsr}", "~{flags}"][..],
-            "mips" | "mips64" => &["~{$1}"],
-            _ => &[],
-        };
-
-        let all_constraints = ia
-            .outputs
-            .iter()
-            .map(|out| out.constraint.to_string())
-            .chain(ia.inputs.iter().map(|s| s.to_string()))
-            .chain(ext_constraints)
-            .chain(clobbers)
-            .chain(arch_clobbers.iter().map(|s| (*s).to_string()))
-            .collect::<Vec<String>>()
-            .join(",");
-
-        debug!("Asm Constraints: {}", &all_constraints);
-
-        // Depending on how many outputs we have, the return type is different
-        let num_outputs = output_types.len();
-        let output_type = match num_outputs {
-            0 => self.type_void(),
-            1 => output_types[0],
-            _ => self.type_struct(&output_types, false),
-        };
-
-        let asm = ia.asm.as_str();
-        let r = inline_asm_call(
-            self,
-            &asm,
-            &all_constraints,
-            &inputs,
-            output_type,
-            ia.volatile,
-            ia.alignstack,
-            ia.dialect,
-            &[span],
-        );
-        if r.is_none() {
-            return false;
-        }
-        let r = r.unwrap();
-
-        // Again, based on how many outputs we have
-        let outputs = ia.outputs.iter().zip(&outputs).filter(|&(o, _)| !o.is_indirect);
-        for (i, (_, &place)) in outputs.enumerate() {
-            let v = if num_outputs == 1 { r } else { self.extract_value(r, i as u64) };
-            OperandValue::Immediate(v).store(self, place);
-        }
-
-        true
-    }
-
+impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
     fn codegen_inline_asm(
         &mut self,
         template: &[InlineAsmTemplatePiece],
@@ -121,6 +28,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         options: InlineAsmOptions,
         line_spans: &[Span],
         instance: Instance<'_>,
+        dest_catch_funclet: Option<(Self::BasicBlock, Self::BasicBlock, Option<&Self::Funclet>)>,
     ) {
         let asm_arch = self.tcx.sess.asm_arch.unwrap();
 
@@ -136,10 +44,10 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                     let is_target_supported = |reg_class: InlineAsmRegClass| {
                         for &(_, feature) in reg_class.supported_types(asm_arch) {
                             if let Some(feature) = feature {
-                                let codegen_fn_attrs = self.tcx.codegen_fn_attrs(instance.def_id());
-                                let feature_name = Symbol::intern(feature);
-                                if self.tcx.sess.target_features.contains(&feature_name)
-                                    || codegen_fn_attrs.target_features.contains(&feature_name)
+                                if self
+                                    .tcx
+                                    .asm_target_features(instance.def_id())
+                                    .contains(&feature)
                                 {
                                     return true;
                                 }
@@ -223,7 +131,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                     op_idx.insert(idx, constraints.len());
                     constraints.push(reg_to_llvm(reg, Some(&value.layout)));
                 }
-                InlineAsmOperandRef::InOut { reg, late: _, in_value, out_place: _ } => {
+                InlineAsmOperandRef::InOut { reg, late, in_value, out_place: _ } => {
                     let value = llvm_fixup_input(
                         self,
                         in_value.immediate(),
@@ -231,7 +139,16 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                         &in_value.layout,
                     );
                     inputs.push(value);
-                    constraints.push(format!("{}", op_idx[&idx]));
+
+                    // In the case of fixed registers, we have the choice of
+                    // either using a tied operand or duplicating the constraint.
+                    // We prefer the latter because it matches the behavior of
+                    // Clang.
+                    if late && matches!(reg, InlineAsmRegOrRegClass::Reg(_)) {
+                        constraints.push(reg_to_llvm(reg, Some(&in_value.layout)).to_string());
+                    } else {
+                        constraints.push(format!("{}", op_idx[&idx]));
+                    }
                 }
                 InlineAsmOperandRef::SymFn { instance } => {
                     inputs.push(self.cx.get_fn(instance));
@@ -314,14 +231,38 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                         "~{vxrm}".to_string(),
                     ]);
                 }
+                InlineAsmArch::Avr => {
+                    constraints.push("~{sreg}".to_string());
+                }
                 InlineAsmArch::Nvptx64 => {}
                 InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => {}
                 InlineAsmArch::Hexagon => {}
+                InlineAsmArch::LoongArch64 => {
+                    constraints.extend_from_slice(&[
+                        "~{$fcc0}".to_string(),
+                        "~{$fcc1}".to_string(),
+                        "~{$fcc2}".to_string(),
+                        "~{$fcc3}".to_string(),
+                        "~{$fcc4}".to_string(),
+                        "~{$fcc5}".to_string(),
+                        "~{$fcc6}".to_string(),
+                        "~{$fcc7}".to_string(),
+                    ]);
+                }
                 InlineAsmArch::Mips | InlineAsmArch::Mips64 => {}
-                InlineAsmArch::S390x => {}
+                InlineAsmArch::S390x => {
+                    constraints.push("~{cc}".to_string());
+                }
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 | InlineAsmArch::Wasm64 => {}
                 InlineAsmArch::Bpf => {}
+                InlineAsmArch::Msp430 => {
+                    constraints.push("~{sr}".to_string());
+                }
+                InlineAsmArch::M68k => {
+                    constraints.push("~{ccr}".to_string());
+                }
+                InlineAsmArch::CSKY => {}
             }
         }
         if !options.contains(InlineAsmOptions::NOMEM) {
@@ -341,9 +282,9 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
             InlineAsmArch::X86 | InlineAsmArch::X86_64
                 if !options.contains(InlineAsmOptions::ATT_SYNTAX) =>
             {
-                LlvmAsmDialect::Intel
+                llvm::AsmDialect::Intel
             }
-            _ => LlvmAsmDialect::Att,
+            _ => llvm::AsmDialect::Att,
         };
         let result = inline_asm_call(
             self,
@@ -355,21 +296,29 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
             alignstack,
             dialect,
             line_spans,
+            options.contains(InlineAsmOptions::MAY_UNWIND),
+            dest_catch_funclet,
         )
         .unwrap_or_else(|| span_bug!(line_spans[0], "LLVM asm constraint validation failed"));
 
+        let mut attrs = SmallVec::<[_; 2]>::new();
         if options.contains(InlineAsmOptions::PURE) {
             if options.contains(InlineAsmOptions::NOMEM) {
-                llvm::Attribute::ReadNone.apply_callsite(llvm::AttributePlace::Function, result);
+                attrs.push(llvm::MemoryEffects::None.create_attr(self.cx.llcx));
             } else if options.contains(InlineAsmOptions::READONLY) {
-                llvm::Attribute::ReadOnly.apply_callsite(llvm::AttributePlace::Function, result);
+                attrs.push(llvm::MemoryEffects::ReadOnly.create_attr(self.cx.llcx));
             }
-            llvm::Attribute::WillReturn.apply_callsite(llvm::AttributePlace::Function, result);
+            attrs.push(llvm::AttributeKind::WillReturn.create_attr(self.cx.llcx));
         } else if options.contains(InlineAsmOptions::NOMEM) {
-            llvm::Attribute::InaccessibleMemOnly
-                .apply_callsite(llvm::AttributePlace::Function, result);
+            attrs.push(llvm::MemoryEffects::InaccessibleMemOnly.create_attr(self.cx.llcx));
         } else {
             // LLVM doesn't have an attribute to represent ReadOnly + SideEffect
+        }
+        attributes::apply_to_callsite(result, llvm::AttributePlace::Function, &{ attrs });
+
+        // Switch to the 'normal' basic block if we did an `invoke` instead of a `call`
+        if let Some((dest, _, _)) = dest_catch_funclet {
+            self.switch_to_block(dest);
         }
 
         // Write results to outputs
@@ -389,11 +338,11 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
     }
 }
 
-impl AsmMethods for CodegenCx<'ll, 'tcx> {
+impl<'tcx> AsmMethods<'tcx> for CodegenCx<'_, 'tcx> {
     fn codegen_global_asm(
         &self,
         template: &[InlineAsmTemplatePiece],
-        operands: &[GlobalAsmOperandRef],
+        operands: &[GlobalAsmOperandRef<'tcx>],
         options: InlineAsmOptions,
         _line_spans: &[Span],
     ) {
@@ -419,6 +368,29 @@ impl AsmMethods for CodegenCx<'ll, 'tcx> {
                             // here unlike normal inline assembly.
                             template_str.push_str(string);
                         }
+                        GlobalAsmOperandRef::SymFn { instance } => {
+                            let llval = self.get_fn(instance);
+                            self.add_compiler_used_global(llval);
+                            let symbol = llvm::build_string(|s| unsafe {
+                                llvm::LLVMRustGetMangledName(llval, s);
+                            })
+                            .expect("symbol is not valid UTF-8");
+                            template_str.push_str(&symbol);
+                        }
+                        GlobalAsmOperandRef::SymStatic { def_id } => {
+                            let llval = self
+                                .renamed_statics
+                                .borrow()
+                                .get(&def_id)
+                                .copied()
+                                .unwrap_or_else(|| self.get_static(def_id));
+                            self.add_compiler_used_global(llval);
+                            let symbol = llvm::build_string(|s| unsafe {
+                                llvm::LLVMRustGetMangledName(llval, s);
+                            })
+                            .expect("symbol is not valid UTF-8");
+                            template_str.push_str(&symbol);
+                        }
                     }
                 }
             }
@@ -428,7 +400,7 @@ impl AsmMethods for CodegenCx<'ll, 'tcx> {
         }
 
         unsafe {
-            llvm::LLVMRustAppendModuleInlineAsm(
+            llvm::LLVMAppendModuleInlineAsm(
                 self.llmod,
                 template_str.as_ptr().cast(),
                 template_str.len(),
@@ -437,19 +409,26 @@ impl AsmMethods for CodegenCx<'ll, 'tcx> {
     }
 }
 
-pub(crate) fn inline_asm_call(
-    bx: &mut Builder<'a, 'll, 'tcx>,
+pub(crate) fn inline_asm_call<'ll>(
+    bx: &mut Builder<'_, 'll, '_>,
     asm: &str,
     cons: &str,
     inputs: &[&'ll Value],
     output: &'ll llvm::Type,
     volatile: bool,
     alignstack: bool,
-    dia: LlvmAsmDialect,
+    dia: llvm::AsmDialect,
     line_spans: &[Span],
+    unwind: bool,
+    dest_catch_funclet: Option<(
+        &'ll llvm::BasicBlock,
+        &'ll llvm::BasicBlock,
+        Option<&Funclet<'ll>>,
+    )>,
 ) -> Option<&'ll Value> {
     let volatile = if volatile { llvm::True } else { llvm::False };
     let alignstack = if alignstack { llvm::True } else { llvm::False };
+    let can_throw = if unwind { llvm::True } else { llvm::False };
 
     let argtys = inputs
         .iter()
@@ -460,7 +439,7 @@ pub(crate) fn inline_asm_call(
         .collect::<Vec<_>>();
 
     debug!("Asm Output Type: {:?}", output);
-    let fty = bx.cx.type_func(&argtys[..], output);
+    let fty = bx.cx.type_func(&argtys, output);
     unsafe {
         // Ask LLVM to verify that the constraints are well-formed.
         let constraints_ok = llvm::LLVMRustInlineAsmVerify(fty, cons.as_ptr().cast(), cons.len());
@@ -474,12 +453,18 @@ pub(crate) fn inline_asm_call(
                 cons.len(),
                 volatile,
                 alignstack,
-                llvm::AsmDialect::from_generic(dia),
+                dia,
+                can_throw,
             );
-            let call = bx.call(fty, v, inputs, None);
+
+            let call = if let Some((dest, catch, funclet)) = dest_catch_funclet {
+                bx.invoke(fty, None, None, v, inputs, dest, catch, funclet)
+            } else {
+                bx.call(fty, None, None, v, inputs, None)
+            };
 
             // Store mark in a metadata node so we can map LLVM errors
-            // back to source locations.  See #17552.
+            // back to source locations. See #17552.
             let key = "srcloc";
             let kind = llvm::LLVMGetMDKindIDInContext(
                 bx.llcx,
@@ -492,7 +477,7 @@ pub(crate) fn inline_asm_call(
             // we just encode the start position of each line.
             // FIXME: Figure out a way to pass the entire line spans.
             let mut srcloc = vec![];
-            if dia == LlvmAsmDialect::Intel && line_spans.len() > 1 {
+            if dia == llvm::AsmDialect::Intel && line_spans.len() > 1 {
                 // LLVM inserts an extra line to add the ".intel_syntax", so add
                 // a dummy srcloc entry for it.
                 //
@@ -539,6 +524,44 @@ fn xmm_reg_index(reg: InlineAsmReg) -> Option<u32> {
     }
 }
 
+/// If the register is an AArch64 integer register then return its index.
+fn a64_reg_index(reg: InlineAsmReg) -> Option<u32> {
+    match reg {
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x0) => Some(0),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x1) => Some(1),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x2) => Some(2),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x3) => Some(3),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x4) => Some(4),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x5) => Some(5),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x6) => Some(6),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x7) => Some(7),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x8) => Some(8),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x9) => Some(9),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x10) => Some(10),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x11) => Some(11),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x12) => Some(12),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x13) => Some(13),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x14) => Some(14),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x15) => Some(15),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x16) => Some(16),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x17) => Some(17),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x18) => Some(18),
+        // x19 is reserved
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x20) => Some(20),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x21) => Some(21),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x22) => Some(22),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x23) => Some(23),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x24) => Some(24),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x25) => Some(25),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x26) => Some(26),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x27) => Some(27),
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x28) => Some(28),
+        // x29 is reserved
+        InlineAsmReg::AArch64(AArch64InlineAsmReg::x30) => Some(30),
+        _ => None,
+    }
+}
+
 /// If the register is an AArch64 vector register then return its index.
 fn a64_vreg_index(reg: InlineAsmReg) -> Option<u32> {
     match reg {
@@ -553,7 +576,7 @@ fn a64_vreg_index(reg: InlineAsmReg) -> Option<u32> {
 }
 
 /// Converts a register class to an LLVM constraint code.
-fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) -> String {
+fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) -> String {
     match reg {
         // For vector registers LLVM wants the register name to match the type size.
         InlineAsmRegOrRegClass::Reg(reg) => {
@@ -569,6 +592,22 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
                     'x'
                 };
                 format!("{{{}mm{}}}", class, idx)
+            } else if let Some(idx) = a64_reg_index(reg) {
+                let class = if let Some(layout) = layout {
+                    match layout.size.bytes() {
+                        8 => 'x',
+                        _ => 'w',
+                    }
+                } else {
+                    // We use i32 as the type for discarded outputs
+                    'w'
+                };
+                if class == 'x' && reg == InlineAsmReg::AArch64(AArch64InlineAsmReg::x30) {
+                    // LLVM doesn't recognize x30. use lr instead.
+                    "{lr}".to_string()
+                } else {
+                    format!("{{{}{}}}", class, idx)
+                }
             } else if let Some(idx) = a64_vreg_index(reg) {
                 let class = if let Some(layout) = layout {
                     match layout.size.bytes() {
@@ -584,9 +623,6 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
                     'q'
                 };
                 format!("{{{}{}}}", class, idx)
-            } else if reg == InlineAsmReg::AArch64(AArch64InlineAsmReg::x30) {
-                // LLVM doesn't recognize x30
-                "{lr}".to_string()
             } else if reg == InlineAsmReg::Arm(ArmInlineAsmReg::r14) {
                 // LLVM doesn't recognize r14
                 "{lr}".to_string()
@@ -594,6 +630,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
                 format!("{{{}}}", reg.name())
             }
         }
+        // The constraints can be retrieved from
+        // https://llvm.org/docs/LangRef.html#supported-constraint-code-list
         InlineAsmRegOrRegClass::RegClass(reg) => match reg {
             InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg) => "w",
@@ -602,7 +640,6 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
                 unreachable!("clobber-only")
             }
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg) => "r",
-            InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => "l",
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg)
             | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::dreg_low16)
             | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::qreg_low8) => "t",
@@ -612,6 +649,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::dreg)
             | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::qreg) => "w",
             InlineAsmRegClass::Hexagon(HexagonInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::LoongArch(LoongArchInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::LoongArch(LoongArchInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::Mips(MipsInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg16) => "h",
@@ -637,13 +676,27 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => "v",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => "^Yk",
             InlineAsmRegClass::X86(
-                X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg,
+                X86InlineAsmRegClass::x87_reg
+                | X86InlineAsmRegClass::mmx_reg
+                | X86InlineAsmRegClass::kreg0
+                | X86InlineAsmRegClass::tmm_reg,
             ) => unreachable!("clobber-only"),
             InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => "w",
+            InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_upper) => "d",
+            InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_pair) => "r",
+            InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_iw) => "w",
+            InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_ptr) => "e",
             InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => "f",
+            InlineAsmRegClass::Msp430(Msp430InlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_addr) => "a",
+            InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_data) => "d",
+            InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
                 bug!("LLVM backend does not support SPIR-V")
             }
@@ -659,6 +712,8 @@ fn modifier_to_llvm(
     reg: InlineAsmRegClass,
     modifier: Option<char>,
 ) -> Option<char> {
+    // The modifiers can be retrieved from
+    // https://llvm.org/docs/LangRef.html#asm-template-argument-modifiers
     match reg {
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::reg) => modifier,
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg)
@@ -668,8 +723,7 @@ fn modifier_to_llvm(
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::preg) => {
             unreachable!("clobber-only")
         }
-        InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg)
-        | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => None,
+        InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg) => None,
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg)
         | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg_low16) => None,
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::dreg)
@@ -685,6 +739,7 @@ fn modifier_to_llvm(
             }
         }
         InlineAsmRegClass::Hexagon(_) => None,
+        InlineAsmRegClass::LoongArch(_) => None,
         InlineAsmRegClass::Mips(_) => None,
         InlineAsmRegClass::Nvptx(_) => None,
         InlineAsmRegClass::PowerPC(_) => None,
@@ -717,22 +772,38 @@ fn modifier_to_llvm(
             _ => unreachable!(),
         },
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => None,
-        InlineAsmRegClass::X86(X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg) => {
+        InlineAsmRegClass::X86(
+            X86InlineAsmRegClass::x87_reg
+            | X86InlineAsmRegClass::mmx_reg
+            | X86InlineAsmRegClass::kreg0
+            | X86InlineAsmRegClass::tmm_reg,
+        ) => {
             unreachable!("clobber-only")
         }
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => None,
         InlineAsmRegClass::Bpf(_) => None,
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_pair)
+        | InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_iw)
+        | InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_ptr) => match modifier {
+            Some('h') => Some('B'),
+            Some('l') => Some('A'),
+            _ => None,
+        },
+        InlineAsmRegClass::Avr(_) => None,
         InlineAsmRegClass::S390x(_) => None,
+        InlineAsmRegClass::Msp430(_) => None,
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
+        InlineAsmRegClass::M68k(_) => None,
+        InlineAsmRegClass::CSKY(_) => None,
         InlineAsmRegClass::Err => unreachable!(),
     }
 }
 
 /// Type to use for outputs that are discarded. It doesn't really matter what
 /// the type is, as long as it is valid for the constraint code.
-fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll Type {
+fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'ll Type {
     match reg {
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg)
@@ -742,8 +813,7 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::preg) => {
             unreachable!("clobber-only")
         }
-        InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg)
-        | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => cx.type_i32(),
+        InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg)
         | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg_low16) => cx.type_f32(),
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::dreg)
@@ -755,6 +825,8 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
             cx.type_vector(cx.type_i64(), 2)
         }
         InlineAsmRegClass::Hexagon(HexagonInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::LoongArch(LoongArchInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::LoongArch(LoongArchInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::Mips(MipsInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg16) => cx.type_i16(),
@@ -779,14 +851,30 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::ymm_reg)
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => cx.type_f32(),
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => cx.type_i16(),
-        InlineAsmRegClass::X86(X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg) => {
+        InlineAsmRegClass::X86(
+            X86InlineAsmRegClass::x87_reg
+            | X86InlineAsmRegClass::mmx_reg
+            | X86InlineAsmRegClass::kreg0
+            | X86InlineAsmRegClass::tmm_reg,
+        ) => {
             unreachable!("clobber-only")
         }
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => cx.type_i64(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => cx.type_i32(),
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg) => cx.type_i8(),
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_upper) => cx.type_i8(),
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_pair) => cx.type_i16(),
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_iw) => cx.type_i16(),
+        InlineAsmRegClass::Avr(AvrInlineAsmRegClass::reg_ptr) => cx.type_i16(),
         InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => cx.type_f64(),
+        InlineAsmRegClass::Msp430(Msp430InlineAsmRegClass::reg) => cx.type_i16(),
+        InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_addr) => cx.type_i32(),
+        InlineAsmRegClass::M68k(M68kInlineAsmRegClass::reg_data) => cx.type_i32(),
+        InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::CSKY(CSKYInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
@@ -796,29 +884,32 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
 
 /// Helper function to get the LLVM type for a Scalar. Pointers are returned as
 /// the equivalent integer type.
-fn llvm_asm_scalar_type(cx: &CodegenCx<'ll, 'tcx>, scalar: Scalar) -> &'ll Type {
-    match scalar.value {
+fn llvm_asm_scalar_type<'ll>(cx: &CodegenCx<'ll, '_>, scalar: Scalar) -> &'ll Type {
+    let dl = &cx.tcx.data_layout;
+    match scalar.primitive() {
         Primitive::Int(Integer::I8, _) => cx.type_i8(),
         Primitive::Int(Integer::I16, _) => cx.type_i16(),
         Primitive::Int(Integer::I32, _) => cx.type_i32(),
         Primitive::Int(Integer::I64, _) => cx.type_i64(),
         Primitive::F32 => cx.type_f32(),
         Primitive::F64 => cx.type_f64(),
-        Primitive::Pointer => cx.type_isize(),
+        // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
+        Primitive::Pointer(_) => cx.type_from_integer(dl.ptr_sized_integer()),
         _ => unreachable!(),
     }
 }
 
 /// Fix up an input value to work around LLVM bugs.
-fn llvm_fixup_input(
-    bx: &mut Builder<'a, 'll, 'tcx>,
+fn llvm_fixup_input<'ll, 'tcx>(
+    bx: &mut Builder<'_, 'll, 'tcx>,
     mut value: &'ll Value,
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
+    let dl = &bx.tcx.data_layout;
     match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
-            if let Primitive::Int(Integer::I8, _) = s.value {
+            if let Primitive::Int(Integer::I8, _) = s.primitive() {
                 let vec_ty = bx.cx.type_vector(bx.cx.type_i8(), 8);
                 bx.insert_element(bx.const_undef(vec_ty), value, bx.const_i32(0))
             } else {
@@ -829,8 +920,10 @@ fn llvm_fixup_input(
             let elem_ty = llvm_asm_scalar_type(bx.cx, s);
             let count = 16 / layout.size.bytes();
             let vec_ty = bx.cx.type_vector(elem_ty, count);
-            if let Primitive::Pointer = s.value {
-                value = bx.ptrtoint(value, bx.cx.type_isize());
+            // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
+            if let Primitive::Pointer(_) = s.primitive() {
+                let t = bx.type_from_integer(dl.ptr_sized_integer());
+                value = bx.ptrtoint(value, t);
             }
             bx.insert_element(bx.const_undef(vec_ty), value, bx.const_i32(0))
         }
@@ -844,7 +937,7 @@ fn llvm_fixup_input(
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
         (InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd), Abi::Scalar(s))
-            if s.value == Primitive::F64 =>
+            if s.primitive() == Primitive::F64 =>
         {
             bx.bitcast(value, bx.cx.type_i64())
         }
@@ -856,7 +949,7 @@ fn llvm_fixup_input(
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg | ArmInlineAsmRegClass::sreg_low16),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I32, _) = s.value {
+            if let Primitive::Int(Integer::I32, _) = s.primitive() {
                 bx.bitcast(value, bx.cx.type_f32())
             } else {
                 value
@@ -870,33 +963,35 @@ fn llvm_fixup_input(
             ),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I64, _) = s.value {
+            if let Primitive::Int(Integer::I64, _) = s.primitive() {
                 bx.bitcast(value, bx.cx.type_f64())
             } else {
                 value
             }
         }
-        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
-            // MIPS only supports register-length arithmetics.
-            Primitive::Int(Integer::I8 | Integer::I16, _) => bx.zext(value, bx.cx.type_i32()),
-            Primitive::F32 => bx.bitcast(value, bx.cx.type_i32()),
-            Primitive::F64 => bx.bitcast(value, bx.cx.type_i64()),
-            _ => value,
-        },
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => {
+            match s.primitive() {
+                // MIPS only supports register-length arithmetics.
+                Primitive::Int(Integer::I8 | Integer::I16, _) => bx.zext(value, bx.cx.type_i32()),
+                Primitive::F32 => bx.bitcast(value, bx.cx.type_i32()),
+                Primitive::F64 => bx.bitcast(value, bx.cx.type_i64()),
+                _ => value,
+            }
+        }
         _ => value,
     }
 }
 
 /// Fix up an output value to work around LLVM bugs.
-fn llvm_fixup_output(
-    bx: &mut Builder<'a, 'll, 'tcx>,
+fn llvm_fixup_output<'ll, 'tcx>(
+    bx: &mut Builder<'_, 'll, 'tcx>,
     mut value: &'ll Value,
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
     match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
-            if let Primitive::Int(Integer::I8, _) = s.value {
+            if let Primitive::Int(Integer::I8, _) = s.primitive() {
                 bx.extract_element(value, bx.const_i32(0))
             } else {
                 value
@@ -904,7 +999,7 @@ fn llvm_fixup_output(
         }
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg_low16), Abi::Scalar(s)) => {
             value = bx.extract_element(value, bx.const_i32(0));
-            if let Primitive::Pointer = s.value {
+            if let Primitive::Pointer(_) = s.primitive() {
                 value = bx.inttoptr(value, layout.llvm_type(bx.cx));
             }
             value
@@ -919,7 +1014,7 @@ fn llvm_fixup_output(
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
         (InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd), Abi::Scalar(s))
-            if s.value == Primitive::F64 =>
+            if s.primitive() == Primitive::F64 =>
         {
             bx.bitcast(value, bx.cx.type_f64())
         }
@@ -931,7 +1026,7 @@ fn llvm_fixup_output(
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg | ArmInlineAsmRegClass::sreg_low16),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I32, _) = s.value {
+            if let Primitive::Int(Integer::I32, _) = s.primitive() {
                 bx.bitcast(value, bx.cx.type_i32())
             } else {
                 value
@@ -945,33 +1040,35 @@ fn llvm_fixup_output(
             ),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I64, _) = s.value {
+            if let Primitive::Int(Integer::I64, _) = s.primitive() {
                 bx.bitcast(value, bx.cx.type_i64())
             } else {
                 value
             }
         }
-        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
-            // MIPS only supports register-length arithmetics.
-            Primitive::Int(Integer::I8, _) => bx.trunc(value, bx.cx.type_i8()),
-            Primitive::Int(Integer::I16, _) => bx.trunc(value, bx.cx.type_i16()),
-            Primitive::F32 => bx.bitcast(value, bx.cx.type_f32()),
-            Primitive::F64 => bx.bitcast(value, bx.cx.type_f64()),
-            _ => value,
-        },
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => {
+            match s.primitive() {
+                // MIPS only supports register-length arithmetics.
+                Primitive::Int(Integer::I8, _) => bx.trunc(value, bx.cx.type_i8()),
+                Primitive::Int(Integer::I16, _) => bx.trunc(value, bx.cx.type_i16()),
+                Primitive::F32 => bx.bitcast(value, bx.cx.type_f32()),
+                Primitive::F64 => bx.bitcast(value, bx.cx.type_f64()),
+                _ => value,
+            }
+        }
         _ => value,
     }
 }
 
 /// Output type to use for llvm_fixup_output.
-fn llvm_fixup_output_type(
+fn llvm_fixup_output_type<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Type {
     match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
-            if let Primitive::Int(Integer::I8, _) = s.value {
+            if let Primitive::Int(Integer::I8, _) = s.primitive() {
                 cx.type_vector(cx.type_i8(), 8)
             } else {
                 layout.llvm_type(cx)
@@ -990,7 +1087,7 @@ fn llvm_fixup_output_type(
             cx.type_vector(elem_ty, count * 2)
         }
         (InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd), Abi::Scalar(s))
-            if s.value == Primitive::F64 =>
+            if s.primitive() == Primitive::F64 =>
         {
             cx.type_i64()
         }
@@ -1002,7 +1099,7 @@ fn llvm_fixup_output_type(
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg | ArmInlineAsmRegClass::sreg_low16),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I32, _) = s.value {
+            if let Primitive::Int(Integer::I32, _) = s.primitive() {
                 cx.type_f32()
             } else {
                 layout.llvm_type(cx)
@@ -1016,19 +1113,21 @@ fn llvm_fixup_output_type(
             ),
             Abi::Scalar(s),
         ) => {
-            if let Primitive::Int(Integer::I64, _) = s.value {
+            if let Primitive::Int(Integer::I64, _) = s.primitive() {
                 cx.type_f64()
             } else {
                 layout.llvm_type(cx)
             }
         }
-        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
-            // MIPS only supports register-length arithmetics.
-            Primitive::Int(Integer::I8 | Integer::I16, _) => cx.type_i32(),
-            Primitive::F32 => cx.type_i32(),
-            Primitive::F64 => cx.type_i64(),
-            _ => layout.llvm_type(cx),
-        },
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => {
+            match s.primitive() {
+                // MIPS only supports register-length arithmetics.
+                Primitive::Int(Integer::I8 | Integer::I16, _) => cx.type_i32(),
+                Primitive::F32 => cx.type_i32(),
+                Primitive::F64 => cx.type_i64(),
+                _ => layout.llvm_type(cx),
+            }
+        }
         _ => layout.llvm_type(cx),
     }
 }

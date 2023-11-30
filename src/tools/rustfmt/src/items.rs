@@ -18,7 +18,8 @@ use crate::config::lists::*;
 use crate::config::{BraceStyle, Config, IndentStyle, Version};
 use crate::expr::{
     is_empty_block, is_simple_block_stmt, rewrite_assign_rhs, rewrite_assign_rhs_with,
-    rewrite_assign_rhs_with_comments, RhsTactics,
+    rewrite_assign_rhs_with_comments, rewrite_else_kw_with_comments, rewrite_let_else_block,
+    RhsAssignKind, RhsTactics,
 };
 use crate::lists::{definitive_tactic, itemize_list, write_list, ListFormatting, Separator};
 use crate::macros::{rewrite_macro, MacroPosition};
@@ -28,6 +29,7 @@ use crate::shape::{Indent, Shape};
 use crate::source_map::{LineRangeUtils, SpanUtils};
 use crate::spanned::Spanned;
 use crate::stmt::Stmt;
+use crate::types::opaque_ty;
 use crate::utils::*;
 use crate::vertical::rewrite_with_alignment;
 use crate::visitor::FmtVisitor;
@@ -43,7 +45,7 @@ fn type_annotation_separator(config: &Config) -> &str {
 }
 
 // Statements of the form
-// let pat: ty = init;
+// let pat: ty = init; or let pat: ty = init else { .. };
 impl Rewrite for ast::Local {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
         debug!(
@@ -53,7 +55,7 @@ impl Rewrite for ast::Local {
 
         skip_out_of_file_lines_range!(context, self.span);
 
-        if contains_skip(&self.attrs) || matches!(self.kind, ast::LocalKind::InitElse(..)) {
+        if contains_skip(&self.attrs) {
             return None;
         }
 
@@ -73,6 +75,7 @@ impl Rewrite for ast::Local {
                 false,
             )?
         };
+        let let_kw_offset = result.len() - "let ".len();
 
         // 4 = "let ".len()
         let pat_shape = shape.offset_left(4)?;
@@ -111,17 +114,132 @@ impl Rewrite for ast::Local {
 
         result.push_str(&infix);
 
-        if let Some((init, _els)) = self.kind.init_else_opt() {
+        if let Some((init, else_block)) = self.kind.init_else_opt() {
             // 1 = trailing semicolon;
             let nested_shape = shape.sub_width(1)?;
 
-            result = rewrite_assign_rhs(context, result, init, nested_shape)?;
-            // todo else
+            result = rewrite_assign_rhs(
+                context,
+                result,
+                init,
+                &RhsAssignKind::Expr(&init.kind, init.span),
+                nested_shape,
+            )?;
+
+            if let Some(block) = else_block {
+                let else_kw_span = init.span.between(block.span);
+                // Strip attributes and comments to check if newline is needed before the else
+                // keyword from the initializer part. (#5901)
+                let init_str = if context.config.version() == Version::Two {
+                    &result[let_kw_offset..]
+                } else {
+                    result.as_str()
+                };
+                let force_newline_else = pat_str.contains('\n')
+                    || !same_line_else_kw_and_brace(init_str, context, else_kw_span, nested_shape);
+                let else_kw = rewrite_else_kw_with_comments(
+                    force_newline_else,
+                    true,
+                    context,
+                    else_kw_span,
+                    shape,
+                );
+                result.push_str(&else_kw);
+
+                // At this point we've written `let {pat} = {expr} else' into the buffer, and we
+                // want to calculate up front if there's room to write the divergent block on the
+                // same line. The available space varies based on indentation so we clamp the width
+                // on the smaller of `shape.width` and `single_line_let_else_max_width`.
+                let max_width =
+                    std::cmp::min(shape.width, context.config.single_line_let_else_max_width());
+
+                // If available_space hits zero we know for sure this will be a multi-lined block
+                let assign_str_with_else_kw = if context.config.version() == Version::Two {
+                    &result[let_kw_offset..]
+                } else {
+                    result.as_str()
+                };
+                let available_space = max_width.saturating_sub(assign_str_with_else_kw.len());
+
+                let allow_single_line = !force_newline_else
+                    && available_space > 0
+                    && allow_single_line_let_else_block(assign_str_with_else_kw, block);
+
+                let mut rw_else_block =
+                    rewrite_let_else_block(block, allow_single_line, context, shape)?;
+
+                let single_line_else = !rw_else_block.contains('\n');
+                // +1 for the trailing `;`
+                let else_block_exceeds_width = rw_else_block.len() + 1 > available_space;
+
+                if allow_single_line && single_line_else && else_block_exceeds_width {
+                    // writing this on one line would exceed the available width
+                    // so rewrite the else block over multiple lines.
+                    rw_else_block = rewrite_let_else_block(block, false, context, shape)?;
+                }
+
+                result.push_str(&rw_else_block);
+            };
         }
 
         result.push(';');
         Some(result)
     }
+}
+
+/// When the initializer expression is multi-lined, then the else keyword and opening brace of the
+/// block ( i.e. "else {") should be put on the same line as the end of the initializer expression
+/// if all the following are true:
+///
+/// 1. The initializer expression ends with one or more closing parentheses, square brackets,
+///    or braces
+/// 2. There is nothing else on that line
+/// 3. That line is not indented beyond the indent on the first line of the let keyword
+fn same_line_else_kw_and_brace(
+    init_str: &str,
+    context: &RewriteContext<'_>,
+    else_kw_span: Span,
+    init_shape: Shape,
+) -> bool {
+    if !init_str.contains('\n') {
+        // initializer expression is single lined. The "else {" can only be placed on the same line
+        // as the initializer expression if there is enough room for it.
+        // 7 = ` else {`
+        return init_shape.width.saturating_sub(init_str.len()) >= 7;
+    }
+
+    // 1. The initializer expression ends with one or more `)`, `]`, `}`.
+    if !init_str.ends_with([')', ']', '}']) {
+        return false;
+    }
+
+    // 2. There is nothing else on that line
+    // For example, there are no comments
+    let else_kw_snippet = context.snippet(else_kw_span).trim();
+    if else_kw_snippet != "else" {
+        return false;
+    }
+
+    // 3. The last line of the initializer expression is not indented beyond the `let` keyword
+    let indent = init_shape.indent.to_string(context.config);
+    init_str
+        .lines()
+        .last()
+        .expect("initializer expression is multi-lined")
+        .strip_prefix(indent.as_ref())
+        .map_or(false, |l| !l.starts_with(char::is_whitespace))
+}
+
+fn allow_single_line_let_else_block(result: &str, block: &ast::Block) -> bool {
+    if result.contains('\n') {
+        return false;
+    }
+
+    if block.stmts.len() <= 1 {
+        return true;
+    }
+
+    false
 }
 
 // FIXME convert to using rewrite style rather than visitor
@@ -141,9 +259,8 @@ impl<'a> Item<'a> {
         Item {
             unsafety: fm.unsafety,
             abi: format_extern(
-                ast::Extern::from_abi(fm.abi),
+                ast::Extern::from_abi(fm.abi, DUMMY_SP),
                 config.force_explicit_abi(),
-                true,
             ),
             vis: None,
             body: fm
@@ -197,27 +314,24 @@ impl<'a> FnSig<'a> {
 
     pub(crate) fn from_fn_kind(
         fn_kind: &'a visit::FnKind<'_>,
-        generics: &'a ast::Generics,
         decl: &'a ast::FnDecl,
         defaultness: ast::Defaultness,
     ) -> FnSig<'a> {
         match *fn_kind {
-            visit::FnKind::Fn(fn_ctxt, _, fn_sig, vis, _) => match fn_ctxt {
-                visit::FnCtxt::Assoc(..) => {
-                    let mut fn_sig = FnSig::from_method_sig(fn_sig, generics, vis);
-                    fn_sig.defaultness = defaultness;
-                    fn_sig
-                }
-                _ => FnSig {
-                    decl,
-                    generics,
-                    ext: fn_sig.header.ext,
-                    constness: fn_sig.header.constness,
-                    is_async: Cow::Borrowed(&fn_sig.header.asyncness),
-                    defaultness,
-                    unsafety: fn_sig.header.unsafety,
-                    visibility: vis,
-                },
+            visit::FnKind::Fn(visit::FnCtxt::Assoc(..), _, fn_sig, vis, generics, _) => {
+                let mut fn_sig = FnSig::from_method_sig(fn_sig, generics, vis);
+                fn_sig.defaultness = defaultness;
+                fn_sig
+            }
+            visit::FnKind::Fn(_, _, fn_sig, vis, generics, _) => FnSig {
+                decl,
+                generics,
+                ext: fn_sig.header.ext,
+                constness: fn_sig.header.constness,
+                is_async: Cow::Borrowed(&fn_sig.header.asyncness),
+                defaultness,
+                unsafety: fn_sig.header.unsafety,
+                visibility: vis,
             },
             _ => unreachable!(),
         }
@@ -234,7 +348,6 @@ impl<'a> FnSig<'a> {
         result.push_str(&format_extern(
             self.ext,
             context.config.force_explicit_abi(),
-            false,
         ));
         result
     }
@@ -368,7 +481,7 @@ impl<'a> FmtVisitor<'a> {
             && self.block_indent.width() + fn_str.len() + 3 <= self.config.max_width()
             && !last_line_contains_single_line_comment(fn_str)
         {
-            return Some(format!("{} {{}}", fn_str));
+            return Some(format!("{fn_str} {{}}"));
         }
 
         if !self.config.fn_single_line() || !is_simple_block_stmt(&context, block, None) {
@@ -380,7 +493,7 @@ impl<'a> FmtVisitor<'a> {
 
         let width = self.block_indent.width() + fn_str.len() + res.len() + 5;
         if !res.contains('\n') && width <= self.config.max_width() {
-            Some(format!("{} {{ {} }}", fn_str, res))
+            Some(format!("{fn_str} {{ {res} }}"))
         } else {
             None
         }
@@ -554,7 +667,7 @@ impl<'a> FmtVisitor<'a> {
         let variant_body = match field.data {
             ast::VariantData::Tuple(..) | ast::VariantData::Struct(..) => format_struct(
                 &context,
-                &StructParts::from_variant(field),
+                &StructParts::from_variant(field, &context),
                 self.block_indent,
                 Some(one_line_width),
             )?,
@@ -562,12 +675,14 @@ impl<'a> FmtVisitor<'a> {
         };
 
         let variant_body = if let Some(ref expr) = field.disr_expr {
-            let lhs = format!("{:1$} =", variant_body, pad_discrim_ident_to);
+            let lhs = format!("{variant_body:pad_discrim_ident_to$} =");
+            let ex = &*expr.value;
             rewrite_assign_rhs_with(
                 &context,
                 lhs,
-                &*expr.value,
+                ex,
                 shape,
+                &RhsAssignKind::Expr(&ex.kind, ex.span),
                 RhsTactics::AllowOverflow,
             )?
         } else {
@@ -579,6 +694,22 @@ impl<'a> FmtVisitor<'a> {
 
     fn visit_impl_items(&mut self, items: &[ptr::P<ast::AssocItem>]) {
         if self.get_context().config.reorder_impl_items() {
+            type TyOpt = Option<ptr::P<ast::Ty>>;
+            use crate::ast::AssocItemKind::*;
+            let is_type = |ty: &TyOpt| opaque_ty(ty).is_none();
+            let is_opaque = |ty: &TyOpt| opaque_ty(ty).is_some();
+            let both_type = |l: &TyOpt, r: &TyOpt| is_type(l) && is_type(r);
+            let both_opaque = |l: &TyOpt, r: &TyOpt| is_opaque(l) && is_opaque(r);
+            let need_empty_line = |a: &ast::AssocItemKind, b: &ast::AssocItemKind| match (a, b) {
+                (Type(lty), Type(rty))
+                    if both_type(&lty.ty, &rty.ty) || both_opaque(&lty.ty, &rty.ty) =>
+                {
+                    false
+                }
+                (Const(..), Const(..)) => false,
+                _ => true,
+            };
+
             // Create visitor for each items, then reorder them.
             let mut buffer = vec![];
             for item in items {
@@ -587,64 +718,20 @@ impl<'a> FmtVisitor<'a> {
                 self.buffer.clear();
             }
 
-            fn is_type(ty: &Option<rustc_ast::ptr::P<ast::Ty>>) -> bool {
-                if let Some(lty) = ty {
-                    if let ast::TyKind::ImplTrait(..) = lty.kind {
-                        return false;
-                    }
-                }
-                true
-            }
-
-            fn is_opaque(ty: &Option<rustc_ast::ptr::P<ast::Ty>>) -> bool {
-                !is_type(ty)
-            }
-
-            fn both_type(
-                a: &Option<rustc_ast::ptr::P<ast::Ty>>,
-                b: &Option<rustc_ast::ptr::P<ast::Ty>>,
-            ) -> bool {
-                is_type(a) && is_type(b)
-            }
-
-            fn both_opaque(
-                a: &Option<rustc_ast::ptr::P<ast::Ty>>,
-                b: &Option<rustc_ast::ptr::P<ast::Ty>>,
-            ) -> bool {
-                is_opaque(a) && is_opaque(b)
-            }
-
-            // In rustc-ap-v638 the `OpaqueTy` AssocItemKind variant was removed but
-            // we still need to differentiate to maintain sorting order.
-
-            // type -> opaque -> const -> macro -> method
-            use crate::ast::AssocItemKind::*;
-            fn need_empty_line(a: &ast::AssocItemKind, b: &ast::AssocItemKind) -> bool {
-                match (a, b) {
-                    (TyAlias(lty), TyAlias(rty))
-                        if both_type(&lty.ty, &rty.ty) || both_opaque(&lty.ty, &rty.ty) =>
-                    {
-                        false
-                    }
-                    (Const(..), Const(..)) => false,
-                    _ => true,
-                }
-            }
-
             buffer.sort_by(|(_, a), (_, b)| match (&a.kind, &b.kind) {
-                (TyAlias(lty), TyAlias(rty))
+                (Type(lty), Type(rty))
                     if both_type(&lty.ty, &rty.ty) || both_opaque(&lty.ty, &rty.ty) =>
                 {
-                    a.ident.as_str().cmp(&b.ident.as_str())
+                    a.ident.as_str().cmp(b.ident.as_str())
                 }
                 (Const(..), Const(..)) | (MacCall(..), MacCall(..)) => {
-                    a.ident.as_str().cmp(&b.ident.as_str())
+                    a.ident.as_str().cmp(b.ident.as_str())
                 }
                 (Fn(..), Fn(..)) => a.span.lo().cmp(&b.span.lo()),
-                (TyAlias(ty), _) if is_type(&ty.ty) => Ordering::Less,
-                (_, TyAlias(ty)) if is_type(&ty.ty) => Ordering::Greater,
-                (TyAlias(..), _) => Ordering::Less,
-                (_, TyAlias(..)) => Ordering::Greater,
+                (Type(ty), _) if is_type(&ty.ty) => Ordering::Less,
+                (_, Type(ty)) if is_type(&ty.ty) => Ordering::Greater,
+                (Type(..), _) => Ordering::Less,
+                (_, Type(..)) => Ordering::Greater,
                 (Const(..), _) => Ordering::Less,
                 (_, Const(..)) => Ordering::Greater,
                 (MacCall(..), _) => Ordering::Less,
@@ -676,136 +763,134 @@ impl<'a> FmtVisitor<'a> {
 pub(crate) fn format_impl(
     context: &RewriteContext<'_>,
     item: &ast::Item,
+    iimpl: &ast::Impl,
     offset: Indent,
 ) -> Option<String> {
-    if let ast::ItemKind::Impl(impl_kind) = &item.kind {
-        let ast::Impl {
-            ref generics,
-            ref self_ty,
-            ref items,
-            ..
-        } = **impl_kind;
-        let mut result = String::with_capacity(128);
-        let ref_and_type = format_impl_ref_and_type(context, item, offset)?;
-        let sep = offset.to_string_with_newline(context.config);
-        result.push_str(&ref_and_type);
+    let ast::Impl {
+        generics,
+        self_ty,
+        items,
+        ..
+    } = iimpl;
+    let mut result = String::with_capacity(128);
+    let ref_and_type = format_impl_ref_and_type(context, item, iimpl, offset)?;
+    let sep = offset.to_string_with_newline(context.config);
+    result.push_str(&ref_and_type);
 
-        let where_budget = if result.contains('\n') {
-            context.config.max_width()
-        } else {
-            context.budget(last_line_width(&result))
-        };
-
-        let mut option = WhereClauseOption::snuggled(&ref_and_type);
-        let snippet = context.snippet(item.span);
-        let open_pos = snippet.find_uncommented("{")? + 1;
-        if !contains_comment(&snippet[open_pos..])
-            && items.is_empty()
-            && generics.where_clause.predicates.len() == 1
-            && !result.contains('\n')
-        {
-            option.suppress_comma();
-            option.snuggle();
-            option.allow_single_line();
-        }
-
-        let missing_span = mk_sp(self_ty.span.hi(), item.span.hi());
-        let where_span_end = context.snippet_provider.opt_span_before(missing_span, "{");
-        let where_clause_str = rewrite_where_clause(
-            context,
-            &generics.where_clause,
-            context.config.brace_style(),
-            Shape::legacy(where_budget, offset.block_only()),
-            false,
-            "{",
-            where_span_end,
-            self_ty.span.hi(),
-            option,
-        )?;
-
-        // If there is no where-clause, we may have missing comments between the trait name and
-        // the opening brace.
-        if generics.where_clause.predicates.is_empty() {
-            if let Some(hi) = where_span_end {
-                match recover_missing_comment_in_span(
-                    mk_sp(self_ty.span.hi(), hi),
-                    Shape::indented(offset, context.config),
-                    context,
-                    last_line_width(&result),
-                ) {
-                    Some(ref missing_comment) if !missing_comment.is_empty() => {
-                        result.push_str(missing_comment);
-                    }
-                    _ => (),
-                }
-            }
-        }
-
-        if is_impl_single_line(context, items.as_slice(), &result, &where_clause_str, item)? {
-            result.push_str(&where_clause_str);
-            if where_clause_str.contains('\n') || last_line_contains_single_line_comment(&result) {
-                // if the where_clause contains extra comments AND
-                // there is only one where-clause predicate
-                // recover the suppressed comma in single line where_clause formatting
-                if generics.where_clause.predicates.len() == 1 {
-                    result.push(',');
-                }
-                result.push_str(&format!("{}{{{}}}", sep, sep));
-            } else {
-                result.push_str(" {}");
-            }
-            return Some(result);
-        }
-
-        result.push_str(&where_clause_str);
-
-        let need_newline = last_line_contains_single_line_comment(&result) || result.contains('\n');
-        match context.config.brace_style() {
-            _ if need_newline => result.push_str(&sep),
-            BraceStyle::AlwaysNextLine => result.push_str(&sep),
-            BraceStyle::PreferSameLine => result.push(' '),
-            BraceStyle::SameLineWhere => {
-                if !where_clause_str.is_empty() {
-                    result.push_str(&sep);
-                } else {
-                    result.push(' ');
-                }
-            }
-        }
-
-        result.push('{');
-        // this is an impl body snippet(impl SampleImpl { /* here */ })
-        let lo = max(self_ty.span.hi(), generics.where_clause.span.hi());
-        let snippet = context.snippet(mk_sp(lo, item.span.hi()));
-        let open_pos = snippet.find_uncommented("{")? + 1;
-
-        if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
-            let mut visitor = FmtVisitor::from_context(context);
-            let item_indent = offset.block_only().block_indent(context.config);
-            visitor.block_indent = item_indent;
-            visitor.last_pos = lo + BytePos(open_pos as u32);
-
-            visitor.visit_attrs(&item.attrs, ast::AttrStyle::Inner);
-            visitor.visit_impl_items(items);
-
-            visitor.format_missing(item.span.hi() - BytePos(1));
-
-            let inner_indent_str = visitor.block_indent.to_string_with_newline(context.config);
-            let outer_indent_str = offset.block_only().to_string_with_newline(context.config);
-
-            result.push_str(&inner_indent_str);
-            result.push_str(visitor.buffer.trim());
-            result.push_str(&outer_indent_str);
-        } else if need_newline || !context.config.empty_item_single_line() {
-            result.push_str(&sep);
-        }
-
-        result.push('}');
-
-        Some(result)
+    let where_budget = if result.contains('\n') {
+        context.config.max_width()
     } else {
-        unreachable!();
+        context.budget(last_line_width(&result))
+    };
+
+    let mut option = WhereClauseOption::snuggled(&ref_and_type);
+    let snippet = context.snippet(item.span);
+    let open_pos = snippet.find_uncommented("{")? + 1;
+    if !contains_comment(&snippet[open_pos..])
+        && items.is_empty()
+        && generics.where_clause.predicates.len() == 1
+        && !result.contains('\n')
+    {
+        option.suppress_comma();
+        option.snuggle();
+        option.allow_single_line();
     }
+
+    let missing_span = mk_sp(self_ty.span.hi(), item.span.hi());
+    let where_span_end = context.snippet_provider.opt_span_before(missing_span, "{");
+    let where_clause_str = rewrite_where_clause(
+        context,
+        &generics.where_clause.predicates,
+        generics.where_clause.span,
+        context.config.brace_style(),
+        Shape::legacy(where_budget, offset.block_only()),
+        false,
+        "{",
+        where_span_end,
+        self_ty.span.hi(),
+        option,
+    )?;
+
+    // If there is no where-clause, we may have missing comments between the trait name and
+    // the opening brace.
+    if generics.where_clause.predicates.is_empty() {
+        if let Some(hi) = where_span_end {
+            match recover_missing_comment_in_span(
+                mk_sp(self_ty.span.hi(), hi),
+                Shape::indented(offset, context.config),
+                context,
+                last_line_width(&result),
+            ) {
+                Some(ref missing_comment) if !missing_comment.is_empty() => {
+                    result.push_str(missing_comment);
+                }
+                _ => (),
+            }
+        }
+    }
+
+    if is_impl_single_line(context, items.as_slice(), &result, &where_clause_str, item)? {
+        result.push_str(&where_clause_str);
+        if where_clause_str.contains('\n') || last_line_contains_single_line_comment(&result) {
+            // if the where_clause contains extra comments AND
+            // there is only one where-clause predicate
+            // recover the suppressed comma in single line where_clause formatting
+            if generics.where_clause.predicates.len() == 1 {
+                result.push(',');
+            }
+            result.push_str(&format!("{sep}{{{sep}}}"));
+        } else {
+            result.push_str(" {}");
+        }
+        return Some(result);
+    }
+
+    result.push_str(&where_clause_str);
+
+    let need_newline = last_line_contains_single_line_comment(&result) || result.contains('\n');
+    match context.config.brace_style() {
+        _ if need_newline => result.push_str(&sep),
+        BraceStyle::AlwaysNextLine => result.push_str(&sep),
+        BraceStyle::PreferSameLine => result.push(' '),
+        BraceStyle::SameLineWhere => {
+            if !where_clause_str.is_empty() {
+                result.push_str(&sep);
+            } else {
+                result.push(' ');
+            }
+        }
+    }
+
+    result.push('{');
+    // this is an impl body snippet(impl SampleImpl { /* here */ })
+    let lo = max(self_ty.span.hi(), generics.where_clause.span.hi());
+    let snippet = context.snippet(mk_sp(lo, item.span.hi()));
+    let open_pos = snippet.find_uncommented("{")? + 1;
+
+    if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
+        let mut visitor = FmtVisitor::from_context(context);
+        let item_indent = offset.block_only().block_indent(context.config);
+        visitor.block_indent = item_indent;
+        visitor.last_pos = lo + BytePos(open_pos as u32);
+
+        visitor.visit_attrs(&item.attrs, ast::AttrStyle::Inner);
+        visitor.visit_impl_items(items);
+
+        visitor.format_missing(item.span.hi() - BytePos(1));
+
+        let inner_indent_str = visitor.block_indent.to_string_with_newline(context.config);
+        let outer_indent_str = offset.block_only().to_string_with_newline(context.config);
+
+        result.push_str(&inner_indent_str);
+        result.push_str(visitor.buffer.trim());
+        result.push_str(&outer_indent_str);
+    } else if need_newline || !context.config.empty_item_single_line() {
+        result.push_str(&sep);
+    }
+
+    result.push('}');
+
+    Some(result)
 }
 
 fn is_impl_single_line(
@@ -830,111 +915,106 @@ fn is_impl_single_line(
 fn format_impl_ref_and_type(
     context: &RewriteContext<'_>,
     item: &ast::Item,
+    iimpl: &ast::Impl,
     offset: Indent,
 ) -> Option<String> {
-    if let ast::ItemKind::Impl(impl_kind) = &item.kind {
-        let ast::Impl {
-            unsafety,
-            polarity,
-            defaultness,
-            constness,
-            ref generics,
-            of_trait: ref trait_ref,
-            ref self_ty,
-            ..
-        } = **impl_kind;
-        let mut result = String::with_capacity(128);
+    let ast::Impl {
+        unsafety,
+        polarity,
+        defaultness,
+        constness,
+        ref generics,
+        of_trait: ref trait_ref,
+        ref self_ty,
+        ..
+    } = *iimpl;
+    let mut result = String::with_capacity(128);
 
-        result.push_str(&format_visibility(context, &item.vis));
-        result.push_str(format_defaultness(defaultness));
-        result.push_str(format_unsafety(unsafety));
+    result.push_str(&format_visibility(context, &item.vis));
+    result.push_str(format_defaultness(defaultness));
+    result.push_str(format_unsafety(unsafety));
 
-        let shape = if context.config.version() == Version::Two {
-            Shape::indented(offset + last_line_width(&result), context.config)
-        } else {
-            generics_shape_from_config(
-                context.config,
-                Shape::indented(offset + last_line_width(&result), context.config),
-                0,
-            )?
-        };
-        let generics_str = rewrite_generics(context, "impl", generics, shape)?;
-        result.push_str(&generics_str);
-        result.push_str(format_constness_right(constness));
-
-        let polarity_str = match polarity {
-            ast::ImplPolarity::Negative(_) => "!",
-            ast::ImplPolarity::Positive => "",
-        };
-
-        let polarity_overhead;
-        let trait_ref_overhead;
-        if let Some(ref trait_ref) = *trait_ref {
-            let result_len = last_line_width(&result);
-            result.push_str(&rewrite_trait_ref(
-                context,
-                trait_ref,
-                offset,
-                polarity_str,
-                result_len,
-            )?);
-            polarity_overhead = 0; // already written
-            trait_ref_overhead = " for".len();
-        } else {
-            polarity_overhead = polarity_str.len();
-            trait_ref_overhead = 0;
-        }
-
-        // Try to put the self type in a single line.
-        let curly_brace_overhead = if generics.where_clause.predicates.is_empty() {
-            // If there is no where-clause adapt budget for type formatting to take space and curly
-            // brace into account.
-            match context.config.brace_style() {
-                BraceStyle::AlwaysNextLine => 0,
-                _ => 2,
-            }
-        } else {
-            0
-        };
-        let used_space = last_line_width(&result)
-            + polarity_overhead
-            + trait_ref_overhead
-            + curly_brace_overhead;
-        // 1 = space before the type.
-        let budget = context.budget(used_space + 1);
-        if let Some(self_ty_str) = self_ty.rewrite(context, Shape::legacy(budget, offset)) {
-            if !self_ty_str.contains('\n') {
-                if trait_ref.is_some() {
-                    result.push_str(" for ");
-                } else {
-                    result.push(' ');
-                    result.push_str(polarity_str);
-                }
-                result.push_str(&self_ty_str);
-                return Some(result);
-            }
-        }
-
-        // Couldn't fit the self type on a single line, put it on a new line.
-        result.push('\n');
-        // Add indentation of one additional tab.
-        let new_line_offset = offset.block_indent(context.config);
-        result.push_str(&new_line_offset.to_string(context.config));
-        if trait_ref.is_some() {
-            result.push_str("for ");
-        } else {
-            result.push_str(polarity_str);
-        }
-        let budget = context.budget(last_line_width(&result) + polarity_overhead);
-        let type_offset = match context.config.indent_style() {
-            IndentStyle::Visual => new_line_offset + trait_ref_overhead,
-            IndentStyle::Block => new_line_offset,
-        };
-        result.push_str(&*self_ty.rewrite(context, Shape::legacy(budget, type_offset))?);
-        Some(result)
+    let shape = if context.config.version() == Version::Two {
+        Shape::indented(offset + last_line_width(&result), context.config)
     } else {
-        unreachable!();
+        generics_shape_from_config(
+            context.config,
+            Shape::indented(offset + last_line_width(&result), context.config),
+            0,
+        )?
+    };
+    let generics_str = rewrite_generics(context, "impl", generics, shape)?;
+    result.push_str(&generics_str);
+    result.push_str(format_constness_right(constness));
+
+    let polarity_str = match polarity {
+        ast::ImplPolarity::Negative(_) => "!",
+        ast::ImplPolarity::Positive => "",
+    };
+
+    let polarity_overhead;
+    let trait_ref_overhead;
+    if let Some(ref trait_ref) = *trait_ref {
+        let result_len = last_line_width(&result);
+        result.push_str(&rewrite_trait_ref(
+            context,
+            trait_ref,
+            offset,
+            polarity_str,
+            result_len,
+        )?);
+        polarity_overhead = 0; // already written
+        trait_ref_overhead = " for".len();
+    } else {
+        polarity_overhead = polarity_str.len();
+        trait_ref_overhead = 0;
     }
+
+    // Try to put the self type in a single line.
+    let curly_brace_overhead = if generics.where_clause.predicates.is_empty() {
+        // If there is no where-clause adapt budget for type formatting to take space and curly
+        // brace into account.
+        match context.config.brace_style() {
+            BraceStyle::AlwaysNextLine => 0,
+            _ => 2,
+        }
+    } else {
+        0
+    };
+    let used_space =
+        last_line_width(&result) + polarity_overhead + trait_ref_overhead + curly_brace_overhead;
+    // 1 = space before the type.
+    let budget = context.budget(used_space + 1);
+    if let Some(self_ty_str) = self_ty.rewrite(context, Shape::legacy(budget, offset)) {
+        if !self_ty_str.contains('\n') {
+            if trait_ref.is_some() {
+                result.push_str(" for ");
+            } else {
+                result.push(' ');
+                result.push_str(polarity_str);
+            }
+            result.push_str(&self_ty_str);
+            return Some(result);
+        }
+    }
+
+    // Couldn't fit the self type on a single line, put it on a new line.
+    result.push('\n');
+    // Add indentation of one additional tab.
+    let new_line_offset = offset.block_indent(context.config);
+    result.push_str(&new_line_offset.to_string(context.config));
+    if trait_ref.is_some() {
+        result.push_str("for ");
+    } else {
+        result.push_str(polarity_str);
+    }
+    let budget = context.budget(last_line_width(&result) + polarity_overhead);
+    let type_offset = match context.config.indent_style() {
+        IndentStyle::Visual => new_line_offset + trait_ref_overhead,
+        IndentStyle::Block => new_line_offset,
+    };
+    result.push_str(&*self_ty.rewrite(context, Shape::legacy(budget, type_offset))?);
+    Some(result)
 }
 
 fn rewrite_trait_ref(
@@ -949,7 +1029,7 @@ fn rewrite_trait_ref(
     let shape = Shape::indented(offset + used_space, context.config);
     if let Some(trait_ref_str) = trait_ref.rewrite(context, shape) {
         if !trait_ref_str.contains('\n') {
-            return Some(format!(" {}{}", polarity_str, trait_ref_str));
+            return Some(format!(" {polarity_str}{trait_ref_str}"));
         }
     }
     // We could not make enough space for trait_ref, so put it on new line.
@@ -978,14 +1058,14 @@ impl<'a> StructParts<'a> {
         format_header(context, self.prefix, self.ident, self.vis, offset)
     }
 
-    fn from_variant(variant: &'a ast::Variant) -> Self {
+    fn from_variant(variant: &'a ast::Variant, context: &RewriteContext<'_>) -> Self {
         StructParts {
             prefix: "",
             ident: variant.ident,
             vis: &DEFAULT_VISIBILITY,
             def: &variant.data,
             generics: None,
-            span: variant.span,
+            span: enum_variant_span(variant, context),
         }
     }
 
@@ -1003,6 +1083,25 @@ impl<'a> StructParts<'a> {
             generics: Some(generics),
             span: item.span,
         }
+    }
+}
+
+fn enum_variant_span(variant: &ast::Variant, context: &RewriteContext<'_>) -> Span {
+    use ast::VariantData::*;
+    if let Some(ref anon_const) = variant.disr_expr {
+        let span_before_consts = variant.span.until(anon_const.value.span);
+        let hi = match &variant.data {
+            Struct(..) => context
+                .snippet_provider
+                .span_after_last(span_before_consts, "}"),
+            Tuple(..) => context
+                .snippet_provider
+                .span_after_last(span_before_consts, ")"),
+            Unit(..) => variant.ident.span.hi(),
+        };
+        mk_sp(span_before_consts.lo(), hi)
+    } else {
+        variant.span
     }
 }
 
@@ -1028,166 +1127,172 @@ pub(crate) fn format_trait(
     item: &ast::Item,
     offset: Indent,
 ) -> Option<String> {
-    if let ast::ItemKind::Trait(trait_kind) = &item.kind {
-        let ast::Trait {
-            is_auto,
-            unsafety,
-            ref generics,
-            ref bounds,
-            ref items,
-        } = **trait_kind;
-        let mut result = String::with_capacity(128);
-        let header = format!(
-            "{}{}{}trait ",
-            format_visibility(context, &item.vis),
-            format_unsafety(unsafety),
-            format_auto(is_auto),
-        );
-        result.push_str(&header);
-
-        let body_lo = context.snippet_provider.span_after(item.span, "{");
-
-        let shape = Shape::indented(offset, context.config).offset_left(result.len())?;
-        let generics_str =
-            rewrite_generics(context, rewrite_ident(context, item.ident), generics, shape)?;
-        result.push_str(&generics_str);
-
-        // FIXME(#2055): rustfmt fails to format when there are comments between trait bounds.
-        if !bounds.is_empty() {
-            let ident_hi = context
-                .snippet_provider
-                .span_after(item.span, &item.ident.as_str());
-            let bound_hi = bounds.last().unwrap().span().hi();
-            let snippet = context.snippet(mk_sp(ident_hi, bound_hi));
-            if contains_comment(snippet) {
-                return None;
-            }
-
-            result = rewrite_assign_rhs_with(
-                context,
-                result + ":",
-                bounds,
-                shape,
-                RhsTactics::ForceNextLineWithoutIndent,
-            )?;
-        }
-
-        // Rewrite where-clause.
-        if !generics.where_clause.predicates.is_empty() {
-            let where_on_new_line = context.config.indent_style() != IndentStyle::Block;
-
-            let where_budget = context.budget(last_line_width(&result));
-            let pos_before_where = if bounds.is_empty() {
-                generics.where_clause.span.lo()
-            } else {
-                bounds[bounds.len() - 1].span().hi()
-            };
-            let option = WhereClauseOption::snuggled(&generics_str);
-            let where_clause_str = rewrite_where_clause(
-                context,
-                &generics.where_clause,
-                context.config.brace_style(),
-                Shape::legacy(where_budget, offset.block_only()),
-                where_on_new_line,
-                "{",
-                None,
-                pos_before_where,
-                option,
-            )?;
-            // If the where-clause cannot fit on the same line,
-            // put the where-clause on a new line
-            if !where_clause_str.contains('\n')
-                && last_line_width(&result) + where_clause_str.len() + offset.width()
-                    > context.config.comment_width()
-            {
-                let width = offset.block_indent + context.config.tab_spaces() - 1;
-                let where_indent = Indent::new(0, width);
-                result.push_str(&where_indent.to_string_with_newline(context.config));
-            }
-            result.push_str(&where_clause_str);
-        } else {
-            let item_snippet = context.snippet(item.span);
-            if let Some(lo) = item_snippet.find('/') {
-                // 1 = `{`
-                let comment_hi = body_lo - BytePos(1);
-                let comment_lo = item.span.lo() + BytePos(lo as u32);
-                if comment_lo < comment_hi {
-                    match recover_missing_comment_in_span(
-                        mk_sp(comment_lo, comment_hi),
-                        Shape::indented(offset, context.config),
-                        context,
-                        last_line_width(&result),
-                    ) {
-                        Some(ref missing_comment) if !missing_comment.is_empty() => {
-                            result.push_str(missing_comment);
-                        }
-                        _ => (),
-                    }
-                }
-            }
-        }
-
-        let block_span = mk_sp(generics.where_clause.span.hi(), item.span.hi());
-        let snippet = context.snippet(block_span);
-        let open_pos = snippet.find_uncommented("{")? + 1;
-
-        match context.config.brace_style() {
-            _ if last_line_contains_single_line_comment(&result)
-                || last_line_width(&result) + 2 > context.budget(offset.width()) =>
-            {
-                result.push_str(&offset.to_string_with_newline(context.config));
-            }
-            _ if context.config.empty_item_single_line()
-                && items.is_empty()
-                && !result.contains('\n')
-                && !contains_comment(&snippet[open_pos..]) =>
-            {
-                result.push_str(" {}");
-                return Some(result);
-            }
-            BraceStyle::AlwaysNextLine => {
-                result.push_str(&offset.to_string_with_newline(context.config));
-            }
-            BraceStyle::PreferSameLine => result.push(' '),
-            BraceStyle::SameLineWhere => {
-                if result.contains('\n')
-                    || (!generics.where_clause.predicates.is_empty() && !items.is_empty())
-                {
-                    result.push_str(&offset.to_string_with_newline(context.config));
-                } else {
-                    result.push(' ');
-                }
-            }
-        }
-        result.push('{');
-
-        let outer_indent_str = offset.block_only().to_string_with_newline(context.config);
-
-        if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
-            let mut visitor = FmtVisitor::from_context(context);
-            visitor.block_indent = offset.block_only().block_indent(context.config);
-            visitor.last_pos = block_span.lo() + BytePos(open_pos as u32);
-
-            for item in items {
-                visitor.visit_trait_item(item);
-            }
-
-            visitor.format_missing(item.span.hi() - BytePos(1));
-
-            let inner_indent_str = visitor.block_indent.to_string_with_newline(context.config);
-
-            result.push_str(&inner_indent_str);
-            result.push_str(visitor.buffer.trim());
-            result.push_str(&outer_indent_str);
-        } else if result.contains('\n') {
-            result.push_str(&outer_indent_str);
-        }
-
-        result.push('}');
-        Some(result)
-    } else {
+    let ast::ItemKind::Trait(trait_kind) = &item.kind else {
         unreachable!();
+    };
+    let ast::Trait {
+        is_auto,
+        unsafety,
+        ref generics,
+        ref bounds,
+        ref items,
+    } = **trait_kind;
+
+    let mut result = String::with_capacity(128);
+    let header = format!(
+        "{}{}{}trait ",
+        format_visibility(context, &item.vis),
+        format_unsafety(unsafety),
+        format_auto(is_auto),
+    );
+    result.push_str(&header);
+
+    let body_lo = context.snippet_provider.span_after(item.span, "{");
+
+    let shape = Shape::indented(offset, context.config).offset_left(result.len())?;
+    let generics_str =
+        rewrite_generics(context, rewrite_ident(context, item.ident), generics, shape)?;
+    result.push_str(&generics_str);
+
+    // FIXME(#2055): rustfmt fails to format when there are comments between trait bounds.
+    if !bounds.is_empty() {
+        let ident_hi = context
+            .snippet_provider
+            .span_after(item.span, item.ident.as_str());
+        let bound_hi = bounds.last().unwrap().span().hi();
+        let snippet = context.snippet(mk_sp(ident_hi, bound_hi));
+        if contains_comment(snippet) {
+            return None;
+        }
+
+        result = rewrite_assign_rhs_with(
+            context,
+            result + ":",
+            bounds,
+            shape,
+            &RhsAssignKind::Bounds,
+            RhsTactics::ForceNextLineWithoutIndent,
+        )?;
     }
+
+    // Rewrite where-clause.
+    if !generics.where_clause.predicates.is_empty() {
+        let where_on_new_line = context.config.indent_style() != IndentStyle::Block;
+
+        let where_budget = context.budget(last_line_width(&result));
+        let pos_before_where = if bounds.is_empty() {
+            generics.where_clause.span.lo()
+        } else {
+            bounds[bounds.len() - 1].span().hi()
+        };
+        let option = WhereClauseOption::snuggled(&generics_str);
+        let where_clause_str = rewrite_where_clause(
+            context,
+            &generics.where_clause.predicates,
+            generics.where_clause.span,
+            context.config.brace_style(),
+            Shape::legacy(where_budget, offset.block_only()),
+            where_on_new_line,
+            "{",
+            None,
+            pos_before_where,
+            option,
+        )?;
+        // If the where-clause cannot fit on the same line,
+        // put the where-clause on a new line
+        if !where_clause_str.contains('\n')
+            && last_line_width(&result) + where_clause_str.len() + offset.width()
+                > context.config.comment_width()
+        {
+            let width = offset.block_indent + context.config.tab_spaces() - 1;
+            let where_indent = Indent::new(0, width);
+            result.push_str(&where_indent.to_string_with_newline(context.config));
+        }
+        result.push_str(&where_clause_str);
+    } else {
+        let item_snippet = context.snippet(item.span);
+        if let Some(lo) = item_snippet.find('/') {
+            // 1 = `{`
+            let comment_hi = if generics.params.len() > 0 {
+                generics.span.lo() - BytePos(1)
+            } else {
+                body_lo - BytePos(1)
+            };
+            let comment_lo = item.span.lo() + BytePos(lo as u32);
+            if comment_lo < comment_hi {
+                match recover_missing_comment_in_span(
+                    mk_sp(comment_lo, comment_hi),
+                    Shape::indented(offset, context.config),
+                    context,
+                    last_line_width(&result),
+                ) {
+                    Some(ref missing_comment) if !missing_comment.is_empty() => {
+                        result.push_str(missing_comment);
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    let block_span = mk_sp(generics.where_clause.span.hi(), item.span.hi());
+    let snippet = context.snippet(block_span);
+    let open_pos = snippet.find_uncommented("{")? + 1;
+
+    match context.config.brace_style() {
+        _ if last_line_contains_single_line_comment(&result)
+            || last_line_width(&result) + 2 > context.budget(offset.width()) =>
+        {
+            result.push_str(&offset.to_string_with_newline(context.config));
+        }
+        _ if context.config.empty_item_single_line()
+            && items.is_empty()
+            && !result.contains('\n')
+            && !contains_comment(&snippet[open_pos..]) =>
+        {
+            result.push_str(" {}");
+            return Some(result);
+        }
+        BraceStyle::AlwaysNextLine => {
+            result.push_str(&offset.to_string_with_newline(context.config));
+        }
+        BraceStyle::PreferSameLine => result.push(' '),
+        BraceStyle::SameLineWhere => {
+            if result.contains('\n')
+                || (!generics.where_clause.predicates.is_empty() && !items.is_empty())
+            {
+                result.push_str(&offset.to_string_with_newline(context.config));
+            } else {
+                result.push(' ');
+            }
+        }
+    }
+    result.push('{');
+
+    let outer_indent_str = offset.block_only().to_string_with_newline(context.config);
+
+    if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
+        let mut visitor = FmtVisitor::from_context(context);
+        visitor.block_indent = offset.block_only().block_indent(context.config);
+        visitor.last_pos = block_span.lo() + BytePos(open_pos as u32);
+
+        for item in items {
+            visitor.visit_trait_item(item);
+        }
+
+        visitor.format_missing(item.span.hi() - BytePos(1));
+
+        let inner_indent_str = visitor.block_indent.to_string_with_newline(context.config);
+
+        result.push_str(&inner_indent_str);
+        result.push_str(visitor.buffer.trim());
+        result.push_str(&outer_indent_str);
+    } else if result.contains('\n') {
+        result.push_str(&outer_indent_str);
+    }
+
+    result.push('}');
+    Some(result)
 }
 
 pub(crate) struct TraitAliasBounds<'a> {
@@ -1204,7 +1309,8 @@ impl<'a> Rewrite for TraitAliasBounds<'a> {
 
         let where_str = rewrite_where_clause(
             context,
-            &self.generics.where_clause,
+            &self.generics.where_clause.predicates,
+            self.generics.where_clause.span,
             context.config.brace_style(),
             shape,
             false,
@@ -1225,7 +1331,7 @@ impl<'a> Rewrite for TraitAliasBounds<'a> {
             shape.indent.to_string_with_newline(context.config)
         };
 
-        Some(format!("{}{}{}", generic_bounds_str, space, where_str))
+        Some(format!("{generic_bounds_str}{space}{where_str}"))
     }
 }
 
@@ -1242,13 +1348,20 @@ pub(crate) fn format_trait_alias(
     let g_shape = shape.offset_left(6)?.sub_width(2)?;
     let generics_str = rewrite_generics(context, alias, generics, g_shape)?;
     let vis_str = format_visibility(context, vis);
-    let lhs = format!("{}trait {} =", vis_str, generics_str);
+    let lhs = format!("{vis_str}trait {generics_str} =");
     // 1 = ";"
     let trait_alias_bounds = TraitAliasBounds {
         generic_bounds,
         generics,
     };
-    rewrite_assign_rhs(context, lhs, &trait_alias_bounds, shape.sub_width(1)?).map(|s| s + ";")
+    rewrite_assign_rhs(
+        context,
+        lhs,
+        &trait_alias_bounds,
+        &RhsAssignKind::Bounds,
+        shape.sub_width(1)?,
+    )
+    .map(|s| s + ";")
 }
 
 fn format_unit_struct(
@@ -1258,7 +1371,7 @@ fn format_unit_struct(
 ) -> Option<String> {
     let header_str = format_header(context, p.prefix, p.ident, p.vis, offset);
     let generics_str = if let Some(generics) = p.generics {
-        let hi = context.snippet_provider.span_before(p.span, ";");
+        let hi = context.snippet_provider.span_before_last(p.span, ";");
         format_generics(
             context,
             generics,
@@ -1272,7 +1385,7 @@ fn format_unit_struct(
     } else {
         String::new()
     };
-    Some(format!("{}{};", header_str, generics_str))
+    Some(format!("{header_str}{generics_str};"))
 }
 
 pub(crate) fn format_struct_struct(
@@ -1289,7 +1402,13 @@ pub(crate) fn format_struct_struct(
     result.push_str(&header_str);
 
     let header_hi = struct_parts.ident.span.hi();
-    let body_lo = context.snippet_provider.span_after(span, "{");
+    let body_lo = if let Some(generics) = struct_parts.generics {
+        // Adjust the span to start at the end of the generic arguments before searching for the '{'
+        let span = span.with_lo(generics.where_clause.span.hi());
+        context.snippet_provider.span_after(span, "{")
+    } else {
+        context.snippet_provider.span_after(span, "{")
+    };
 
     let generics_str = match struct_parts.generics {
         Some(g) => format_generics(
@@ -1356,7 +1475,7 @@ pub(crate) fn format_struct_struct(
         && items_str.len() <= one_line_budget
         && !last_line_contains_single_line_comment(&items_str)
     {
-        Some(format!("{} {} }}", result, items_str))
+        Some(format!("{result} {items_str} }}"))
     } else {
         Some(format!(
             "{}\n{}{}\n{}}}",
@@ -1372,7 +1491,7 @@ pub(crate) fn format_struct_struct(
 
 fn get_bytepos_after_visibility(vis: &ast::Visibility, default_span: Span) -> BytePos {
     match vis.kind {
-        ast::VisibilityKind::Crate(..) | ast::VisibilityKind::Restricted { .. } => vis.span.hi(),
+        ast::VisibilityKind::Restricted { .. } => vis.span.hi(),
         _ => default_span.lo(),
     }
 }
@@ -1393,17 +1512,21 @@ fn format_empty_struct_or_tuple(
         result.push_str(&offset.to_string_with_newline(context.config))
     }
     result.push_str(opener);
-    match rewrite_missing_comment(span, Shape::indented(offset, context.config), context) {
+
+    // indented shape for proper indenting of multi-line comments
+    let shape = Shape::indented(offset.block_indent(context.config), context.config);
+    match rewrite_missing_comment(span, shape, context) {
         Some(ref s) if s.is_empty() => (),
         Some(ref s) => {
-            if !is_single_line(s) || first_line_contains_single_line_comment(s) {
+            let is_multi_line = !is_single_line(s);
+            if is_multi_line || first_line_contains_single_line_comment(s) {
                 let nested_indent_str = offset
                     .block_indent(context.config)
                     .to_string_with_newline(context.config);
                 result.push_str(&nested_indent_str);
             }
             result.push_str(s);
-            if last_line_contains_single_line_comment(s) {
+            if is_multi_line || last_line_contains_single_line_comment(s) {
                 result.push_str(&offset.to_string_with_newline(context.config));
             }
         }
@@ -1456,7 +1579,8 @@ fn format_tuple_struct(
             let option = WhereClauseOption::new(true, WhereClauseSpace::Newline);
             rewrite_where_clause(
                 context,
-                &generics.where_clause,
+                &generics.where_clause.predicates,
+                generics.where_clause.span,
                 context.config.brace_style(),
                 Shape::legacy(where_budget, offset.block_only()),
                 false,
@@ -1522,6 +1646,8 @@ struct TyAliasRewriteInfo<'c, 'g>(
     &'c RewriteContext<'c>,
     Indent,
     &'g ast::Generics,
+    (ast::TyAliasWhereClause, ast::TyAliasWhereClause),
+    usize,
     symbol::Ident,
     Span,
 );
@@ -1540,43 +1666,48 @@ pub(crate) fn rewrite_type_alias<'a, 'b>(
         ref generics,
         ref bounds,
         ref ty,
+        where_clauses,
+        where_predicates_split,
     } = *ty_alias_kind;
-    let ty_opt = ty.as_ref().map(|t| &**t);
+    let ty_opt = ty.as_ref();
     let (ident, vis) = match visitor_kind {
         Item(i) => (i.ident, &i.vis),
         AssocTraitItem(i) | AssocImplItem(i) => (i.ident, &i.vis),
         ForeignItem(i) => (i.ident, &i.vis),
     };
-    let rw_info = &TyAliasRewriteInfo(context, indent, generics, ident, span);
-
+    let rw_info = &TyAliasRewriteInfo(
+        context,
+        indent,
+        generics,
+        where_clauses,
+        where_predicates_split,
+        ident,
+        span,
+    );
+    let op_ty = opaque_ty(ty);
     // Type Aliases are formatted slightly differently depending on the context
     // in which they appear, whether they are opaque, and whether they are associated.
     // https://rustc-dev-guide.rust-lang.org/opaque-types-type-alias-impl-trait.html
     // https://github.com/rust-dev-tools/fmt-rfcs/blob/master/guide/items.md#type-aliases
-    match (visitor_kind, ty_opt) {
-        (Item(_), None) => {
-            let op_ty = OpaqueType { bounds };
-            rewrite_ty(rw_info, Some(bounds), Some(&op_ty), vis)
+    match (visitor_kind, &op_ty) {
+        (Item(_) | AssocTraitItem(_) | ForeignItem(_), Some(op_bounds)) => {
+            let op = OpaqueType { bounds: op_bounds };
+            rewrite_ty(rw_info, Some(bounds), Some(&op), vis)
         }
-        (Item(_), Some(ty)) => rewrite_ty(rw_info, Some(bounds), Some(&*ty), vis),
+        (Item(_) | AssocTraitItem(_) | ForeignItem(_), None) => {
+            rewrite_ty(rw_info, Some(bounds), ty_opt, vis)
+        }
         (AssocImplItem(_), _) => {
-            let result = if let Some(ast::Ty {
-                kind: ast::TyKind::ImplTrait(_, ref bounds),
-                ..
-            }) = ty_opt
-            {
-                let op_ty = OpaqueType { bounds };
-                rewrite_ty(rw_info, None, Some(&op_ty), &DEFAULT_VISIBILITY)
+            let result = if let Some(op_bounds) = op_ty {
+                let op = OpaqueType { bounds: op_bounds };
+                rewrite_ty(rw_info, Some(bounds), Some(&op), &DEFAULT_VISIBILITY)
             } else {
-                rewrite_ty(rw_info, None, ty.as_ref(), vis)
+                rewrite_ty(rw_info, Some(bounds), ty_opt, vis)
             }?;
             match defaultness {
-                ast::Defaultness::Default(..) => Some(format!("default {}", result)),
+                ast::Defaultness::Default(..) => Some(format!("default {result}")),
                 _ => Some(result),
             }
-        }
-        (AssocTraitItem(_), _) | (ForeignItem(_), _) => {
-            rewrite_ty(rw_info, Some(bounds), ty.as_ref(), vis)
         }
     }
 }
@@ -1588,7 +1719,22 @@ fn rewrite_ty<R: Rewrite>(
     vis: &ast::Visibility,
 ) -> Option<String> {
     let mut result = String::with_capacity(128);
-    let TyAliasRewriteInfo(context, indent, generics, ident, span) = *rw_info;
+    let TyAliasRewriteInfo(
+        context,
+        indent,
+        generics,
+        where_clauses,
+        where_predicates_split,
+        ident,
+        span,
+    ) = *rw_info;
+    let (before_where_predicates, after_where_predicates) = generics
+        .where_clause
+        .predicates
+        .split_at(where_predicates_split);
+    if !after_where_predicates.is_empty() {
+        return None;
+    }
     result.push_str(&format!("{}type ", format_visibility(context, vis)));
     let ident_str = rewrite_ident(context, ident);
 
@@ -1619,7 +1765,8 @@ fn rewrite_ty<R: Rewrite>(
     }
     let where_clause_str = rewrite_where_clause(
         context,
-        &generics.where_clause,
+        before_where_predicates,
+        where_clauses.0.1,
         context.config.brace_style(),
         Shape::legacy(where_budget, indent),
         false,
@@ -1633,7 +1780,7 @@ fn rewrite_ty<R: Rewrite>(
     if let Some(ty) = rhs {
         // If there's a where clause, add a newline before the assignment. Otherwise just add a
         // space.
-        let has_where = !generics.where_clause.predicates.is_empty();
+        let has_where = !before_where_predicates.is_empty();
         if has_where {
             result.push_str(&indent.to_string_with_newline(context.config));
         } else {
@@ -1643,7 +1790,7 @@ fn rewrite_ty<R: Rewrite>(
         let comment_span = context
             .snippet_provider
             .opt_span_before(span, "=")
-            .map(|op_lo| mk_sp(generics.where_clause.span.hi(), op_lo));
+            .map(|op_lo| mk_sp(where_clauses.0.1.hi(), op_lo));
 
         let lhs = match comment_span {
             Some(comment_span)
@@ -1665,14 +1812,14 @@ fn rewrite_ty<R: Rewrite>(
                     true,
                 )?
             }
-            _ => format!("{}=", result),
+            _ => format!("{result}="),
         };
 
         // 1 = `;`
         let shape = Shape::indented(indent, context.config).sub_width(1)?;
-        rewrite_assign_rhs(context, lhs, &*ty, shape).map(|s| s + ";")
+        rewrite_assign_rhs(context, lhs, &*ty, &RhsAssignKind::Ty, shape).map(|s| s + ";")
     } else {
-        Some(format!("{};", result))
+        Some(format!("{result};"))
     }
 }
 
@@ -1753,14 +1900,14 @@ pub(crate) fn rewrite_struct_field(
         .offset_left(overhead + spacing.len())
         .and_then(|ty_shape| field.ty.rewrite(context, ty_shape));
     if let Some(ref ty) = orig_ty {
-        if !ty.contains('\n') {
+        if !ty.contains('\n') && !contains_comment(context.snippet(missing_span)) {
             return Some(attr_prefix + &spacing + ty);
         }
     }
 
     let is_prefix_empty = prefix.is_empty();
     // We must use multiline. We are going to put attributes and a field on different lines.
-    let field_str = rewrite_assign_rhs(context, prefix, &*field.ty, shape)?;
+    let field_str = rewrite_assign_rhs(context, prefix, &*field.ty, &RhsAssignKind::Ty, shape)?;
     // Remove a leading white-space from `rewrite_assign_rhs()` when rewriting a tuple struct.
     let field_str = if is_prefix_empty {
         field_str.trim_start()
@@ -1783,13 +1930,15 @@ pub(crate) struct StaticParts<'a> {
 
 impl<'a> StaticParts<'a> {
     pub(crate) fn from_item(item: &'a ast::Item) -> Self {
-        let (defaultness, prefix, ty, mutability, expr) = match item.kind {
-            ast::ItemKind::Static(ref ty, mutability, ref expr) => {
-                (None, "static", ty, mutability, expr)
-            }
-            ast::ItemKind::Const(defaultness, ref ty, ref expr) => {
-                (Some(defaultness), "const", ty, ast::Mutability::Not, expr)
-            }
+        let (defaultness, prefix, ty, mutability, expr) = match &item.kind {
+            ast::ItemKind::Static(s) => (None, "static", &s.ty, s.mutability, &s.expr),
+            ast::ItemKind::Const(c) => (
+                Some(c.defaultness),
+                "const",
+                &c.ty,
+                ast::Mutability::Not,
+                &c.expr,
+            ),
             _ => unreachable!(),
         };
         StaticParts {
@@ -1805,10 +1954,8 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_trait_item(ti: &'a ast::AssocItem) -> Self {
-        let (defaultness, ty, expr_opt) = match ti.kind {
-            ast::AssocItemKind::Const(defaultness, ref ty, ref expr_opt) => {
-                (defaultness, ty, expr_opt)
-            }
+        let (defaultness, ty, expr_opt) = match &ti.kind {
+            ast::AssocItemKind::Const(c) => (c.defaultness, &c.ty, &c.expr),
             _ => unreachable!(),
         };
         StaticParts {
@@ -1824,8 +1971,8 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_impl_item(ii: &'a ast::AssocItem) -> Self {
-        let (defaultness, ty, expr) = match ii.kind {
-            ast::AssocItemKind::Const(defaultness, ref ty, ref expr) => (defaultness, ty, expr),
+        let (defaultness, ty, expr) = match &ii.kind {
+            ast::AssocItemKind::Const(c) => (c.defaultness, &c.ty, &c.expr),
             _ => unreachable!(),
         };
         StaticParts {
@@ -1881,7 +2028,7 @@ fn rewrite_static(
         let expr_lo = expr.span.lo();
         let comments_span = mk_sp(comments_lo, expr_lo);
 
-        let lhs = format!("{}{} =", prefix, ty_str);
+        let lhs = format!("{prefix}{ty_str} =");
 
         // 1 = ;
         let remaining_width = context.budget(offset.block_indent + 1);
@@ -1890,6 +2037,7 @@ fn rewrite_static(
             &lhs,
             &**expr,
             Shape::legacy(remaining_width, offset.block_only()),
+            &RhsAssignKind::Expr(&expr.kind, expr.span),
             RhsTactics::Default,
             comments_span,
             true,
@@ -1897,9 +2045,15 @@ fn rewrite_static(
         .and_then(|res| recover_comment_removed(res, static_parts.span, context))
         .map(|s| if s.ends_with(';') { s } else { s + ";" })
     } else {
-        Some(format!("{}{};", prefix, ty_str))
+        Some(format!("{prefix}{ty_str};"))
     }
 }
+
+// FIXME(calebcartwright) - This is a hack around a bug in the handling of TyKind::ImplTrait.
+// This should be removed once that bug is resolved, with the type alias formatting using the
+// defined Ty for the RHS directly.
+// https://github.com/rust-lang/rustfmt/issues/4373
+// https://github.com/rust-lang/rustfmt/issues/5027
 struct OpaqueType<'a> {
     bounds: &'a ast::GenericBounds,
 }
@@ -2031,9 +2185,15 @@ impl Rewrite for ast::Param {
                 {
                     result.push_str(&ty_str);
                 } else {
+                    let prev_str = if param_attrs_result.is_empty() {
+                        param_attrs_result
+                    } else {
+                        param_attrs_result + &shape.to_string_with_newline(context.config)
+                    };
+
                     result = combine_strs_with_missing_comments(
                         context,
-                        &(param_attrs_result + &shape.to_string_with_newline(context.config)),
+                        &prev_str,
                         param_name,
                         span,
                         shape,
@@ -2078,7 +2238,7 @@ fn rewrite_explicit_self(
                     Some(combine_strs_with_missing_comments(
                         context,
                         param_attrs,
-                        &format!("&{} {}self", lifetime_str, mut_str),
+                        &format!("&{lifetime_str} {mut_str}self"),
                         span,
                         shape,
                         !has_multiple_attr_lines,
@@ -2087,7 +2247,7 @@ fn rewrite_explicit_self(
                 None => Some(combine_strs_with_missing_comments(
                     context,
                     param_attrs,
-                    &format!("&{}self", mut_str),
+                    &format!("&{mut_str}self"),
                     span,
                     shape,
                     !has_multiple_attr_lines,
@@ -2193,7 +2353,7 @@ fn rewrite_fn_base(
     let generics_str = rewrite_generics(
         context,
         rewrite_ident(context, ident),
-        fn_sig.generics,
+        &fn_sig.generics,
         shape,
     )?;
     result.push_str(&generics_str);
@@ -2433,7 +2593,8 @@ fn rewrite_fn_base(
     }
     let where_clause_str = rewrite_where_clause(
         context,
-        where_clause,
+        &where_clause.predicates,
+        where_clause.span,
         context.config.brace_style(),
         Shape::indented(indent, context.config),
         true,
@@ -2447,7 +2608,8 @@ fn rewrite_fn_base(
     if where_clause_str.is_empty() {
         if let ast::FnRetTy::Default(ret_span) = fd.output {
             match recover_missing_comment_in_span(
-                mk_sp(params_span.hi(), ret_span.hi()),
+                // from after the closing paren to right before block or semicolon
+                mk_sp(ret_span.lo(), span.hi()),
                 shape,
                 context,
                 last_line_width(&result),
@@ -2571,7 +2733,7 @@ fn rewrite_params(
         &param_items,
         context
             .config
-            .fn_args_layout()
+            .fn_params_layout()
             .to_list_tactic(param_items.len()),
         Separator::Comma,
         one_line_budget,
@@ -2709,7 +2871,8 @@ fn generics_shape_from_config(config: &Config, shape: Shape, offset: usize) -> O
 
 fn rewrite_where_clause_rfc_style(
     context: &RewriteContext<'_>,
-    where_clause: &ast::WhereClause,
+    predicates: &[ast::WherePredicate],
+    where_span: Span,
     shape: Shape,
     terminator: &str,
     span_end: Option<BytePos>,
@@ -2718,7 +2881,8 @@ fn rewrite_where_clause_rfc_style(
 ) -> Option<String> {
     let (where_keyword, allow_single_line) = rewrite_where_keyword(
         context,
-        where_clause,
+        predicates,
+        where_span,
         shape,
         span_end_before_where,
         where_clause_option,
@@ -2731,12 +2895,12 @@ fn rewrite_where_clause_rfc_style(
         .block_left(context.config.tab_spaces())?
         .sub_width(1)?;
     let force_single_line = context.config.where_single_line()
-        && where_clause.predicates.len() == 1
+        && predicates.len() == 1
         && !where_clause_option.veto_single_line;
 
     let preds_str = rewrite_bounds_on_where_clause(
         context,
-        where_clause,
+        predicates,
         clause_shape,
         terminator,
         span_end,
@@ -2754,13 +2918,14 @@ fn rewrite_where_clause_rfc_style(
             clause_shape.indent.to_string_with_newline(context.config)
         };
 
-    Some(format!("{}{}{}", where_keyword, clause_sep, preds_str))
+    Some(format!("{where_keyword}{clause_sep}{preds_str}"))
 }
 
 /// Rewrite `where` and comment around it.
 fn rewrite_where_keyword(
     context: &RewriteContext<'_>,
-    where_clause: &ast::WhereClause,
+    predicates: &[ast::WherePredicate],
+    where_span: Span,
     shape: Shape,
     span_end_before_where: BytePos,
     where_clause_option: WhereClauseOption,
@@ -2780,7 +2945,7 @@ fn rewrite_where_keyword(
     };
 
     let (span_before, span_after) =
-        missing_span_before_after_where(span_end_before_where, where_clause);
+        missing_span_before_after_where(span_end_before_where, predicates, where_span);
     let (comment_before, comment_after) =
         rewrite_comments_before_after_where(context, span_before, span_after, shape)?;
 
@@ -2793,8 +2958,8 @@ fn rewrite_where_keyword(
     let newline_before_where = comment_separator(&comment_before, shape);
     let newline_after_where = comment_separator(&comment_after, clause_shape);
     let result = format!(
-        "{}{}{}where{}{}",
-        starting_newline, comment_before, newline_before_where, newline_after_where, comment_after
+        "{starting_newline}{comment_before}{newline_before_where}where\
+{newline_after_where}{comment_after}"
     );
     let allow_single_line = where_clause_option.allow_single_line
         && comment_before.is_empty()
@@ -2806,22 +2971,22 @@ fn rewrite_where_keyword(
 /// Rewrite bounds on a where clause.
 fn rewrite_bounds_on_where_clause(
     context: &RewriteContext<'_>,
-    where_clause: &ast::WhereClause,
+    predicates: &[ast::WherePredicate],
     shape: Shape,
     terminator: &str,
     span_end: Option<BytePos>,
     where_clause_option: WhereClauseOption,
     force_single_line: bool,
 ) -> Option<String> {
-    let span_start = where_clause.predicates[0].span().lo();
+    let span_start = predicates[0].span().lo();
     // If we don't have the start of the next span, then use the end of the
     // predicates, but that means we miss comments.
-    let len = where_clause.predicates.len();
-    let end_of_preds = where_clause.predicates[len - 1].span().hi();
+    let len = predicates.len();
+    let end_of_preds = predicates[len - 1].span().hi();
     let span_end = span_end.unwrap_or(end_of_preds);
     let items = itemize_list(
         context.snippet_provider,
-        where_clause.predicates.iter(),
+        predicates.iter(),
         terminator,
         ",",
         |pred| pred.span().lo(),
@@ -2845,16 +3010,19 @@ fn rewrite_bounds_on_where_clause(
         DefinitiveListTactic::Vertical
     };
 
+    let preserve_newline = context.config.version() == Version::One;
+
     let fmt = ListFormatting::new(shape, context.config)
         .tactic(shape_tactic)
         .trailing_separator(comma_tactic)
-        .preserve_newline(true);
+        .preserve_newline(preserve_newline);
     write_list(&items.collect::<Vec<_>>(), &fmt)
 }
 
 fn rewrite_where_clause(
     context: &RewriteContext<'_>,
-    where_clause: &ast::WhereClause,
+    predicates: &[ast::WherePredicate],
+    where_span: Span,
     brace_style: BraceStyle,
     shape: Shape,
     on_new_line: bool,
@@ -2863,14 +3031,15 @@ fn rewrite_where_clause(
     span_end_before_where: BytePos,
     where_clause_option: WhereClauseOption,
 ) -> Option<String> {
-    if where_clause.predicates.is_empty() {
+    if predicates.is_empty() {
         return Some(String::new());
     }
 
     if context.config.indent_style() == IndentStyle::Block {
         return rewrite_where_clause_rfc_style(
             context,
-            where_clause,
+            predicates,
+            where_span,
             shape,
             terminator,
             span_end,
@@ -2890,15 +3059,15 @@ fn rewrite_where_clause(
     // be out by a char or two.
 
     let budget = context.config.max_width() - offset.width();
-    let span_start = where_clause.predicates[0].span().lo();
+    let span_start = predicates[0].span().lo();
     // If we don't have the start of the next span, then use the end of the
     // predicates, but that means we miss comments.
-    let len = where_clause.predicates.len();
-    let end_of_preds = where_clause.predicates[len - 1].span().hi();
+    let len = predicates.len();
+    let end_of_preds = predicates[len - 1].span().hi();
     let span_end = span_end.unwrap_or(end_of_preds);
     let items = itemize_list(
         context.snippet_provider,
-        where_clause.predicates.iter(),
+        predicates.iter(),
         terminator,
         ",",
         |pred| pred.span().lo(),
@@ -2947,18 +3116,19 @@ fn rewrite_where_clause(
             preds_str
         ))
     } else {
-        Some(format!(" where {}", preds_str))
+        Some(format!(" where {preds_str}"))
     }
 }
 
 fn missing_span_before_after_where(
     before_item_span_end: BytePos,
-    where_clause: &ast::WhereClause,
+    predicates: &[ast::WherePredicate],
+    where_span: Span,
 ) -> (Span, Span) {
-    let missing_span_before = mk_sp(before_item_span_end, where_clause.span.lo());
+    let missing_span_before = mk_sp(before_item_span_end, where_span.lo());
     // 5 = `where`
-    let pos_after_where = where_clause.span.lo() + BytePos(5);
-    let missing_span_after = mk_sp(pos_after_where, where_clause.predicates[0].span().lo());
+    let pos_after_where = where_span.lo() + BytePos(5);
+    let missing_span_after = mk_sp(pos_after_where, predicates[0].span().lo());
     (missing_span_before, missing_span_after)
 }
 
@@ -3047,7 +3217,8 @@ fn format_generics(
         }
         let where_clause_str = rewrite_where_clause(
             context,
-            &generics.where_clause,
+            &generics.where_clause.predicates,
+            generics.where_clause.span,
             brace_style,
             Shape::legacy(budget, offset.block_only()),
             true,
@@ -3074,7 +3245,7 @@ fn format_generics(
                     if brace_pos == BracePos::None {
                         span.hi()
                     } else {
-                        context.snippet_provider.span_before(span, "{")
+                        context.snippet_provider.span_before_last(span, "{")
                     },
                 ),
                 shape,
@@ -3141,8 +3312,14 @@ impl Rewrite for ast::ForeignItem {
                     let inner_attrs = inner_attributes(&self.attrs);
                     let fn_ctxt = visit::FnCtxt::Foreign;
                     visitor.visit_fn(
-                        visit::FnKind::Fn(fn_ctxt, self.ident, &sig, &self.vis, Some(body)),
-                        generics,
+                        visit::FnKind::Fn(
+                            fn_ctxt,
+                            self.ident,
+                            sig,
+                            &self.vis,
+                            generics,
+                            Some(body),
+                        ),
                         &sig.decl,
                         self.span,
                         defaultness,
@@ -3154,7 +3331,7 @@ impl Rewrite for ast::ForeignItem {
                         context,
                         shape.indent,
                         self.ident,
-                        &FnSig::from_method_sig(&sig, generics, &self.vis),
+                        &FnSig::from_method_sig(sig, generics, &self.vis),
                         span,
                         FnBraceStyle::None,
                     )
@@ -3173,10 +3350,17 @@ impl Rewrite for ast::ForeignItem {
                     rewrite_ident(context, self.ident)
                 );
                 // 1 = ;
-                rewrite_assign_rhs(context, prefix, &**ty, shape.sub_width(1)?).map(|s| s + ";")
+                rewrite_assign_rhs(
+                    context,
+                    prefix,
+                    &**ty,
+                    &RhsAssignKind::Ty,
+                    shape.sub_width(1)?,
+                )
+                .map(|s| s + ";")
             }
             ast::ForeignItemKind::TyAlias(ref ty_alias) => {
-                let (kind, span) = (&ItemVisitorKind::ForeignItem(&self), self.span);
+                let (kind, span) = (&ItemVisitorKind::ForeignItem(self), self.span);
                 rewrite_type_alias(ty_alias, context, shape.indent, kind, span)
             }
             ast::ForeignItemKind::MacCall(ref mac) => {

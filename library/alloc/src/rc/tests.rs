@@ -32,7 +32,7 @@ fn test_simple_clone() {
 
 #[test]
 fn test_destructor() {
-    let x: Rc<Box<_>> = Rc::new(box 5);
+    let x: Rc<Box<_>> = Rc::new(Box::new(5));
     assert_eq!(**x, 5);
 }
 
@@ -152,8 +152,23 @@ fn try_unwrap() {
 }
 
 #[test]
+fn into_inner() {
+    let x = Rc::new(3);
+    assert_eq!(Rc::into_inner(x), Some(3));
+
+    let x = Rc::new(4);
+    let y = Rc::clone(&x);
+    assert_eq!(Rc::into_inner(x), None);
+    assert_eq!(Rc::into_inner(y), Some(4));
+
+    let x = Rc::new(5);
+    let _w = Rc::downgrade(&x);
+    assert_eq!(Rc::into_inner(x), Some(5));
+}
+
+#[test]
 fn into_from_raw() {
-    let x = Rc::new(box "hello");
+    let x = Rc::new(Box::new("hello"));
     let y = x.clone();
 
     let x_ptr = Rc::into_raw(x);
@@ -192,7 +207,7 @@ fn test_into_from_raw_unsized() {
 
 #[test]
 fn into_from_weak_raw() {
-    let x = Rc::new(box "hello");
+    let x = Rc::new(Box::new("hello"));
     let y = Rc::downgrade(&x);
 
     let y_ptr = Weak::into_raw(y);
@@ -309,7 +324,7 @@ fn test_cowrc_clone_weak() {
 #[test]
 fn test_show() {
     let foo = Rc::new(75);
-    assert_eq!(format!("{:?}", foo), "75");
+    assert_eq!(format!("{foo:?}"), "75");
 }
 
 #[test]
@@ -324,7 +339,7 @@ fn test_maybe_thin_unsized() {
     use std::ffi::{CStr, CString};
 
     let x: Rc<CStr> = Rc::from(CString::new("swordfish").unwrap().into_boxed_c_str());
-    assert_eq!(format!("{:?}", x), "\"swordfish\"");
+    assert_eq!(format!("{x:?}"), "\"swordfish\"");
     let y: Weak<CStr> = Rc::downgrade(&x);
     drop(x);
 
@@ -409,7 +424,7 @@ fn test_clone_from_slice_panic() {
 
 #[test]
 fn test_from_box() {
-    let b: Box<u32> = box 123;
+    let b: Box<u32> = Box::new(123);
     let r: Rc<u32> = Rc::from(b);
 
     assert_eq!(*r, 123);
@@ -438,7 +453,7 @@ fn test_from_box_trait() {
     use std::fmt::Display;
     use std::string::ToString;
 
-    let b: Box<dyn Display> = box 123;
+    let b: Box<dyn Display> = Box::new(123);
     let r: Rc<dyn Display> = Rc::from(b);
 
     assert_eq!(r.to_string(), "123");
@@ -448,10 +463,10 @@ fn test_from_box_trait() {
 fn test_from_box_trait_zero_sized() {
     use std::fmt::Debug;
 
-    let b: Box<dyn Debug> = box ();
+    let b: Box<dyn Debug> = Box::new(());
     let r: Rc<dyn Debug> = Rc::from(b);
 
-    assert_eq!(format!("{:?}", r), "()");
+    assert_eq!(format!("{r:?}"), "()");
 }
 
 #[test]
@@ -558,4 +573,49 @@ fn test_rc_cyclic_with_two_ref() {
 
     assert_eq!(Rc::strong_count(&two_refs), 3);
     assert_eq!(Rc::weak_count(&two_refs), 2);
+}
+
+#[test]
+fn test_unique_rc_weak() {
+    let rc = UniqueRc::new(42);
+    let weak = UniqueRc::downgrade(&rc);
+    assert!(weak.upgrade().is_none());
+
+    let _rc = UniqueRc::into_rc(rc);
+    assert_eq!(*weak.upgrade().unwrap(), 42);
+}
+
+#[test]
+fn test_unique_rc_drop_weak() {
+    let rc = UniqueRc::new(42);
+    let weak = UniqueRc::downgrade(&rc);
+    mem::drop(weak);
+
+    let rc = UniqueRc::into_rc(rc);
+    assert_eq!(*rc, 42);
+}
+
+#[test]
+fn test_unique_rc_drops_contents() {
+    let mut dropped = false;
+    struct DropMe<'a>(&'a mut bool);
+    impl Drop for DropMe<'_> {
+        fn drop(&mut self) {
+            *self.0 = true;
+        }
+    }
+    {
+        let rc = UniqueRc::new(DropMe(&mut dropped));
+        drop(rc);
+    }
+    assert!(dropped);
+}
+
+#[test]
+fn test_unique_rc_weak_clone_holding_ref() {
+    let mut v = UniqueRc::new(0u8);
+    let w = UniqueRc::downgrade(&v);
+    let r = &mut *v;
+    let _ = w.clone(); // touch weak count
+    *r = 123;
 }

@@ -1,9 +1,10 @@
 use crate::os::windows::prelude::*;
 
+use crate::borrow::Cow;
 use crate::ffi::OsString;
 use crate::fmt;
-use crate::io::{self, Error, IoSlice, IoSliceMut, SeekFrom};
-use crate::mem;
+use crate::io::{self, BorrowedCursor, Error, IoSlice, IoSliceMut, SeekFrom};
+use crate::mem::{self, MaybeUninit};
 use crate::os::windows::io::{AsHandle, BorrowedHandle};
 use crate::path::{Path, PathBuf};
 use crate::ptr;
@@ -11,11 +12,14 @@ use crate::slice;
 use crate::sync::Arc;
 use crate::sys::handle::Handle;
 use crate::sys::time::SystemTime;
-use crate::sys::{c, cvt};
+use crate::sys::{c, cvt, Align8};
 use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::thread;
+
+use core::ffi::c_void;
 
 use super::path::maybe_verbatim;
-use super::to_u16s;
+use super::{api, to_u16s, IoResult};
 
 pub struct File {
     handle: Handle,
@@ -56,6 +60,9 @@ pub struct DirEntry {
     data: c::WIN32_FIND_DATAW,
 }
 
+unsafe impl Send for OpenOptions {}
+unsafe impl Sync for OpenOptions {}
+
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     // generic
@@ -71,12 +78,26 @@ pub struct OpenOptions {
     attributes: c::DWORD,
     share_mode: c::DWORD,
     security_qos_flags: c::DWORD,
-    security_attributes: usize, // FIXME: should be a reference
+    security_attributes: c::LPSECURITY_ATTRIBUTES,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions {
     attrs: c::DWORD,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FileTimes {
+    accessed: Option<c::FILETIME>,
+    modified: Option<c::FILETIME>,
+    created: Option<c::FILETIME>,
+}
+
+impl fmt::Debug for c::FILETIME {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let time = ((self.dwHighDateTime as u64) << 32) | self.dwLowDateTime as u64;
+        f.debug_tuple("FILETIME").field(&time).finish()
+    }
 }
 
 #[derive(Debug)]
@@ -102,7 +123,7 @@ impl Iterator for ReadDir {
             let mut wfd = mem::zeroed();
             loop {
                 if c::FindNextFileW(self.handle.0, &mut wfd) == 0 {
-                    if c::GetLastError() == c::ERROR_NO_MORE_FILES {
+                    if api::get_last_error().code == c::ERROR_NO_MORE_FILES {
                         return None;
                     } else {
                         return Some(Err(Error::last_os_error()));
@@ -135,7 +156,7 @@ impl DirEntry {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.root.join(&self.file_name())
+        self.root.join(self.file_name())
     }
 
     pub fn file_name(&self) -> OsString {
@@ -151,22 +172,7 @@ impl DirEntry {
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        Ok(FileAttr {
-            attributes: self.data.dwFileAttributes,
-            creation_time: self.data.ftCreationTime,
-            last_access_time: self.data.ftLastAccessTime,
-            last_write_time: self.data.ftLastWriteTime,
-            file_size: ((self.data.nFileSizeHigh as u64) << 32) | (self.data.nFileSizeLow as u64),
-            reparse_tag: if self.data.dwFileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                // reserved unless this is a reparse point
-                self.data.dwReserved0
-            } else {
-                0
-            },
-            volume_serial_number: None,
-            number_of_links: None,
-            file_index: None,
-        })
+        Ok(self.data.into())
     }
 }
 
@@ -186,7 +192,7 @@ impl OpenOptions {
             share_mode: c::FILE_SHARE_READ | c::FILE_SHARE_WRITE | c::FILE_SHARE_DELETE,
             attributes: 0,
             security_qos_flags: 0,
-            security_attributes: 0,
+            security_attributes: ptr::null_mut(),
         }
     }
 
@@ -227,7 +233,7 @@ impl OpenOptions {
         self.security_qos_flags = flags | c::SECURITY_SQOS_PRESENT;
     }
     pub fn security_attributes(&mut self, attrs: c::LPSECURITY_ATTRIBUTES) {
-        self.security_attributes = attrs as usize;
+        self.security_attributes = attrs;
     }
 
     fn get_access_mode(&self) -> io::Result<c::DWORD> {
@@ -288,16 +294,17 @@ impl File {
                 path.as_ptr(),
                 opts.get_access_mode()?,
                 opts.share_mode,
-                opts.security_attributes as *mut _,
+                opts.security_attributes,
                 opts.get_creation_mode()?,
                 opts.get_flags_and_attributes(),
                 ptr::null_mut(),
             )
         };
-        if handle == c::INVALID_HANDLE_VALUE {
-            Err(Error::last_os_error())
+        let handle = unsafe { HandleOrInvalid::from_raw_handle(handle) };
+        if let Ok(handle) = handle.try_into() {
+            Ok(File { handle: Handle::from_inner(handle) })
         } else {
-            unsafe { Ok(File { handle: Handle::from_raw_handle(handle) }) }
+            Err(Error::last_os_error())
         }
     }
 
@@ -311,17 +318,8 @@ impl File {
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
-        let mut info = c::FILE_END_OF_FILE_INFO { EndOfFile: size as c::LARGE_INTEGER };
-        let size = mem::size_of_val(&info);
-        cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileEndOfFileInfo,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
-        })?;
-        Ok(())
+        let info = c::FILE_END_OF_FILE_INFO { EndOfFile: size as i64 };
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
     }
 
     #[cfg(not(target_vendor = "uwp"))]
@@ -331,9 +329,15 @@ impl File {
             cvt(c::GetFileInformationByHandle(self.handle.as_raw_handle(), &mut info))?;
             let mut reparse_tag = 0;
             if info.dwFileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                let mut b = [0; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-                if let Ok((_, buf)) = self.reparse_point(&mut b) {
-                    reparse_tag = buf.ReparseTag;
+                let mut attr_tag: c::FILE_ATTRIBUTE_TAG_INFO = mem::zeroed();
+                cvt(c::GetFileInformationByHandleEx(
+                    self.handle.as_raw_handle(),
+                    c::FileAttributeTagInfo,
+                    ptr::addr_of_mut!(attr_tag).cast(),
+                    mem::size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
+                ))?;
+                if attr_tag.FileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    reparse_tag = attr_tag.ReparseTag;
                 }
             }
             Ok(FileAttr {
@@ -360,7 +364,7 @@ impl File {
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
-                &mut info as *mut _ as *mut libc::c_void,
+                &mut info as *mut _ as *mut c_void,
                 size as c::DWORD,
             ))?;
             let mut attr = FileAttr {
@@ -388,15 +392,21 @@ impl File {
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileStandardInfo,
-                &mut info as *mut _ as *mut libc::c_void,
+                &mut info as *mut _ as *mut c_void,
                 size as c::DWORD,
             ))?;
             attr.file_size = info.AllocationSize as u64;
             attr.number_of_links = Some(info.NumberOfLinks);
             if attr.file_type().is_reparse_point() {
-                let mut b = [0; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-                if let Ok((_, buf)) = self.reparse_point(&mut b) {
-                    attr.reparse_tag = buf.ReparseTag;
+                let mut attr_tag: c::FILE_ATTRIBUTE_TAG_INFO = mem::zeroed();
+                cvt(c::GetFileInformationByHandleEx(
+                    self.handle.as_raw_handle(),
+                    c::FileAttributeTagInfo,
+                    ptr::addr_of_mut!(attr_tag).cast(),
+                    mem::size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
+                ))?;
+                if attr_tag.FileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    attr.reparse_tag = attr_tag.ReparseTag;
                 }
             }
             Ok(attr)
@@ -418,6 +428,10 @@ impl File {
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.handle.read_at(buf, offset)
+    }
+
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        self.handle.read_buf(cursor)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -456,96 +470,364 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        Ok(File { handle: self.handle.duplicate(0, false, c::DUPLICATE_SAME_ACCESS)? })
+        Ok(Self { handle: self.handle.try_clone()? })
     }
 
-    fn reparse_point<'a>(
+    // NB: returned pointer is derived from `space`, and has provenance to
+    // match. A raw pointer is returned rather than a reference in order to
+    // avoid narrowing provenance to the actual `REPARSE_DATA_BUFFER`.
+    fn reparse_point(
         &self,
-        space: &'a mut [u8; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE],
-    ) -> io::Result<(c::DWORD, &'a c::REPARSE_DATA_BUFFER)> {
+        space: &mut Align8<[MaybeUninit<u8>]>,
+    ) -> io::Result<(c::DWORD, *mut c::REPARSE_DATA_BUFFER)> {
         unsafe {
             let mut bytes = 0;
             cvt({
+                // Grab this in advance to avoid it invalidating the pointer
+                // we get from `space.0.as_mut_ptr()`.
+                let len = space.0.len();
                 c::DeviceIoControl(
                     self.handle.as_raw_handle(),
                     c::FSCTL_GET_REPARSE_POINT,
                     ptr::null_mut(),
                     0,
-                    space.as_mut_ptr() as *mut _,
-                    space.len() as c::DWORD,
+                    space.0.as_mut_ptr().cast(),
+                    len as c::DWORD,
                     &mut bytes,
                     ptr::null_mut(),
                 )
             })?;
-            Ok((bytes, &*(space.as_ptr() as *const c::REPARSE_DATA_BUFFER)))
+            const _: () = assert!(core::mem::align_of::<c::REPARSE_DATA_BUFFER>() <= 8);
+            Ok((bytes, space.0.as_mut_ptr().cast::<c::REPARSE_DATA_BUFFER>()))
         }
     }
 
     fn readlink(&self) -> io::Result<PathBuf> {
-        let mut space = [0u8; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        let mut space =
+            Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
         let (_bytes, buf) = self.reparse_point(&mut space)?;
         unsafe {
-            let (path_buffer, subst_off, subst_len, relative) = match buf.ReparseTag {
+            let (path_buffer, subst_off, subst_len, relative) = match (*buf).ReparseTag {
                 c::IO_REPARSE_TAG_SYMLINK => {
-                    let info: *const c::SYMBOLIC_LINK_REPARSE_BUFFER =
-                        &buf.rest as *const _ as *const _;
+                    let info: *mut c::SYMBOLIC_LINK_REPARSE_BUFFER =
+                        ptr::addr_of_mut!((*buf).rest).cast();
+                    assert!(info.is_aligned());
                     (
-                        &(*info).PathBuffer as *const _ as *const u16,
+                        ptr::addr_of_mut!((*info).PathBuffer).cast::<u16>(),
                         (*info).SubstituteNameOffset / 2,
                         (*info).SubstituteNameLength / 2,
                         (*info).Flags & c::SYMLINK_FLAG_RELATIVE != 0,
                     )
                 }
                 c::IO_REPARSE_TAG_MOUNT_POINT => {
-                    let info: *const c::MOUNT_POINT_REPARSE_BUFFER =
-                        &buf.rest as *const _ as *const _;
+                    let info: *mut c::MOUNT_POINT_REPARSE_BUFFER =
+                        ptr::addr_of_mut!((*buf).rest).cast();
+                    assert!(info.is_aligned());
                     (
-                        &(*info).PathBuffer as *const _ as *const u16,
+                        ptr::addr_of_mut!((*info).PathBuffer).cast::<u16>(),
                         (*info).SubstituteNameOffset / 2,
                         (*info).SubstituteNameLength / 2,
                         false,
                     )
                 }
                 _ => {
-                    return Err(io::Error::new_const(
+                    return Err(io::const_io_error!(
                         io::ErrorKind::Uncategorized,
-                        &"Unsupported reparse point type",
+                        "Unsupported reparse point type",
                     ));
                 }
             };
-            let subst_ptr = path_buffer.offset(subst_off as isize);
-            let mut subst = slice::from_raw_parts(subst_ptr, subst_len as usize);
+            let subst_ptr = path_buffer.add(subst_off.into());
+            let subst = slice::from_raw_parts_mut(subst_ptr, subst_len as usize);
             // Absolute paths start with an NT internal namespace prefix `\??\`
             // We should not let it leak through.
             if !relative && subst.starts_with(&[92u16, 63u16, 63u16, 92u16]) {
-                subst = &subst[4..];
+                // Turn `\??\` into `\\?\` (a verbatim path).
+                subst[1] = b'\\' as u16;
+                // Attempt to convert to a more user-friendly path.
+                let user = super::args::from_wide_to_user_path(
+                    subst.iter().copied().chain([0]).collect(),
+                )?;
+                Ok(PathBuf::from(OsString::from_wide(user.strip_suffix(&[0]).unwrap_or(&user))))
+            } else {
+                Ok(PathBuf::from(OsString::from_wide(subst)))
             }
-            Ok(PathBuf::from(OsString::from_wide(subst)))
         }
     }
 
     pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
-        let mut info = c::FILE_BASIC_INFO {
+        let info = c::FILE_BASIC_INFO {
             CreationTime: 0,
             LastAccessTime: 0,
             LastWriteTime: 0,
             ChangeTime: 0,
             FileAttributes: perm.attrs,
         };
-        let size = mem::size_of_val(&info);
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
+    }
+
+    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
+        let is_zero = |t: c::FILETIME| t.dwLowDateTime == 0 && t.dwHighDateTime == 0;
+        if times.accessed.map_or(false, is_zero)
+            || times.modified.map_or(false, is_zero)
+            || times.created.map_or(false, is_zero)
+        {
+            return Err(io::const_io_error!(
+                io::ErrorKind::InvalidInput,
+                "Cannot set file timestamp to 0",
+            ));
+        }
+        let is_max =
+            |t: c::FILETIME| t.dwLowDateTime == c::DWORD::MAX && t.dwHighDateTime == c::DWORD::MAX;
+        if times.accessed.map_or(false, is_max)
+            || times.modified.map_or(false, is_max)
+            || times.created.map_or(false, is_max)
+        {
+            return Err(io::const_io_error!(
+                io::ErrorKind::InvalidInput,
+                "Cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF",
+            ));
+        }
         cvt(unsafe {
-            c::SetFileInformationByHandle(
-                self.handle.as_raw_handle(),
-                c::FileBasicInfo,
-                &mut info as *mut _ as *mut _,
-                size as c::DWORD,
-            )
+            let created =
+                times.created.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            let accessed =
+                times.accessed.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            let modified =
+                times.modified.as_ref().map(|a| a as *const c::FILETIME).unwrap_or(ptr::null());
+            c::SetFileTime(self.as_raw_handle(), created, accessed, modified)
         })?;
         Ok(())
+    }
+
+    /// Get only basic file information such as attributes and file times.
+    fn basic_info(&self) -> io::Result<c::FILE_BASIC_INFO> {
+        unsafe {
+            let mut info: c::FILE_BASIC_INFO = mem::zeroed();
+            let size = mem::size_of_val(&info);
+            cvt(c::GetFileInformationByHandleEx(
+                self.handle.as_raw_handle(),
+                c::FileBasicInfo,
+                &mut info as *mut _ as *mut c_void,
+                size as c::DWORD,
+            ))?;
+            Ok(info)
+        }
+    }
+    /// Delete using POSIX semantics.
+    ///
+    /// Files will be deleted as soon as the handle is closed. This is supported
+    /// for Windows 10 1607 (aka RS1) and later. However some filesystem
+    /// drivers will not support it even then, e.g. FAT32.
+    ///
+    /// If the operation is not supported for this filesystem or OS version
+    /// then errors will be `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_PARAMETER`.
+    fn posix_delete(&self) -> io::Result<()> {
+        let info = c::FILE_DISPOSITION_INFO_EX {
+            Flags: c::FILE_DISPOSITION_FLAG_DELETE
+                | c::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | c::FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
+    }
+
+    /// Delete a file using win32 semantics. The file won't actually be deleted
+    /// until all file handles are closed. However, marking a file for deletion
+    /// will prevent anyone from opening a new handle to the file.
+    fn win32_delete(&self) -> io::Result<()> {
+        let info = c::FILE_DISPOSITION_INFO { DeleteFile: c::TRUE as _ };
+        api::set_file_information_by_handle(self.handle.as_raw_handle(), &info).io_result()
+    }
+
+    /// Fill the given buffer with as many directory entries as will fit.
+    /// This will remember its position and continue from the last call unless
+    /// `restart` is set to `true`.
+    ///
+    /// The returned bool indicates if there are more entries or not.
+    /// It is an error if `self` is not a directory.
+    ///
+    /// # Symlinks and other reparse points
+    ///
+    /// On Windows a file is either a directory or a non-directory.
+    /// A symlink directory is simply an empty directory with some "reparse" metadata attached.
+    /// So if you open a link (not its target) and iterate the directory,
+    /// you will always iterate an empty directory regardless of the target.
+    fn fill_dir_buff(&self, buffer: &mut DirBuff, restart: bool) -> io::Result<bool> {
+        let class =
+            if restart { c::FileIdBothDirectoryRestartInfo } else { c::FileIdBothDirectoryInfo };
+
+        unsafe {
+            let result = cvt(c::GetFileInformationByHandleEx(
+                self.handle.as_raw_handle(),
+                class,
+                buffer.as_mut_ptr().cast(),
+                buffer.capacity() as _,
+            ));
+            match result {
+                Ok(_) => Ok(true),
+                Err(e) if e.raw_os_error() == Some(c::ERROR_NO_MORE_FILES as _) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// A buffer for holding directory entries.
+struct DirBuff {
+    buffer: Box<Align8<[MaybeUninit<u8>; Self::BUFFER_SIZE]>>,
+}
+impl DirBuff {
+    const BUFFER_SIZE: usize = 1024;
+    fn new() -> Self {
+        Self {
+            // Safety: `Align8<[MaybeUninit<u8>; N]>` does not need
+            // initialization.
+            buffer: unsafe { Box::new_uninit().assume_init() },
+        }
+    }
+    fn capacity(&self) -> usize {
+        self.buffer.0.len()
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buffer.0.as_mut_ptr().cast()
+    }
+    /// Returns a `DirBuffIter`.
+    fn iter(&self) -> DirBuffIter<'_> {
+        DirBuffIter::new(self)
+    }
+}
+impl AsRef<[MaybeUninit<u8>]> for DirBuff {
+    fn as_ref(&self) -> &[MaybeUninit<u8>] {
+        &self.buffer.0
+    }
+}
+
+/// An iterator over entries stored in a `DirBuff`.
+///
+/// Currently only returns file names (UTF-16 encoded).
+struct DirBuffIter<'a> {
+    buffer: Option<&'a [MaybeUninit<u8>]>,
+    cursor: usize,
+}
+impl<'a> DirBuffIter<'a> {
+    fn new(buffer: &'a DirBuff) -> Self {
+        Self { buffer: Some(buffer.as_ref()), cursor: 0 }
+    }
+}
+impl<'a> Iterator for DirBuffIter<'a> {
+    type Item = (Cow<'a, [u16]>, bool);
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::mem::size_of;
+        let buffer = &self.buffer?[self.cursor..];
+
+        // Get the name and next entry from the buffer.
+        // SAFETY:
+        // - The buffer contains a `FILE_ID_BOTH_DIR_INFO` struct but the last
+        //   field (the file name) is unsized. So an offset has to be used to
+        //   get the file name slice.
+        // - The OS has guaranteed initialization of the fields of
+        //   `FILE_ID_BOTH_DIR_INFO` and the trailing filename (for at least
+        //   `FileNameLength` bytes)
+        let (name, is_directory, next_entry) = unsafe {
+            let info = buffer.as_ptr().cast::<c::FILE_ID_BOTH_DIR_INFO>();
+            // While this is guaranteed to be aligned in documentation for
+            // https://docs.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_both_dir_info
+            // it does not seem that reality is so kind, and assuming this
+            // caused crashes in some cases (https://github.com/rust-lang/rust/issues/104530)
+            // presumably, this can be blamed on buggy filesystem drivers, but who knows.
+            let next_entry = ptr::addr_of!((*info).NextEntryOffset).read_unaligned() as usize;
+            let length = ptr::addr_of!((*info).FileNameLength).read_unaligned() as usize;
+            let attrs = ptr::addr_of!((*info).FileAttributes).read_unaligned();
+            let name = from_maybe_unaligned(
+                ptr::addr_of!((*info).FileName).cast::<u16>(),
+                length / size_of::<u16>(),
+            );
+            let is_directory = (attrs & c::FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            (name, is_directory, next_entry)
+        };
+
+        if next_entry == 0 {
+            self.buffer = None
+        } else {
+            self.cursor += next_entry
+        }
+
+        // Skip `.` and `..` pseudo entries.
+        const DOT: u16 = b'.' as u16;
+        match &name[..] {
+            [DOT] | [DOT, DOT] => self.next(),
+            _ => Some((name, is_directory)),
+        }
+    }
+}
+
+unsafe fn from_maybe_unaligned<'a>(p: *const u16, len: usize) -> Cow<'a, [u16]> {
+    if p.is_aligned() {
+        Cow::Borrowed(crate::slice::from_raw_parts(p, len))
+    } else {
+        Cow::Owned((0..len).map(|i| p.add(i).read_unaligned()).collect())
+    }
+}
+
+/// Open a link relative to the parent directory, ensure no symlinks are followed.
+fn open_link_no_reparse(parent: &File, name: &[u16], access: u32) -> io::Result<File> {
+    // This is implemented using the lower level `NtCreateFile` function as
+    // unfortunately opening a file relative to a parent is not supported by
+    // win32 functions. It is however a fundamental feature of the NT kernel.
+    //
+    // See https://docs.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntcreatefile
+    unsafe {
+        let mut handle = ptr::null_mut();
+        let mut io_status = c::IO_STATUS_BLOCK::PENDING;
+        let mut name_str = c::UNICODE_STRING::from_ref(name);
+        use crate::sync::atomic::{AtomicU32, Ordering};
+        // The `OBJ_DONT_REPARSE` attribute ensures that we haven't been
+        // tricked into following a symlink. However, it may not be available in
+        // earlier versions of Windows.
+        static ATTRIBUTES: AtomicU32 = AtomicU32::new(c::OBJ_DONT_REPARSE);
+        let object = c::OBJECT_ATTRIBUTES {
+            ObjectName: &mut name_str,
+            RootDirectory: parent.as_raw_handle(),
+            Attributes: ATTRIBUTES.load(Ordering::Relaxed),
+            ..c::OBJECT_ATTRIBUTES::default()
+        };
+        let status = c::NtCreateFile(
+            &mut handle,
+            access,
+            &object,
+            &mut io_status,
+            crate::ptr::null_mut(),
+            0,
+            c::FILE_SHARE_DELETE | c::FILE_SHARE_READ | c::FILE_SHARE_WRITE,
+            c::FILE_OPEN,
+            // If `name` is a symlink then open the link rather than the target.
+            c::FILE_OPEN_REPARSE_POINT,
+            crate::ptr::null_mut(),
+            0,
+        );
+        // Convert an NTSTATUS to the more familiar Win32 error codes (aka "DosError")
+        if c::nt_success(status) {
+            Ok(File::from_raw_handle(handle))
+        } else if status == c::STATUS_DELETE_PENDING {
+            // We make a special exception for `STATUS_DELETE_PENDING` because
+            // otherwise this will be mapped to `ERROR_ACCESS_DENIED` which is
+            // very unhelpful.
+            Err(io::Error::from_raw_os_error(c::ERROR_DELETE_PENDING as _))
+        } else if status == c::STATUS_INVALID_PARAMETER
+            && ATTRIBUTES.load(Ordering::Relaxed) == c::OBJ_DONT_REPARSE
+        {
+            // Try without `OBJ_DONT_REPARSE`. See above.
+            ATTRIBUTES.store(0, Ordering::Relaxed);
+            open_link_no_reparse(parent, name, access)
+        } else {
+            Err(io::Error::from_raw_os_error(c::RtlNtStatusToDosError(status) as _))
+        }
     }
 }
 
 impl AsInner<Handle> for File {
+    #[inline]
     fn as_inner(&self) -> &Handle {
         &self.handle
     }
@@ -592,7 +874,7 @@ impl fmt::Debug for File {
         // FIXME(#24570): add more info here (e.g., mode)
         let mut b = f.debug_struct("File");
         b.field("handle", &self.handle.as_raw_handle());
-        if let Ok(path) = get_path(&self) {
+        if let Ok(path) = get_path(self) {
             b.field("path", &path);
         }
         b.finish()
@@ -652,6 +934,26 @@ impl FileAttr {
         self.file_index
     }
 }
+impl From<c::WIN32_FIND_DATAW> for FileAttr {
+    fn from(wfd: c::WIN32_FIND_DATAW) -> Self {
+        FileAttr {
+            attributes: wfd.dwFileAttributes,
+            creation_time: wfd.ftCreationTime,
+            last_access_time: wfd.ftLastAccessTime,
+            last_write_time: wfd.ftLastWriteTime,
+            file_size: ((wfd.nFileSizeHigh as u64) << 32) | (wfd.nFileSizeLow as u64),
+            reparse_tag: if wfd.dwFileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // reserved unless this is a reparse point
+                wfd.dwReserved0
+            } else {
+                0
+            },
+            volume_serial_number: None,
+            number_of_links: None,
+            file_index: None,
+        }
+    }
+}
 
 fn to_u64(ft: &c::FILETIME) -> u64 {
     (ft.dwLowDateTime as u64) | ((ft.dwHighDateTime as u64) << 32)
@@ -668,6 +970,20 @@ impl FilePermissions {
         } else {
             self.attrs &= !c::FILE_ATTRIBUTE_READONLY;
         }
+    }
+}
+
+impl FileTimes {
+    pub fn set_accessed(&mut self, t: SystemTime) {
+        self.accessed = Some(t.into_inner());
+    }
+
+    pub fn set_modified(&mut self, t: SystemTime) {
+        self.modified = Some(t.into_inner());
+    }
+
+    pub fn set_created(&mut self, t: SystemTime) {
+        self.created = Some(t.into_inner());
     }
 }
 
@@ -714,6 +1030,14 @@ impl DirBuilder {
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
+    // We push a `*` to the end of the path which cause the empty path to be
+    // treated as the current directory. So, for consistency with other platforms,
+    // we explicitly error on the empty path.
+    if p.as_os_str().is_empty() {
+        // Return an error code consistent with other ways of opening files.
+        // E.g. fs::metadata or File::open.
+        return Err(io::Error::from_raw_os_error(c::ERROR_PATH_NOT_FOUND as i32));
+    }
     let root = p.to_path_buf();
     let star = p.join("*");
     let path = maybe_verbatim(&star)?;
@@ -752,30 +1076,114 @@ pub fn rmdir(p: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a file or directory without following symlinks.
+fn open_link(path: &Path, access_mode: u32) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.access_mode(access_mode);
+    // `FILE_FLAG_BACKUP_SEMANTICS` allows opening directories.
+    // `FILE_FLAG_OPEN_REPARSE_POINT` opens a link instead of its target.
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | c::FILE_FLAG_OPEN_REPARSE_POINT);
+    File::open(path, &opts)
+}
+
 pub fn remove_dir_all(path: &Path) -> io::Result<()> {
-    let filetype = lstat(path)?.file_type();
-    if filetype.is_symlink() {
-        // On Windows symlinks to files and directories are removed differently.
-        // rmdir only deletes dir symlinks and junctions, not file symlinks.
-        rmdir(path)
-    } else {
-        remove_dir_all_recursive(path)
+    let file = open_link(path, c::DELETE | c::FILE_LIST_DIRECTORY)?;
+
+    // Test if the file is not a directory or a symlink to a directory.
+    if (file.basic_info()?.FileAttributes & c::FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        return Err(io::Error::from_raw_os_error(c::ERROR_DIRECTORY as _));
+    }
+
+    match remove_dir_all_iterative(&file, File::posix_delete) {
+        Err(e) => {
+            if let Some(code) = e.raw_os_error() {
+                match code as u32 {
+                    // If POSIX delete is not supported for this filesystem then fallback to win32 delete.
+                    c::ERROR_NOT_SUPPORTED
+                    | c::ERROR_INVALID_FUNCTION
+                    | c::ERROR_INVALID_PARAMETER => {
+                        remove_dir_all_iterative(&file, File::win32_delete)
+                    }
+                    _ => Err(e),
+                }
+            } else {
+                Err(e)
+            }
+        }
+        ok => ok,
     }
 }
 
-fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
-    for child in readdir(path)? {
-        let child = child?;
-        let child_type = child.file_type()?;
-        if child_type.is_dir() {
-            remove_dir_all_recursive(&child.path())?;
-        } else if child_type.is_symlink_dir() {
-            rmdir(&child.path())?;
-        } else {
-            unlink(&child.path())?;
+fn remove_dir_all_iterative(f: &File, delete: fn(&File) -> io::Result<()>) -> io::Result<()> {
+    // When deleting files we may loop this many times when certain error conditions occur.
+    // This allows remove_dir_all to succeed when the error is temporary.
+    const MAX_RETRIES: u32 = 10;
+
+    let mut buffer = DirBuff::new();
+    let mut dirlist = vec![f.duplicate()?];
+
+    // FIXME: This is a hack so we can push to the dirlist vec after borrowing from it.
+    fn copy_handle(f: &File) -> mem::ManuallyDrop<File> {
+        unsafe { mem::ManuallyDrop::new(File::from_raw_handle(f.as_raw_handle())) }
+    }
+
+    let mut restart = true;
+    while let Some(dir) = dirlist.last() {
+        let dir = copy_handle(dir);
+
+        // Fill the buffer and iterate the entries.
+        let more_data = dir.fill_dir_buff(&mut buffer, restart)?;
+        restart = false;
+        for (name, is_directory) in buffer.iter() {
+            if is_directory {
+                let child_dir = open_link_no_reparse(
+                    &dir,
+                    &name,
+                    c::SYNCHRONIZE | c::DELETE | c::FILE_LIST_DIRECTORY,
+                );
+                // On success, add the handle to the queue.
+                // If opening the directory fails we treat it the same as a file
+                if let Ok(child_dir) = child_dir {
+                    dirlist.push(child_dir);
+                    continue;
+                }
+            }
+            for i in 1..=MAX_RETRIES {
+                let result = open_link_no_reparse(&dir, &name, c::SYNCHRONIZE | c::DELETE);
+                match result {
+                    Ok(f) => delete(&f)?,
+                    // Already deleted, so skip.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    // Retry a few times if the file is locked or a delete is already in progress.
+                    Err(e)
+                        if i < MAX_RETRIES
+                            && (e.raw_os_error() == Some(c::ERROR_DELETE_PENDING as _)
+                                || e.raw_os_error() == Some(c::ERROR_SHARING_VIOLATION as _)) => {}
+                    // Otherwise return the error.
+                    Err(e) => return Err(e),
+                }
+                thread::yield_now();
+            }
+        }
+        // If there were no more files then delete the directory.
+        if !more_data {
+            if let Some(dir) = dirlist.pop() {
+                // Retry deleting a few times in case we need to wait for a file to be deleted.
+                for i in 1..=MAX_RETRIES {
+                    let result = delete(&dir);
+                    if let Err(e) = result {
+                        if i == MAX_RETRIES || e.kind() != io::ErrorKind::DirectoryNotEmpty {
+                            return Err(e);
+                        }
+                        thread::yield_now();
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }
-    rmdir(path)
+    Ok(())
 }
 
 pub fn readlink(path: &Path) -> io::Result<PathBuf> {
@@ -785,7 +1193,7 @@ pub fn readlink(path: &Path) -> io::Result<PathBuf> {
     let mut opts = OpenOptions::new();
     opts.access_mode(0);
     opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
-    let file = File::open(&path, &opts)?;
+    let file = File::open(path, &opts)?;
     file.readlink()
 }
 
@@ -832,29 +1240,95 @@ pub fn link(original: &Path, link: &Path) -> io::Result<()> {
 
 #[cfg(target_vendor = "uwp")]
 pub fn link(_original: &Path, _link: &Path) -> io::Result<()> {
-    return Err(io::Error::new_const(
+    return Err(io::const_io_error!(
         io::ErrorKind::Unsupported,
-        &"hard link are not supported on UWP",
+        "hard link are not supported on UWP",
     ));
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
-    let mut opts = OpenOptions::new();
-    // No read or write permissions are necessary
-    opts.access_mode(0);
-    // This flag is so we can open directories too
-    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS);
-    let file = File::open(path, &opts)?;
-    file.file_attr()
+    match metadata(path, ReparsePoint::Follow) {
+        Err(err) if err.raw_os_error() == Some(c::ERROR_CANT_ACCESS_FILE as i32) => {
+            if let Ok(attrs) = lstat(path) {
+                if !attrs.file_type().is_symlink() {
+                    return Ok(attrs);
+                }
+            }
+            Err(err)
+        }
+        result => result,
+    }
 }
 
 pub fn lstat(path: &Path) -> io::Result<FileAttr> {
+    metadata(path, ReparsePoint::Open)
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReparsePoint {
+    Follow = 0,
+    Open = c::FILE_FLAG_OPEN_REPARSE_POINT,
+}
+impl ReparsePoint {
+    fn as_flag(self) -> u32 {
+        self as u32
+    }
+}
+
+fn metadata(path: &Path, reparse: ReparsePoint) -> io::Result<FileAttr> {
     let mut opts = OpenOptions::new();
     // No read or write permissions are necessary
     opts.access_mode(0);
-    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | c::FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = File::open(path, &opts)?;
-    file.file_attr()
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | reparse.as_flag());
+
+    // Attempt to open the file normally.
+    // If that fails with `ERROR_SHARING_VIOLATION` then retry using `FindFirstFileW`.
+    // If the fallback fails for any reason we return the original error.
+    match File::open(path, &opts) {
+        Ok(file) => file.file_attr(),
+        Err(e)
+            if [Some(c::ERROR_SHARING_VIOLATION as _), Some(c::ERROR_ACCESS_DENIED as _)]
+                .contains(&e.raw_os_error()) =>
+        {
+            // `ERROR_ACCESS_DENIED` is returned when the user doesn't have permission for the resource.
+            // One such example is `System Volume Information` as default but can be created as well
+            // `ERROR_SHARING_VIOLATION` will almost never be returned.
+            // Usually if a file is locked you can still read some metadata.
+            // However, there are special system files, such as
+            // `C:\hiberfil.sys`, that are locked in a way that denies even that.
+            unsafe {
+                let path = maybe_verbatim(path)?;
+
+                // `FindFirstFileW` accepts wildcard file names.
+                // Fortunately wildcards are not valid file names and
+                // `ERROR_SHARING_VIOLATION` means the file exists (but is locked)
+                // therefore it's safe to assume the file name given does not
+                // include wildcards.
+                let mut wfd = mem::zeroed();
+                let handle = c::FindFirstFileW(path.as_ptr(), &mut wfd);
+
+                if handle == c::INVALID_HANDLE_VALUE {
+                    // This can fail if the user does not have read access to the
+                    // directory.
+                    Err(e)
+                } else {
+                    // We no longer need the find handle.
+                    c::FindClose(handle);
+
+                    // `FindFirstFileW` reads the cached file information from the
+                    // directory. The downside is that this metadata may be outdated.
+                    let attrs = FileAttr::from(wfd);
+                    if reparse == ReparsePoint::Follow && attrs.file_type().is_symlink() {
+                        Err(e)
+                    } else {
+                        Ok(attrs)
+                    }
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
@@ -894,7 +1368,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
         _dwCallbackReason: c::DWORD,
         _hSourceFile: c::HANDLE,
         _hDestinationFile: c::HANDLE,
-        lpData: c::LPVOID,
+        lpData: c::LPCVOID,
     ) -> c::DWORD {
         if dwStreamNumber == 1 {
             *(lpData as *mut i64) = StreamBytesTransferred;
@@ -933,28 +1407,48 @@ pub fn symlink_junction<P: AsRef<Path>, Q: AsRef<Path>>(
 #[allow(dead_code)]
 fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
     let d = DirBuilder::new();
-    d.mkdir(&junction)?;
+    d.mkdir(junction)?;
 
     let mut opts = OpenOptions::new();
     opts.write(true);
     opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
     let f = File::open(junction, &opts)?;
     let h = f.as_inner().as_raw_handle();
-
     unsafe {
-        let mut data = [0u8; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-        let db = data.as_mut_ptr() as *mut c::REPARSE_MOUNTPOINT_DATA_BUFFER;
-        let buf = &mut (*db).ReparseTarget as *mut c::WCHAR;
-        let mut i = 0;
+        let mut data =
+            Align8([MaybeUninit::<u8>::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
+        let data_ptr = data.0.as_mut_ptr();
+        let data_end = data_ptr.add(c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize);
+        let db = data_ptr.cast::<c::REPARSE_MOUNTPOINT_DATA_BUFFER>();
+        // Zero the header to ensure it's fully initialized, including reserved parameters.
+        *db = mem::zeroed();
+        let reparse_target_slice = {
+            let buf_start = ptr::addr_of_mut!((*db).ReparseTarget).cast::<c::WCHAR>();
+            // Compute offset in bytes and then divide so that we round down
+            // rather than hit any UB (admittedly this arithmetic should work
+            // out so that this isn't necessary)
+            let buf_len_bytes = usize::try_from(data_end.byte_offset_from(buf_start)).unwrap();
+            let buf_len_wchars = buf_len_bytes / core::mem::size_of::<c::WCHAR>();
+            core::slice::from_raw_parts_mut(buf_start, buf_len_wchars)
+        };
+
         // FIXME: this conversion is very hacky
-        let v = br"\??\";
-        let v = v.iter().map(|x| *x as u16);
-        for c in v.chain(original.as_os_str().encode_wide()) {
-            *buf.offset(i) = c;
+        let iter = br"\??\"
+            .iter()
+            .map(|x| *x as u16)
+            .chain(original.as_os_str().encode_wide())
+            .chain(core::iter::once(0));
+        let mut i = 0;
+        for c in iter {
+            if i >= reparse_target_slice.len() {
+                return Err(crate::io::const_io_error!(
+                    crate::io::ErrorKind::InvalidFilename,
+                    "Input filename is too long"
+                ));
+            }
+            reparse_target_slice[i] = c;
             i += 1;
         }
-        *buf.offset(i) = 0;
-        i += 1;
         (*db).ReparseTag = c::IO_REPARSE_TAG_MOUNT_POINT;
         (*db).ReparseTargetMaximumLength = (i * 2) as c::WORD;
         (*db).ReparseTargetLength = ((i - 1) * 2) as c::WORD;
@@ -964,7 +1458,7 @@ fn symlink_junction_inner(original: &Path, junction: &Path) -> io::Result<()> {
         cvt(c::DeviceIoControl(
             h as *mut _,
             c::FSCTL_SET_REPARSE_POINT,
-            data.as_ptr() as *mut _,
+            data_ptr.cast(),
             (*db).ReparseDataLength + 8,
             ptr::null_mut(),
             0,
@@ -992,6 +1486,13 @@ pub fn try_exists(path: &Path) -> io::Result<bool> {
             // another process. This is often temporary so we simply report it
             // as the file existing.
             _ if e.raw_os_error() == Some(c::ERROR_SHARING_VIOLATION as i32) => Ok(true),
+
+            // `ERROR_CANT_ACCESS_FILE` means that a file exists but that the
+            // reparse point could not be handled by `CreateFile`.
+            // This can happen for special files such as:
+            // * Unix domain sockets which you need to `connect` to
+            // * App exec links which require using `CreateProcess`
+            _ if e.raw_os_error() == Some(c::ERROR_CANT_ACCESS_FILE as i32) => Ok(true),
 
             // Other errors such as `ERROR_ACCESS_DENIED` may indicate that the
             // file exists. However, these types of errors are usually more

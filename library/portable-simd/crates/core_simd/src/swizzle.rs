@@ -1,46 +1,46 @@
 use crate::simd::intrinsics;
 use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
 
-/// Constructs a new vector by selecting values from the lanes of the source vector or vectors to use.
+/// Constructs a new SIMD vector by copying elements from selected lanes in other vectors.
 ///
-/// When swizzling one vector, the indices of the result vector are indicated by a `const` array
-/// of `usize`, like [`Swizzle`].
-/// When swizzling two vectors, the indices are indicated by a `const` array of [`Which`], like
-/// [`Swizzle2`].
+/// When swizzling one vector, lanes are selected by a `const` array of `usize`,
+/// like [`Swizzle`].
+///
+/// When swizzling two vectors, lanes are selected by a `const` array of [`Which`],
+/// like [`Swizzle2`].
 ///
 /// # Examples
-/// ## One source vector
+///
+/// With a single SIMD vector, the const array specifies lane indices in that vector:
 /// ```
 /// # #![feature(portable_simd)]
-/// # #[cfg(feature = "std")] use core_simd::{Simd, simd_swizzle};
-/// # #[cfg(not(feature = "std"))] use core::simd::{Simd, simd_swizzle};
-/// let v = Simd::<f32, 4>::from_array([0., 1., 2., 3.]);
+/// # use core::simd::{u32x2, u32x4, simd_swizzle};
+/// let v = u32x4::from_array([10, 11, 12, 13]);
 ///
 /// // Keeping the same size
-/// let r = simd_swizzle!(v, [3, 0, 1, 2]);
-/// assert_eq!(r.to_array(), [3., 0., 1., 2.]);
+/// let r: u32x4 = simd_swizzle!(v, [3, 0, 1, 2]);
+/// assert_eq!(r.to_array(), [13, 10, 11, 12]);
 ///
 /// // Changing the number of lanes
-/// let r = simd_swizzle!(v, [3, 1]);
-/// assert_eq!(r.to_array(), [3., 1.]);
+/// let r: u32x2 = simd_swizzle!(v, [3, 1]);
+/// assert_eq!(r.to_array(), [13, 11]);
 /// ```
 ///
-/// ## Two source vectors
+/// With two input SIMD vectors, the const array uses `Which` to specify the source of each index:
 /// ```
 /// # #![feature(portable_simd)]
-/// # #[cfg(feature = "std")] use core_simd::{Simd, simd_swizzle, Which};
-/// # #[cfg(not(feature = "std"))] use core::simd::{Simd, simd_swizzle, Which};
-/// use Which::*;
-/// let a = Simd::<f32, 4>::from_array([0., 1., 2., 3.]);
-/// let b = Simd::<f32, 4>::from_array([4., 5., 6., 7.]);
+/// # use core::simd::{u32x2, u32x4, simd_swizzle, Which};
+/// use Which::{First, Second};
+/// let a = u32x4::from_array([0, 1, 2, 3]);
+/// let b = u32x4::from_array([4, 5, 6, 7]);
 ///
 /// // Keeping the same size
-/// let r = simd_swizzle!(a, b, [First(0), First(1), Second(2), Second(3)]);
-/// assert_eq!(r.to_array(), [0., 1., 6., 7.]);
+/// let r: u32x4 = simd_swizzle!(a, b, [First(0), First(1), Second(2), Second(3)]);
+/// assert_eq!(r.to_array(), [0, 1, 6, 7]);
 ///
 /// // Changing the number of lanes
-/// let r = simd_swizzle!(a, b, [First(0), Second(0)]);
-/// assert_eq!(r.to_array(), [0., 4.]);
+/// let r: u32x2 = simd_swizzle!(a, b, [First(0), Second(0)]);
+/// assert_eq!(r.to_array(), [0, 4]);
 /// ```
 #[allow(unused_macros)]
 pub macro simd_swizzle {
@@ -70,12 +70,14 @@ pub macro simd_swizzle {
     }
 }
 
-/// An index into one of two vectors.
+/// Specifies a lane index into one of two SIMD vectors.
+///
+/// This is an input type for [Swizzle2] and helper macros like [simd_swizzle].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Which {
-    /// Indexes the first vector.
+    /// Index of a lane in the first input SIMD vector.
     First(usize),
-    /// Indexes the second vector.
+    /// Index of a lane in the second input SIMD vector.
     Second(usize),
 }
 
@@ -87,12 +89,15 @@ pub trait Swizzle<const INPUT_LANES: usize, const OUTPUT_LANES: usize> {
     /// Create a new vector from the lanes of `vector`.
     ///
     /// Lane `i` of the output is `vector[Self::INDEX[i]]`.
+    #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     fn swizzle<T>(vector: Simd<T, INPUT_LANES>) -> Simd<T, OUTPUT_LANES>
     where
         T: SimdElement,
         LaneCount<INPUT_LANES>: SupportedLaneCount,
         LaneCount<OUTPUT_LANES>: SupportedLaneCount,
     {
+        // Safety: `vector` is a vector, and `INDEX_IMPL` is a const array of u32.
         unsafe { intrinsics::simd_shuffle(vector, vector, Self::INDEX_IMPL) }
     }
 }
@@ -106,6 +111,8 @@ pub trait Swizzle2<const INPUT_LANES: usize, const OUTPUT_LANES: usize> {
     ///
     /// Lane `i` is `first[j]` when `Self::INDEX[i]` is `First(j)`, or `second[j]` when it is
     /// `Second(j)`.
+    #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     fn swizzle2<T>(
         first: Simd<T, INPUT_LANES>,
         second: Simd<T, INPUT_LANES>,
@@ -115,6 +122,7 @@ pub trait Swizzle2<const INPUT_LANES: usize, const OUTPUT_LANES: usize> {
         LaneCount<INPUT_LANES>: SupportedLaneCount,
         LaneCount<OUTPUT_LANES>: SupportedLaneCount,
     {
+        // Safety: `first` and `second` are vectors, and `INDEX_IMPL` is a const array of u32.
         unsafe { intrinsics::simd_shuffle(first, second, Self::INDEX_IMPL) }
     }
 }
@@ -182,6 +190,7 @@ where
 {
     /// Reverse the order of the lanes in the vector.
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     pub fn reverse(self) -> Self {
         const fn reverse_index<const LANES: usize>() -> [usize; LANES] {
             let mut index = [0; LANES];
@@ -206,6 +215,7 @@ where
     /// while the last `LANES - OFFSET` elements move to the front. After calling `rotate_lanes_left`,
     /// the element previously in lane `OFFSET` will become the first element in the slice.
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     pub fn rotate_lanes_left<const OFFSET: usize>(self) -> Self {
         const fn rotate_index<const OFFSET: usize, const LANES: usize>() -> [usize; LANES] {
             let offset = OFFSET % LANES;
@@ -231,6 +241,7 @@ where
     /// the end while the last `OFFSET` elements move to the front. After calling `rotate_lanes_right`,
     /// the element previously at index `LANES - OFFSET` will become the first element in the slice.
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     pub fn rotate_lanes_right<const OFFSET: usize>(self) -> Self {
         const fn rotate_index<const OFFSET: usize, const LANES: usize>() -> [usize; LANES] {
             let offset = LANES - OFFSET % LANES;
@@ -254,18 +265,14 @@ where
 
     /// Interleave two vectors.
     ///
-    /// Produces two vectors with lanes taken alternately from `self` and `other`.
+    /// The resulting vectors contain lanes taken alternatively from `self` and `other`, first
+    /// filling the first result, and then the second.
     ///
-    /// The first result contains the first `LANES / 2` lanes from `self` and `other`,
-    /// alternating, starting with the first lane of `self`.
-    ///
-    /// The second result contains the last `LANES / 2` lanes from `self` and `other`,
-    /// alternating, starting with the lane `LANES / 2` from the start of `self`.
+    /// The reverse of this operation is [`Simd::deinterleave`].
     ///
     /// ```
-    /// #![feature(portable_simd)]
-    /// # #[cfg(feature = "std")] use core_simd::Simd;
-    /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+    /// # #![feature(portable_simd)]
+    /// # use core::simd::Simd;
     /// let a = Simd::from_array([0, 1, 2, 3]);
     /// let b = Simd::from_array([4, 5, 6, 7]);
     /// let (x, y) = a.interleave(b);
@@ -273,30 +280,19 @@ where
     /// assert_eq!(y.to_array(), [2, 6, 3, 7]);
     /// ```
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     pub fn interleave(self, other: Self) -> (Self, Self) {
-        const fn lo<const LANES: usize>() -> [Which; LANES] {
+        const fn interleave<const LANES: usize>(high: bool) -> [Which; LANES] {
             let mut idx = [Which::First(0); LANES];
             let mut i = 0;
             while i < LANES {
-                let offset = i / 2;
-                idx[i] = if i % 2 == 0 {
-                    Which::First(offset)
+                // Treat the source as a concatenated vector
+                let dst_index = if high { i + LANES } else { i };
+                let src_index = dst_index / 2 + (dst_index % 2) * LANES;
+                idx[i] = if src_index < LANES {
+                    Which::First(src_index)
                 } else {
-                    Which::Second(offset)
-                };
-                i += 1;
-            }
-            idx
-        }
-        const fn hi<const LANES: usize>() -> [Which; LANES] {
-            let mut idx = [Which::First(0); LANES];
-            let mut i = 0;
-            while i < LANES {
-                let offset = (LANES + i) / 2;
-                idx[i] = if i % 2 == 0 {
-                    Which::First(offset)
-                } else {
-                    Which::Second(offset)
+                    Which::Second(src_index % LANES)
                 };
                 i += 1;
             }
@@ -307,11 +303,11 @@ where
         struct Hi;
 
         impl<const LANES: usize> Swizzle2<LANES, LANES> for Lo {
-            const INDEX: [Which; LANES] = lo::<LANES>();
+            const INDEX: [Which; LANES] = interleave::<LANES>(false);
         }
 
         impl<const LANES: usize> Swizzle2<LANES, LANES> for Hi {
-            const INDEX: [Which; LANES] = hi::<LANES>();
+            const INDEX: [Which; LANES] = interleave::<LANES>(true);
         }
 
         (Lo::swizzle2(self, other), Hi::swizzle2(self, other))
@@ -325,10 +321,11 @@ where
     /// The second result takes every other lane of `self` and then `other`, starting with
     /// the second lane.
     ///
+    /// The reverse of this operation is [`Simd::interleave`].
+    ///
     /// ```
-    /// #![feature(portable_simd)]
-    /// # #[cfg(feature = "std")] use core_simd::Simd;
-    /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+    /// # #![feature(portable_simd)]
+    /// # use core::simd::Simd;
     /// let a = Simd::from_array([0, 4, 1, 5]);
     /// let b = Simd::from_array([2, 6, 3, 7]);
     /// let (x, y) = a.deinterleave(b);
@@ -336,23 +333,19 @@ where
     /// assert_eq!(y.to_array(), [4, 5, 6, 7]);
     /// ```
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original inputs"]
     pub fn deinterleave(self, other: Self) -> (Self, Self) {
-        const fn even<const LANES: usize>() -> [Which; LANES] {
+        const fn deinterleave<const LANES: usize>(second: bool) -> [Which; LANES] {
             let mut idx = [Which::First(0); LANES];
             let mut i = 0;
-            while i < LANES / 2 {
-                idx[i] = Which::First(2 * i);
-                idx[i + LANES / 2] = Which::Second(2 * i);
-                i += 1;
-            }
-            idx
-        }
-        const fn odd<const LANES: usize>() -> [Which; LANES] {
-            let mut idx = [Which::First(0); LANES];
-            let mut i = 0;
-            while i < LANES / 2 {
-                idx[i] = Which::First(2 * i + 1);
-                idx[i + LANES / 2] = Which::Second(2 * i + 1);
+            while i < LANES {
+                // Treat the source as a concatenated vector
+                let src_index = i * 2 + second as usize;
+                idx[i] = if src_index < LANES {
+                    Which::First(src_index)
+                } else {
+                    Which::Second(src_index % LANES)
+                };
                 i += 1;
             }
             idx
@@ -362,11 +355,11 @@ where
         struct Odd;
 
         impl<const LANES: usize> Swizzle2<LANES, LANES> for Even {
-            const INDEX: [Which; LANES] = even::<LANES>();
+            const INDEX: [Which; LANES] = deinterleave::<LANES>(false);
         }
 
         impl<const LANES: usize> Swizzle2<LANES, LANES> for Odd {
-            const INDEX: [Which; LANES] = odd::<LANES>();
+            const INDEX: [Which; LANES] = deinterleave::<LANES>(true);
         }
 
         (Even::swizzle2(self, other), Odd::swizzle2(self, other))

@@ -19,7 +19,7 @@ use rustc_target::abi::{AddressSpace, Align, Integer, Size};
 use std::fmt;
 use std::ptr;
 
-use libc::c_uint;
+use libc::{c_char, c_uint};
 
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
@@ -38,34 +38,38 @@ impl fmt::Debug for Type {
     }
 }
 
-impl CodegenCx<'ll, 'tcx> {
-    crate fn type_named_struct(&self, name: &str) -> &'ll Type {
+impl<'ll> CodegenCx<'ll, '_> {
+    pub(crate) fn type_named_struct(&self, name: &str) -> &'ll Type {
         let name = SmallCStr::new(name);
         unsafe { llvm::LLVMStructCreateNamed(self.llcx, name.as_ptr()) }
     }
 
-    crate fn set_struct_body(&self, ty: &'ll Type, els: &[&'ll Type], packed: bool) {
+    pub(crate) fn set_struct_body(&self, ty: &'ll Type, els: &[&'ll Type], packed: bool) {
         unsafe { llvm::LLVMStructSetBody(ty, els.as_ptr(), els.len() as c_uint, packed as Bool) }
     }
 
-    crate fn type_void(&self) -> &'ll Type {
+    pub(crate) fn type_void(&self) -> &'ll Type {
         unsafe { llvm::LLVMVoidTypeInContext(self.llcx) }
     }
 
-    crate fn type_metadata(&self) -> &'ll Type {
-        unsafe { llvm::LLVMRustMetadataTypeInContext(self.llcx) }
+    pub(crate) fn type_token(&self) -> &'ll Type {
+        unsafe { llvm::LLVMTokenTypeInContext(self.llcx) }
+    }
+
+    pub(crate) fn type_metadata(&self) -> &'ll Type {
+        unsafe { llvm::LLVMMetadataTypeInContext(self.llcx) }
     }
 
     ///x Creates an integer type with the given number of bits, e.g., i24
-    crate fn type_ix(&self, num_bits: u64) -> &'ll Type {
+    pub(crate) fn type_ix(&self, num_bits: u64) -> &'ll Type {
         unsafe { llvm::LLVMIntTypeInContext(self.llcx, num_bits as c_uint) }
     }
 
-    crate fn type_vector(&self, ty: &'ll Type, len: u64) -> &'ll Type {
+    pub(crate) fn type_vector(&self, ty: &'ll Type, len: u64) -> &'ll Type {
         unsafe { llvm::LLVMVectorType(ty, len as c_uint) }
     }
 
-    crate fn func_params_types(&self, ty: &'ll Type) -> Vec<&'ll Type> {
+    pub(crate) fn func_params_types(&self, ty: &'ll Type) -> Vec<&'ll Type> {
         unsafe {
             let n_args = llvm::LLVMCountParamTypes(ty) as usize;
             let mut args = Vec::with_capacity(n_args);
@@ -75,11 +79,11 @@ impl CodegenCx<'ll, 'tcx> {
         }
     }
 
-    crate fn type_bool(&self) -> &'ll Type {
+    pub(crate) fn type_bool(&self) -> &'ll Type {
         self.type_i8()
     }
 
-    crate fn type_int_from_ty(&self, t: ty::IntTy) -> &'ll Type {
+    pub(crate) fn type_int_from_ty(&self, t: ty::IntTy) -> &'ll Type {
         match t {
             ty::IntTy::Isize => self.type_isize(),
             ty::IntTy::I8 => self.type_i8(),
@@ -90,7 +94,7 @@ impl CodegenCx<'ll, 'tcx> {
         }
     }
 
-    crate fn type_uint_from_ty(&self, t: ty::UintTy) -> &'ll Type {
+    pub(crate) fn type_uint_from_ty(&self, t: ty::UintTy) -> &'ll Type {
         match t {
             ty::UintTy::Usize => self.type_isize(),
             ty::UintTy::U8 => self.type_i8(),
@@ -101,22 +105,16 @@ impl CodegenCx<'ll, 'tcx> {
         }
     }
 
-    crate fn type_float_from_ty(&self, t: ty::FloatTy) -> &'ll Type {
+    pub(crate) fn type_float_from_ty(&self, t: ty::FloatTy) -> &'ll Type {
         match t {
             ty::FloatTy::F32 => self.type_f32(),
             ty::FloatTy::F64 => self.type_f64(),
         }
     }
 
-    crate fn type_pointee_for_align(&self, align: Align) -> &'ll Type {
-        // FIXME(eddyb) We could find a better approximation if ity.align < align.
-        let ity = Integer::approximate_align(self, align);
-        self.type_from_integer(ity)
-    }
-
-    /// Return a LLVM type that has at most the required alignment,
+    /// Return an LLVM type that has at most the required alignment,
     /// and exactly the required size, as a best-effort padding array.
-    crate fn type_padding_filler(&self, size: Size, align: Align) -> &'ll Type {
+    pub(crate) fn type_padding_filler(&self, size: Size, align: Align) -> &'ll Type {
         let unit = Integer::approximate_align(self, align);
         let size = size.bytes();
         let unit_size = unit.size().bytes();
@@ -124,16 +122,12 @@ impl CodegenCx<'ll, 'tcx> {
         self.type_array(self.type_from_integer(unit), size / unit_size)
     }
 
-    crate fn type_variadic_func(&self, args: &[&'ll Type], ret: &'ll Type) -> &'ll Type {
+    pub(crate) fn type_variadic_func(&self, args: &[&'ll Type], ret: &'ll Type) -> &'ll Type {
         unsafe { llvm::LLVMFunctionType(ret, args.as_ptr(), args.len() as c_uint, True) }
-    }
-
-    crate fn type_array(&self, ty: &'ll Type, len: u64) -> &'ll Type {
-        unsafe { llvm::LLVMRustArrayType(ty, len) }
     }
 }
 
-impl BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'ll, 'tcx> BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn type_i1(&self) -> &'ll Type {
         unsafe { llvm::LLVMInt1TypeInContext(self.llcx) }
     }
@@ -189,17 +183,12 @@ impl BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         unsafe { llvm::LLVMRustGetTypeKind(ty).to_generic() }
     }
 
-    fn type_ptr_to(&self, ty: &'ll Type) -> &'ll Type {
-        assert_ne!(
-            self.type_kind(ty),
-            TypeKind::Function,
-            "don't call ptr_to on function types, use ptr_to_llvm_type on FnAbi instead or explicitly specify an address space if it makes sense"
-        );
-        ty.ptr_to(AddressSpace::DATA)
+    fn type_ptr(&self) -> &'ll Type {
+        self.type_ptr_ext(AddressSpace::DATA)
     }
 
-    fn type_ptr_to_ext(&self, ty: &'ll Type, address_space: AddressSpace) -> &'ll Type {
-        ty.ptr_to(address_space)
+    fn type_ptr_ext(&self, address_space: AddressSpace) -> &'ll Type {
+        unsafe { llvm::LLVMPointerTypeInContext(self.llcx, address_space.0) }
     }
 
     fn element_type(&self, ty: &'ll Type) -> &'ll Type {
@@ -231,28 +220,24 @@ impl BaseTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn val_ty(&self, v: &'ll Value) -> &'ll Type {
         common::val_ty(v)
     }
+
+    fn type_array(&self, ty: &'ll Type, len: u64) -> &'ll Type {
+        unsafe { llvm::LLVMRustArrayType(ty, len) }
+    }
 }
 
 impl Type {
-    pub fn i8_llcx(llcx: &llvm::Context) -> &Type {
-        unsafe { llvm::LLVMInt8TypeInContext(llcx) }
-    }
-
-    // Creates an integer type with the given number of bits, e.g., i24
+    /// Creates an integer type with the given number of bits, e.g., i24
     pub fn ix_llcx(llcx: &llvm::Context, num_bits: u64) -> &Type {
         unsafe { llvm::LLVMIntTypeInContext(llcx, num_bits as c_uint) }
     }
 
-    pub fn i8p_llcx(llcx: &llvm::Context) -> &Type {
-        Type::i8_llcx(llcx).ptr_to(AddressSpace::DATA)
-    }
-
-    fn ptr_to(&self, address_space: AddressSpace) -> &Type {
-        unsafe { llvm::LLVMPointerType(self, address_space.0) }
+    pub fn ptr_llcx(llcx: &llvm::Context) -> &Type {
+        unsafe { llvm::LLVMPointerTypeInContext(llcx, AddressSpace::DATA.0) }
     }
 }
 
-impl LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'ll, 'tcx> LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> &'ll Type {
         layout.llvm_type(self)
     }
@@ -287,5 +272,82 @@ impl LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
     fn reg_backend_type(&self, ty: &Reg) -> &'ll Type {
         ty.llvm_type(self)
+    }
+    fn scalar_copy_backend_type(&self, layout: TyAndLayout<'tcx>) -> Option<Self::Type> {
+        layout.scalar_copy_llvm_type(self)
+    }
+}
+
+impl<'ll, 'tcx> TypeMembershipMethods<'tcx> for CodegenCx<'ll, 'tcx> {
+    fn add_type_metadata(&self, function: &'ll Value, typeid: String) {
+        let typeid_metadata = self.typeid_metadata(typeid).unwrap();
+        let v = [self.const_usize(0), typeid_metadata];
+        unsafe {
+            llvm::LLVMRustGlobalAddMetadata(
+                function,
+                llvm::MD_type as c_uint,
+                llvm::LLVMValueAsMetadata(llvm::LLVMMDNodeInContext(
+                    self.llcx,
+                    v.as_ptr(),
+                    v.len() as c_uint,
+                )),
+            )
+        }
+    }
+
+    fn set_type_metadata(&self, function: &'ll Value, typeid: String) {
+        let typeid_metadata = self.typeid_metadata(typeid).unwrap();
+        let v = [self.const_usize(0), typeid_metadata];
+        unsafe {
+            llvm::LLVMGlobalSetMetadata(
+                function,
+                llvm::MD_type as c_uint,
+                llvm::LLVMValueAsMetadata(llvm::LLVMMDNodeInContext(
+                    self.llcx,
+                    v.as_ptr(),
+                    v.len() as c_uint,
+                )),
+            )
+        }
+    }
+
+    fn typeid_metadata(&self, typeid: String) -> Option<&'ll Value> {
+        Some(unsafe {
+            llvm::LLVMMDStringInContext(
+                self.llcx,
+                typeid.as_ptr() as *const c_char,
+                typeid.len() as c_uint,
+            )
+        })
+    }
+
+    fn add_kcfi_type_metadata(&self, function: &'ll Value, kcfi_typeid: u32) {
+        let kcfi_type_metadata = self.const_u32(kcfi_typeid);
+        unsafe {
+            llvm::LLVMRustGlobalAddMetadata(
+                function,
+                llvm::MD_kcfi_type as c_uint,
+                llvm::LLVMMDNodeInContext2(
+                    self.llcx,
+                    &llvm::LLVMValueAsMetadata(kcfi_type_metadata),
+                    1,
+                ),
+            )
+        }
+    }
+
+    fn set_kcfi_type_metadata(&self, function: &'ll Value, kcfi_typeid: u32) {
+        let kcfi_type_metadata = self.const_u32(kcfi_typeid);
+        unsafe {
+            llvm::LLVMGlobalSetMetadata(
+                function,
+                llvm::MD_kcfi_type as c_uint,
+                llvm::LLVMMDNodeInContext2(
+                    self.llcx,
+                    &llvm::LLVMValueAsMetadata(kcfi_type_metadata),
+                    1,
+                ),
+            )
+        }
     }
 }

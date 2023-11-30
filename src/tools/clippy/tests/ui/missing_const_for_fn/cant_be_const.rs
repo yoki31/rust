@@ -2,15 +2,18 @@
 //! compilation error.
 //! The .stderr output of this test should be empty. Otherwise it's a bug somewhere.
 
-// aux-build:helper.rs
+//@aux-build:helper.rs
+//@aux-build:../auxiliary/proc_macros.rs
 
 #![warn(clippy::missing_const_for_fn)]
 #![feature(start)]
-#![feature(custom_inner_attributes)]
 
 extern crate helper;
+extern crate proc_macros;
 
-struct Game;
+use proc_macros::with_span;
+
+struct Game; // You just lost.
 
 // This should not be linted because it's already const
 const fn already_const() -> i32 {
@@ -41,7 +44,6 @@ static Y: u32 = 0;
 // refer to a static variable
 fn get_y() -> u32 {
     Y
-    //~^ ERROR E0013
 }
 
 // Don't lint entrypoint functions
@@ -111,11 +113,55 @@ fn unstably_const_fn() {
     helper::unstably_const_fn()
 }
 
+#[clippy::msrv = "1.46.0"]
 mod const_fn_stabilized_after_msrv {
-    #![clippy::msrv = "1.46.0"]
-
     // Do not lint this because `u8::is_ascii_digit` is stabilized as a const function in 1.47.0.
     fn const_fn_stabilized_after_msrv(byte: u8) {
         byte.is_ascii_digit();
     }
+}
+
+with_span! {
+    span
+    fn dont_check_in_proc_macro() {}
+}
+
+// Do not lint `String` has `Vec<u8>`, which cannot be dropped in const contexts
+fn a(this: String) {}
+
+enum A {
+    F(String),
+    N,
+}
+
+// Same here.
+fn b(this: A) {}
+
+// Minimized version of `a`.
+fn c(this: Vec<u16>) {}
+
+struct F(A);
+
+// Do not lint
+fn f(this: F) {}
+
+// Do not lint
+fn g<T>(this: T) {}
+
+struct Issue10617(String);
+
+impl Issue10617 {
+    // Do not lint
+    pub fn name(self) -> String {
+        self.0
+    }
+}
+
+union U {
+    f: u32,
+}
+
+// Do not lint because accessing union fields from const functions is unstable
+fn h(u: U) -> u32 {
+    unsafe { u.f }
 }

@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_middle::mir::visit::{
     MutatingUseContext, NonMutatingUseContext, NonUseContext, PlaceContext,
 };
@@ -16,9 +18,6 @@ pub fn categorize(context: PlaceContext) -> Option<DefUse> {
 
         PlaceContext::MutatingUse(MutatingUseContext::Store) |
 
-        // This is potentially both a def and a use...
-        PlaceContext::MutatingUse(MutatingUseContext::AsmOutput) |
-
         // We let Call define the result in both the success and
         // unwind cases. This is not really correct, however it
         // does not seem to be observable due to the way that we
@@ -26,6 +25,7 @@ pub fn categorize(context: PlaceContext) -> Option<DefUse> {
         // the def in call only to the input from the success
         // path and not the unwind path. -nmatsakis
         PlaceContext::MutatingUse(MutatingUseContext::Call) |
+        PlaceContext::MutatingUse(MutatingUseContext::AsmOutput) |
         PlaceContext::MutatingUse(MutatingUseContext::Yield) |
 
         // Storage live and storage dead aren't proper defines, but we can ignore
@@ -44,20 +44,23 @@ pub fn categorize(context: PlaceContext) -> Option<DefUse> {
         PlaceContext::MutatingUse(MutatingUseContext::Projection) |
 
         // Borrows only consider their local used at the point of the borrow.
-        // This won't affect the results since we use this analysis for generators
+        // This won't affect the results since we use this analysis for coroutines
         // and we only care about the result at suspension points. Borrows cannot
         // cross suspension points so this behavior is unproblematic.
         PlaceContext::MutatingUse(MutatingUseContext::Borrow) |
         PlaceContext::NonMutatingUse(NonMutatingUseContext::SharedBorrow) |
-        PlaceContext::NonMutatingUse(NonMutatingUseContext::ShallowBorrow) |
-        PlaceContext::NonMutatingUse(NonMutatingUseContext::UniqueBorrow) |
+        PlaceContext::NonMutatingUse(NonMutatingUseContext::FakeBorrow) |
+
+        // `PlaceMention` and `AscribeUserType` both evaluate the place, which must not
+        // contain dangling references.
+        PlaceContext::NonMutatingUse(NonMutatingUseContext::PlaceMention) |
+        PlaceContext::NonUse(NonUseContext::AscribeUserTy(_)) |
 
         PlaceContext::MutatingUse(MutatingUseContext::AddressOf) |
         PlaceContext::NonMutatingUse(NonMutatingUseContext::AddressOf) |
         PlaceContext::NonMutatingUse(NonMutatingUseContext::Inspect) |
         PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy) |
         PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) |
-        PlaceContext::NonUse(NonUseContext::AscribeUserTy) |
         PlaceContext::MutatingUse(MutatingUseContext::Retag) =>
             Some(DefUse::Use),
 
@@ -74,5 +77,9 @@ pub fn categorize(context: PlaceContext) -> Option<DefUse> {
 
         // Debug info is neither def nor use.
         PlaceContext::NonUse(NonUseContext::VarDebugInfo) => None,
+
+        PlaceContext::MutatingUse(MutatingUseContext::Deinit | MutatingUseContext::SetDiscriminant) => {
+            bug!("These statements are not allowed in this MIR phase")
+        }
     }
 }

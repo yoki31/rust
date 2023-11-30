@@ -1,4 +1,4 @@
-# rustfmt [![Build Status](https://travis-ci.com/rust-lang/rustfmt.svg?branch=master)](https://travis-ci.com/rust-lang/rustfmt) [![Build Status](https://ci.appveyor.com/api/projects/status/github/rust-lang/rustfmt?svg=true)](https://ci.appveyor.com/project/rust-lang-libs/rustfmt) [![crates.io](https://img.shields.io/crates/v/rustfmt-nightly.svg)](https://crates.io/crates/rustfmt-nightly) [![Travis Configuration Status](https://img.shields.io/travis/davidalber/rustfmt-travis.svg?label=travis%20example)](https://travis-ci.org/davidalber/rustfmt-travis)
+# rustfmt [![linux](https://github.com/rust-lang/rustfmt/actions/workflows/linux.yml/badge.svg?event=push)](https://github.com/rust-lang/rustfmt/actions/workflows/linux.yml) [![mac](https://github.com/rust-lang/rustfmt/actions/workflows/mac.yml/badge.svg?event=push)](https://github.com/rust-lang/rustfmt/actions/workflows/mac.yml) [![windows](https://github.com/rust-lang/rustfmt/actions/workflows/windows.yml/badge.svg?event=push)](https://github.com/rust-lang/rustfmt/actions/workflows/windows.yml) [![crates.io](https://img.shields.io/crates/v/rustfmt-nightly.svg)](https://crates.io/crates/rustfmt-nightly)
 
 A tool for formatting Rust code according to style guidelines.
 
@@ -7,9 +7,7 @@ If you'd like to help out (and you should, it's a fun project!), see
 Conduct](CODE_OF_CONDUCT.md).
 
 You can use rustfmt in Travis CI builds. We provide a minimal Travis CI
-configuration (see [here](#checking-style-on-a-ci-server)) and verify its status
-using another repository. The status of that repository's build is reported by
-the "travis example" badge above.
+configuration (see [here](#checking-style-on-a-ci-server)).
 
 ## Quick start
 
@@ -48,12 +46,11 @@ cargo +nightly fmt
 ## Limitations
 
 Rustfmt tries to work on as much Rust code as possible. Sometimes, the code
-doesn't even need to compile! As we approach a 1.0 release we are also looking
-to limit areas of instability; in particular, post-1.0, the formatting of most
-code should not change as Rustfmt improves. However, there are some things that
-Rustfmt can't do or can't do well (and thus where formatting might change
-significantly, even post-1.0). We would like to reduce the list of limitations
-over time.
+doesn't even need to compile! In general, we are looking to limit areas of
+instability; in particular, post-1.0, the formatting of most code should not
+change as Rustfmt improves. However, there are some things that Rustfmt can't
+do or can't do well (and thus where formatting might change significantly,
+even post-1.0). We would like to reduce the list of limitations over time.
 
 The following list enumerates areas where Rustfmt does not work or where the
 stability guarantees do not apply (we don't make a distinction between the two
@@ -72,24 +69,6 @@ because in the future Rustfmt might work on code where it currently does not):
   here, but do not have the test coverage or experience to be 100% sure).
 * Bugs in Rustfmt (like any software, Rustfmt has bugs, we do not consider bug
   fixes to break our stability guarantees).
-
-
-## Installation
-
-```sh
-rustup component add rustfmt
-```
-
-## Installing from source
-
-To install from source (nightly required), first checkout to the tag or branch you want to install, then issue
-
-```sh
-cargo install --path .
-```
-
-This will install `rustfmt` in your `~/.cargo/bin`. Make sure to add `~/.cargo/bin` directory to
-your PATH variable.
 
 
 ## Running
@@ -136,7 +115,7 @@ completed without error (whether or not changes were made).
 * [Emacs](https://github.com/rust-lang/rust-mode)
 * [Sublime Text 3](https://packagecontrol.io/packages/RustFmt)
 * [Atom](atom.md)
-* Visual Studio Code using [vscode-rust](https://github.com/editor-rs/vscode-rust), [vsc-rustfmt](https://github.com/Connorcpu/vsc-rustfmt) or [rls_vscode](https://github.com/jonathandturner/rls_vscode) through RLS.
+* [Visual Studio Code](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
 * [IntelliJ or CLion](intellij.md)
 
 
@@ -250,4 +229,4 @@ See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) for details.
 
 [rust]: https://github.com/rust-lang/rust
 [fmt rfcs]: https://github.com/rust-dev-tools/fmt-rfcs
-[style guide]: https://github.com/rust-dev-tools/fmt-rfcs/blob/master/guide/guide.md
+[style guide]: https://doc.rust-lang.org/nightly/style-guide/

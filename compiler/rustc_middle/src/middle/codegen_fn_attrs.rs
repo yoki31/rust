@@ -26,8 +26,10 @@ pub struct CodegenFnAttrs {
     /// The `#[target_feature(enable = "...")]` attribute and the enabled
     /// features (only enabled features are supported right now).
     pub target_features: Vec<Symbol>,
-    /// The `#[linkage = "..."]` attribute and the value we found.
+    /// The `#[linkage = "..."]` attribute on Rust-defined items and the value we found.
     pub linkage: Option<Linkage>,
+    /// The `#[linkage = "..."]` attribute on foreign items and the value we found.
+    pub import_linkage: Option<Linkage>,
     /// The `#[link_section = "..."]` attribute, or what executable section this
     /// should be placed in.
     pub link_section: Option<Symbol>,
@@ -50,7 +52,7 @@ bitflags! {
         /// the hot path.
         const COLD                      = 1 << 0;
         /// `#[rustc_allocator]`: a hint to LLVM that the pointer returned from this
-        /// function is never null.
+        /// function is never null and the function has no side effects other than allocating.
         const ALLOCATOR                 = 1 << 1;
         /// An indicator that function will never unwind. Will become obsolete
         /// once C-unwind is fully stabilized.
@@ -85,15 +87,28 @@ bitflags! {
         /// #[cmse_nonsecure_entry]: with a TrustZone-M extension, declare a
         /// function as an entry function from Non-Secure code.
         const CMSE_NONSECURE_ENTRY      = 1 << 14;
-        /// `#[no_coverage]`: indicates that the function should be ignored by
+        /// `#[coverage(off)]`: indicates that the function should be ignored by
         /// the MIR `InstrumentCoverage` pass and not added to the coverage map
         /// during codegen.
         const NO_COVERAGE               = 1 << 15;
+        /// `#[used(linker)]`:
+        /// indicates that neither LLVM nor the linker will eliminate this function.
+        const USED_LINKER               = 1 << 16;
+        /// `#[rustc_deallocator]`: a hint to LLVM that the function only deallocates memory.
+        const DEALLOCATOR               = 1 << 17;
+        /// `#[rustc_reallocator]`: a hint to LLVM that the function only reallocates memory.
+        const REALLOCATOR               = 1 << 18;
+        /// `#[rustc_allocator_zeroed]`: a hint to LLVM that the function only allocates zeroed memory.
+        const ALLOCATOR_ZEROED          = 1 << 19;
+        /// `#[no_builtins]`: indicates that disable implicit builtin knowledge of functions for the function.
+        const NO_BUILTINS               = 1 << 20;
     }
 }
 
 impl CodegenFnAttrs {
-    pub fn new() -> CodegenFnAttrs {
+    pub const EMPTY: &'static Self = &Self::new();
+
+    pub const fn new() -> CodegenFnAttrs {
         CodegenFnAttrs {
             flags: CodegenFnAttrFlags::empty(),
             inline: InlineAttr::None,
@@ -103,18 +118,11 @@ impl CodegenFnAttrs {
             link_ordinal: None,
             target_features: vec![],
             linkage: None,
+            import_linkage: None,
             link_section: None,
             no_sanitize: SanitizerSet::empty(),
             instruction_set: None,
             alignment: None,
-        }
-    }
-
-    /// Returns `true` if `#[inline]` or `#[inline(always)]` is present.
-    pub fn requests_inline(&self) -> bool {
-        match self.inline {
-            InlineAttr::Hint | InlineAttr::Always => true,
-            InlineAttr::None | InlineAttr::Never => false,
         }
     }
 

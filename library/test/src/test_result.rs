@@ -19,7 +19,6 @@ pub enum TestResult {
     TrFailed,
     TrFailedMsg(String),
     TrIgnored,
-    TrAllowedFail,
     TrBench(BenchSamples),
     TrTimedFail,
 }
@@ -34,7 +33,7 @@ pub fn calc_result<'a>(
 ) -> TestResult {
     let result = match (&desc.should_panic, task_result) {
         (&ShouldPanic::No, Ok(())) | (&ShouldPanic::Yes, Err(_)) => TestResult::TrOk,
-        (&ShouldPanic::YesWithMessage(msg), Err(ref err)) => {
+        (&ShouldPanic::YesWithMessage(msg), Err(err)) => {
             let maybe_panic_str = err
                 .downcast_ref::<String>()
                 .map(|e| &**e)
@@ -42,21 +41,18 @@ pub fn calc_result<'a>(
 
             if maybe_panic_str.map(|e| e.contains(msg)).unwrap_or(false) {
                 TestResult::TrOk
-            } else if desc.allow_fail {
-                TestResult::TrAllowedFail
             } else if let Some(panic_str) = maybe_panic_str {
                 TestResult::TrFailedMsg(format!(
                     r#"panic did not contain expected string
-      panic message: `{:?}`,
- expected substring: `{:?}`"#,
-                    panic_str, msg
+      panic message: `{panic_str:?}`,
+ expected substring: `{msg:?}`"#
                 ))
             } else {
                 TestResult::TrFailedMsg(format!(
                     r#"expected panic with string value,
  found non-string value: `{:?}`
      expected substring: `{:?}`"#,
-                    (**err).type_id(),
+                    (*err).type_id(),
                     msg
                 ))
             }
@@ -64,7 +60,6 @@ pub fn calc_result<'a>(
         (&ShouldPanic::Yes, Ok(())) | (&ShouldPanic::YesWithMessage(_), Ok(())) => {
             TestResult::TrFailedMsg("test did not panic as expected".to_string())
         }
-        _ if desc.allow_fail => TestResult::TrAllowedFail,
         _ => TestResult::TrFailed,
     };
 
@@ -90,11 +85,10 @@ pub fn get_result_from_exit_code(
     time_opts: &Option<time::TestTimeOptions>,
     exec_time: &Option<time::TestExecTime>,
 ) -> TestResult {
-    let result = match (desc.allow_fail, code) {
-        (_, TR_OK) => TestResult::TrOk,
-        (true, TR_FAILED) => TestResult::TrAllowedFail,
-        (false, TR_FAILED) => TestResult::TrFailed,
-        (_, _) => TestResult::TrFailedMsg(format!("got unexpected return code {}", code)),
+    let result = match code {
+        TR_OK => TestResult::TrOk,
+        TR_FAILED => TestResult::TrFailed,
+        _ => TestResult::TrFailedMsg(format!("got unexpected return code {code}")),
     };
 
     // If test is already failed (or allowed to fail), do not change the result.

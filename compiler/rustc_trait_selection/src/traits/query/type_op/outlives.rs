@@ -1,9 +1,12 @@
-use crate::infer::canonical::{Canonicalized, CanonicalizedQueryResponse};
-use crate::traits::query::dropck_outlives::{trivial_dropck_outlives, DropckOutlivesResult};
-use crate::traits::query::Fallible;
+use crate::infer::canonical::{Canonical, CanonicalQueryResponse};
+use crate::traits::query::dropck_outlives::{
+    compute_dropck_outlives_inner, trivial_dropck_outlives,
+};
+use crate::traits::ObligationCtxt;
+use rustc_middle::traits::query::{DropckOutlivesResult, NoSolution};
 use rustc_middle::ty::{ParamEnvAnd, Ty, TyCtxt};
 
-#[derive(Copy, Clone, Debug, HashStable, TypeFoldable, Lift)]
+#[derive(Copy, Clone, Debug, HashStable, TypeFoldable, TypeVisitable)]
 pub struct DropckOutlives<'tcx> {
     dropped_ty: Ty<'tcx>,
 }
@@ -14,34 +17,20 @@ impl<'tcx> DropckOutlives<'tcx> {
     }
 }
 
-impl super::QueryTypeOp<'tcx> for DropckOutlives<'tcx> {
+impl<'tcx> super::QueryTypeOp<'tcx> for DropckOutlives<'tcx> {
     type QueryResponse = DropckOutlivesResult<'tcx>;
 
     fn try_fast_path(
         tcx: TyCtxt<'tcx>,
         key: &ParamEnvAnd<'tcx, Self>,
     ) -> Option<Self::QueryResponse> {
-        if trivial_dropck_outlives(tcx, key.value.dropped_ty) {
-            Some(DropckOutlivesResult::default())
-        } else {
-            None
-        }
+        trivial_dropck_outlives(tcx, key.value.dropped_ty).then(DropckOutlivesResult::default)
     }
 
     fn perform_query(
         tcx: TyCtxt<'tcx>,
-        canonicalized: Canonicalized<'tcx, ParamEnvAnd<'tcx, Self>>,
-    ) -> Fallible<CanonicalizedQueryResponse<'tcx, Self::QueryResponse>> {
-        // Subtle: note that we are not invoking
-        // `infcx.at(...).dropck_outlives(...)` here, but rather the
-        // underlying `dropck_outlives` query. This same underlying
-        // query is also used by the
-        // `infcx.at(...).dropck_outlives(...)` fn. Avoiding the
-        // wrapper means we don't need an infcx in this code, which is
-        // good because the interface doesn't give us one (so that we
-        // know we are not registering any subregion relations or
-        // other things).
-
+        canonicalized: Canonical<'tcx, ParamEnvAnd<'tcx, Self>>,
+    ) -> Result<CanonicalQueryResponse<'tcx, Self::QueryResponse>, NoSolution> {
         // FIXME convert to the type expected by the `dropck_outlives`
         // query. This should eventually be fixed by changing the
         // *underlying query*.
@@ -51,5 +40,12 @@ impl super::QueryTypeOp<'tcx> for DropckOutlives<'tcx> {
         });
 
         tcx.dropck_outlives(canonicalized)
+    }
+
+    fn perform_locally_in_new_solver(
+        ocx: &ObligationCtxt<'_, 'tcx>,
+        key: ParamEnvAnd<'tcx, Self>,
+    ) -> Result<Self::QueryResponse, NoSolution> {
+        compute_dropck_outlives_inner(ocx, key.param_env.and(key.value.dropped_ty))
     }
 }

@@ -9,7 +9,7 @@ use crate::{Features, Stability};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_span::symbol::{sym, Symbol};
 
-use std::lazy::SyncLazy;
+use std::sync::LazyLock;
 
 type GateFn = fn(&Features) -> bool;
 
@@ -24,18 +24,18 @@ pub type GatedCfg = (Symbol, Symbol, GateFn);
 /// `cfg(...)`'s that are feature gated.
 const GATED_CFGS: &[GatedCfg] = &[
     // (name in cfg, feature, function to check if the feature is enabled)
+    (sym::overflow_checks, sym::cfg_overflow_checks, cfg_fn!(cfg_overflow_checks)),
     (sym::target_abi, sym::cfg_target_abi, cfg_fn!(cfg_target_abi)),
     (sym::target_thread_local, sym::cfg_target_thread_local, cfg_fn!(cfg_target_thread_local)),
-    (sym::target_has_atomic, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
-    (sym::target_has_atomic_load_store, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
     (
         sym::target_has_atomic_equal_alignment,
-        sym::cfg_target_has_atomic,
-        cfg_fn!(cfg_target_has_atomic),
+        sym::cfg_target_has_atomic_equal_alignment,
+        cfg_fn!(cfg_target_has_atomic_equal_alignment),
     ),
+    (sym::target_has_atomic_load_store, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
     (sym::sanitize, sym::cfg_sanitize, cfg_fn!(cfg_sanitize)),
     (sym::version, sym::cfg_version, cfg_fn!(cfg_version)),
-    (sym::panic, sym::cfg_panic, cfg_fn!(cfg_panic)),
+    (sym::relocation_model, sym::cfg_relocation_model, cfg_fn!(cfg_relocation_model)),
 ];
 
 /// Find a gated cfg determined by the `pred`icate which is given the cfg's name.
@@ -72,7 +72,7 @@ impl std::fmt::Debug for AttributeGate {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Gated(ref stab, name, expl, _) => {
-                write!(fmt, "Gated({:?}, {}, {})", stab, name, expl)
+                write!(fmt, "Gated({stab:?}, {name}, {expl})")
             }
             Self::Ungated => write!(fmt, "Ungated"),
         }
@@ -149,6 +149,16 @@ pub enum AttributeDuplicates {
     FutureWarnPreceding,
 }
 
+/// A convenience macro to deal with `$($expr)?`.
+macro_rules! or_default {
+    ($default:expr,) => {
+        $default
+    };
+    ($default:expr, $next:expr) => {
+        $next
+    };
+}
+
 /// A convenience macro for constructing attribute templates.
 /// E.g., `template!(Word, List: "description")` means that the attribute
 /// supports forms `#[attr]` and `#[attr(description)]`.
@@ -170,9 +180,10 @@ macro_rules! template {
 }
 
 macro_rules! ungated {
-    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(,)?) => {
+    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)? $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
+            only_local: or_default!(false, $($only_local)?),
             type_: $typ,
             template: $tpl,
             gate: Ungated,
@@ -182,18 +193,20 @@ macro_rules! ungated {
 }
 
 macro_rules! gated {
-    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $gate:ident, $msg:expr $(,)?) => {
+    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $gate:ident, $msg:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
+            only_local: or_default!(false, $($only_local)?),
             type_: $typ,
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::$gate, $msg, cfg_fn!($gate)),
         }
     };
-    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $msg:expr $(,)?) => {
+    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $msg:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
+            only_local: or_default!(false, $($only_local)?),
             type_: $typ,
             template: $tpl,
             duplicates: $duplicates,
@@ -203,12 +216,13 @@ macro_rules! gated {
 }
 
 macro_rules! rustc_attr {
-    (TEST, $attr:ident, $typ:expr, $tpl:expr, $duplicate:expr $(,)?) => {
+    (TEST, $attr:ident, $typ:expr, $tpl:expr, $duplicate:expr $(, @only_local: $only_local:expr)? $(,)?) => {
         rustc_attr!(
             $attr,
             $typ,
             $tpl,
             $duplicate,
+            $(@only_local: $only_local,)?
             concat!(
                 "the `#[",
                 stringify!($attr),
@@ -217,9 +231,10 @@ macro_rules! rustc_attr {
             ),
         )
     };
-    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $msg:expr $(,)?) => {
+    ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $msg:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
+            only_local: or_default!(false, $($only_local)?),
             type_: $typ,
             template: $tpl,
             duplicates: $duplicates,
@@ -239,6 +254,10 @@ const INTERNAL_UNSTABLE: &str = "this is an internal attribute that will never b
 
 pub struct BuiltinAttribute {
     pub name: Symbol,
+    /// Whether this attribute is only used in the local crate.
+    ///
+    /// If so, it is not encoded in the crate metadata.
+    pub only_local: bool,
     pub type_: AttributeType,
     pub template: AttributeTemplate,
     pub duplicates: AttributeDuplicates,
@@ -260,7 +279,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ungated!(ignore, Normal, template!(Word, NameValueStr: "reason"), WarnFollowing),
     ungated!(
         should_panic, Normal,
-        template!(Word, List: r#"expected = "reason"#, NameValueStr: "reason"), FutureWarnFollowing,
+        template!(Word, List: r#"expected = "reason""#, NameValueStr: "reason"), FutureWarnFollowing,
     ),
     // FIXME(Centril): This can be used on stable but shouldn't.
     ungated!(reexport_test_harness_main, CrateLevel, template!(NameValueStr: "name"), ErrorFollowing),
@@ -279,21 +298,29 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
 
     // Lints:
     ungated!(
-        warn, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#), DuplicatesOk
+        warn, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#),
+        DuplicatesOk, @only_local: true,
     ),
     ungated!(
-        allow, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#), DuplicatesOk
+        allow, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#),
+        DuplicatesOk, @only_local: true,
+    ),
+    gated!(
+        expect, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#), DuplicatesOk,
+        lint_reasons, experimental!(expect)
     ),
     ungated!(
-        forbid, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#), DuplicatesOk
+        forbid, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#),
+        DuplicatesOk, @only_local: true,
     ),
     ungated!(
-        deny, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#), DuplicatesOk
+        deny, Normal, template!(List: r#"lint1, lint2, ..., /*opt*/ reason = "...""#),
+        DuplicatesOk, @only_local: true,
     ),
     ungated!(must_use, Normal, template!(Word, NameValueStr: "reason"), FutureWarnFollowing),
     gated!(
         must_not_suspend, Normal, template!(Word, NameValueStr: "reason"), WarnFollowing,
-        must_not_suspend, experimental!(must_not_suspend)
+        experimental!(must_not_suspend)
     ),
     ungated!(
         deprecated, Normal,
@@ -302,44 +329,40 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
             List: r#"/*opt*/ since = "version", /*opt*/ note = "reason""#,
             NameValueStr: "reason"
         ),
-        // This has special duplicate handling in E0550 to handle duplicates with rustc_deprecated
-        DuplicatesOk
+        ErrorFollowing
     ),
 
     // Crate properties:
     ungated!(crate_name, CrateLevel, template!(NameValueStr: "name"), FutureWarnFollowing),
-    ungated!(crate_type, CrateLevel, template!(NameValueStr: "bin|lib|..."), FutureWarnFollowing),
+    ungated!(crate_type, CrateLevel, template!(NameValueStr: "bin|lib|..."), DuplicatesOk),
     // crate_id is deprecated
     ungated!(crate_id, CrateLevel, template!(NameValueStr: "ignored"), FutureWarnFollowing),
 
     // ABI, linking, symbols, and FFI
     ungated!(
         link, Normal,
-        template!(List: r#"name = "...", /*opt*/ kind = "dylib|static|...", /*opt*/ wasm_import_module = "...""#),
+        template!(List: r#"name = "...", /*opt*/ kind = "dylib|static|...", /*opt*/ wasm_import_module = "...", /*opt*/ import_name_type = "decorated|noprefix|undecorated""#),
         DuplicatesOk,
     ),
     ungated!(link_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding),
     ungated!(no_link, Normal, template!(Word), WarnFollowing),
-    ungated!(repr, Normal, template!(List: "C"), DuplicatesOk),
+    ungated!(repr, Normal, template!(List: "C"), DuplicatesOk, @only_local: true),
     ungated!(export_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding),
     ungated!(link_section, Normal, template!(NameValueStr: "name"), FutureWarnPreceding),
-    ungated!(no_mangle, Normal, template!(Word), WarnFollowing),
-    ungated!(used, Normal, template!(Word), WarnFollowing),
+    ungated!(no_mangle, Normal, template!(Word), WarnFollowing, @only_local: true),
+    ungated!(used, Normal, template!(Word, List: "compiler|linker"), WarnFollowing, @only_local: true),
+    ungated!(link_ordinal, Normal, template!(List: "ordinal"), ErrorPreceding),
 
     // Limits:
     ungated!(recursion_limit, CrateLevel, template!(NameValueStr: "N"), FutureWarnFollowing),
     ungated!(type_length_limit, CrateLevel, template!(NameValueStr: "N"), FutureWarnFollowing),
-    gated!(
-        const_eval_limit, CrateLevel, template!(NameValueStr: "N"), ErrorFollowing,
-        const_eval_limit, experimental!(const_eval_limit)
-    ),
     gated!(
         move_size_limit, CrateLevel, template!(NameValueStr: "N"), ErrorFollowing,
         large_assignments, experimental!(move_size_limit)
     ),
 
     // Entry point:
-    ungated!(main, Normal, template!(Word), WarnFollowing),
+    gated!(unix_sigpipe, Normal, template!(Word, NameValueStr: "inherit|sig_ign|sig_dfl"), ErrorFollowing, experimental!(unix_sigpipe)),
     ungated!(start, Normal, template!(Word), WarnFollowing),
     ungated!(no_start, CrateLevel, template!(Word), WarnFollowing),
     ungated!(no_main, CrateLevel, template!(Word), WarnFollowing),
@@ -352,26 +375,36 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
 
     // Runtime
     ungated!(
-        windows_subsystem, Normal,
+        windows_subsystem, CrateLevel,
         template!(NameValueStr: "windows|console"), FutureWarnFollowing
     ),
     ungated!(panic_handler, Normal, template!(Word), WarnFollowing), // RFC 2070
 
     // Code generation:
-    ungated!(inline, Normal, template!(Word, List: "always|never"), FutureWarnFollowing),
-    ungated!(cold, Normal, template!(Word), WarnFollowing),
-    ungated!(no_builtins, Normal, template!(Word), WarnFollowing),
-    ungated!(target_feature, Normal, template!(List: r#"enable = "name""#), DuplicatesOk),
+    ungated!(inline, Normal, template!(Word, List: "always|never"), FutureWarnFollowing, @only_local: true),
+    ungated!(cold, Normal, template!(Word), WarnFollowing, @only_local: true),
+    ungated!(no_builtins, CrateLevel, template!(Word), WarnFollowing),
+    ungated!(
+        target_feature, Normal, template!(List: r#"enable = "name""#),
+        DuplicatesOk, @only_local: true,
+    ),
     ungated!(track_caller, Normal, template!(Word), WarnFollowing),
+    ungated!(instruction_set, Normal, template!(List: "set"), ErrorPreceding),
     gated!(
         no_sanitize, Normal,
-        template!(List: "address, memory, thread"), DuplicatesOk,
+        template!(List: "address, kcfi, memory, thread"), DuplicatesOk,
         experimental!(no_sanitize)
     ),
-    gated!(no_coverage, Normal, template!(Word), WarnFollowing, experimental!(no_coverage)),
+    gated!(coverage, Normal, template!(Word, List: "on|off"), WarnFollowing, coverage_attribute, experimental!(coverage)),
 
     ungated!(
         doc, Normal, template!(List: "hidden|inline|...", NameValueStr: "string"), DuplicatesOk
+    ),
+
+    // Debugging
+    ungated!(
+        debugger_visualizer, Normal,
+        template!(List: r#"natvis_file = "...", gdb_script_file = "...""#), DuplicatesOk
     ),
 
     // ==========================================================================
@@ -379,38 +412,20 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
 
     // Linking:
-    gated!(naked, Normal, template!(Word), WarnFollowing, naked_functions, experimental!(naked)),
     gated!(
-        link_ordinal, Normal, template!(List: "ordinal"), ErrorPreceding, raw_dylib,
-        experimental!(link_ordinal)
+        naked, Normal, template!(Word), WarnFollowing, @only_local: true,
+        naked_functions, experimental!(naked)
     ),
 
-    // Plugins:
-    BuiltinAttribute {
-        name: sym::plugin,
-        type_: CrateLevel,
-        template: template!(List: "name"),
-        duplicates: DuplicatesOk,
-        gate: Gated(
-            Stability::Deprecated(
-                "https://github.com/rust-lang/rust/pull/64675",
-                Some("may be removed in a future compiler version"),
-            ),
-            sym::plugin,
-            "compiler plugins are deprecated",
-            cfg_fn!(plugin)
-        ),
-    },
-
     // Testing:
-    gated!(allow_fail, Normal, template!(Word), WarnFollowing, experimental!(allow_fail)),
     gated!(
         test_runner, CrateLevel, template!(List: "path"), ErrorFollowing, custom_test_frameworks,
         "custom test frameworks are an unstable feature",
     ),
     // RFC #1268
     gated!(
-        marker, Normal, template!(Word), WarnFollowing, marker_trait_attr, experimental!(marker)
+        marker, Normal, template!(Word), WarnFollowing, @only_local: true,
+        marker_trait_attr, experimental!(marker)
     ),
     gated!(
         thread_local, Normal, template!(Word), WarnFollowing,
@@ -422,21 +437,12 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         optimize, Normal, template!(List: "size|speed"), ErrorPreceding, optimize_attribute,
         experimental!(optimize),
     ),
-    // RFC 2867
-    gated!(
-        instruction_set, Normal, template!(List: "set"), ErrorPreceding,
-        isa_attribute, experimental!(instruction_set)
-    ),
 
     gated!(
         ffi_returns_twice, Normal, template!(Word), WarnFollowing, experimental!(ffi_returns_twice)
     ),
     gated!(ffi_pure, Normal, template!(Word), WarnFollowing, experimental!(ffi_pure)),
     gated!(ffi_const, Normal, template!(Word), WarnFollowing, experimental!(ffi_const)),
-    gated!(
-        register_attr, CrateLevel, template!(List: "attr1, attr2, ..."), DuplicatesOk,
-        experimental!(register_attr),
-    ),
     gated!(
         register_tool, CrateLevel, template!(List: "tool1, tool2, ..."), DuplicatesOk,
         experimental!(register_tool),
@@ -448,31 +454,58 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
     // RFC 2632
     gated!(
-        default_method_body_is_const, Normal, template!(Word), WarnFollowing, const_trait_impl,
-        "`default_method_body_is_const` is a temporary placeholder for declaring default bodies \
-        as `const`, which may be removed or renamed in the future."
+        const_trait, Normal, template!(Word), WarnFollowing, const_trait_impl,
+        "`const_trait` is a temporary placeholder for marking a trait that is suitable for `const` \
+        `impls` and all default bodies as `const`, which may be removed or renamed in the \
+        future."
+    ),
+    // lang-team MCP 147
+    gated!(
+        deprecated_safe, Normal, template!(List: r#"since = "version", note = "...""#), ErrorFollowing,
+        experimental!(deprecated_safe),
+    ),
+
+    // `#[collapse_debuginfo]`
+    gated!(
+        collapse_debuginfo, Normal, template!(Word), WarnFollowing,
+        experimental!(collapse_debuginfo)
+    ),
+
+    // RFC 2397
+    gated!(do_not_recommend, Normal, template!(Word), WarnFollowing, experimental!(do_not_recommend)),
+
+    // `#[cfi_encoding = ""]`
+    gated!(
+        cfi_encoding, Normal, template!(NameValueStr: "encoding"), ErrorPreceding,
+        experimental!(cfi_encoding)
     ),
 
     // ==========================================================================
     // Internal attributes: Stability, deprecation, and unsafe:
     // ==========================================================================
 
-    ungated!(feature, CrateLevel, template!(List: "name1, name1, ..."), DuplicatesOk),
-    // DuplicatesOk since it has its own validation
     ungated!(
-        rustc_deprecated, Normal,
-        template!(List: r#"since = "version", reason = "...""#), DuplicatesOk // See E0550
+        feature, CrateLevel,
+        template!(List: "name1, name2, ..."), DuplicatesOk, @only_local: true,
     ),
     // DuplicatesOk since it has its own validation
     ungated!(
-        stable, Normal, template!(List: r#"feature = "name", since = "version""#), DuplicatesOk
+        stable, Normal,
+        template!(List: r#"feature = "name", since = "version""#), DuplicatesOk, @only_local: true,
     ),
     ungated!(
         unstable, Normal,
         template!(List: r#"feature = "name", reason = "...", issue = "N""#), DuplicatesOk,
     ),
     ungated!(rustc_const_unstable, Normal, template!(List: r#"feature = "name""#), DuplicatesOk),
-    ungated!(rustc_const_stable, Normal, template!(List: r#"feature = "name""#), DuplicatesOk),
+    ungated!(
+        rustc_const_stable, Normal,
+        template!(List: r#"feature = "name""#), DuplicatesOk, @only_local: true,
+    ),
+    ungated!(
+        rustc_default_body_unstable, Normal,
+        template!(List: r#"feature = "name", reason = "...", issue = "N""#), DuplicatesOk
+    ),
     gated!(
         allow_internal_unstable, Normal, template!(Word, List: "feat1, feat2, ..."), DuplicatesOk,
         "allow_internal_unstable side-steps feature gating and stability checks",
@@ -486,6 +519,9 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         allow_internal_unsafe, Normal, template!(Word), WarnFollowing,
         "allow_internal_unsafe side-steps the unsafe_code lint",
     ),
+    rustc_attr!(rustc_allowed_through_unstable_modules, Normal, template!(Word), WarnFollowing,
+    "rustc_allowed_through_unstable_modules special cases accidental stabilizations of stable items \
+    through unstable paths"),
 
     // ==========================================================================
     // Internal attributes: Type system related:
@@ -502,11 +538,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
 
     rustc_attr!(rustc_allocator, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
-    rustc_attr!(rustc_allocator_nounwind, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
-    gated!(
-        alloc_error_handler, Normal, template!(Word), WarnFollowing,
-        experimental!(alloc_error_handler)
-    ),
+    rustc_attr!(rustc_nounwind, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
+    rustc_attr!(rustc_reallocator, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
+    rustc_attr!(rustc_deallocator, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
+    rustc_attr!(rustc_allocator_zeroed, Normal, template!(Word), WarnFollowing, IMPL_DETAIL),
     gated!(
         default_lib_allocator, Normal, template!(Word), WarnFollowing, allocator_internals,
         experimental!(default_lib_allocator),
@@ -536,11 +571,11 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
 
     gated!(
-        linkage, Normal, template!(NameValueStr: "external|internal|..."), ErrorPreceding,
+        linkage, Normal, template!(NameValueStr: "external|internal|..."), ErrorPreceding, @only_local: true,
         "the `linkage` attribute is experimental and not portable across platforms",
     ),
     rustc_attr!(
-        rustc_std_internal_symbol, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
+        rustc_std_internal_symbol, Normal, template!(Word), WarnFollowing, @only_local: true, INTERNAL_UNSTABLE
     ),
 
     // ==========================================================================
@@ -572,6 +607,12 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         ErrorFollowing,
         INTERNAL_UNSTABLE
     ),
+    rustc_attr!(
+        rustc_confusables, Normal,
+        template!(List: r#""name1", "name2", ..."#),
+        ErrorFollowing,
+        INTERNAL_UNSTABLE,
+    ),
     // Enumerates "identity-like" conversion methods to suggest on type mismatch.
     rustc_attr!(
         rustc_conversion_suggestion, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
@@ -581,6 +622,18 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(
         rustc_trivial_field_reads, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
     ),
+    // Used by the `rustc::potential_query_instability` lint to warn methods which
+    // might not be stable during incremental compilation.
+    rustc_attr!(rustc_lint_query_instability, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
+    // Used by the `rustc::untranslatable_diagnostic` and `rustc::diagnostic_outside_of_impl` lints
+    // to assist in changes to diagnostic APIs.
+    rustc_attr!(rustc_lint_diagnostics, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
+    // Used by the `rustc::bad_opt_access` lint to identify `DebuggingOptions` and `CodegenOptions`
+    // types (as well as any others in future).
+    rustc_attr!(rustc_lint_opt_ty, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
+    // Used by the `rustc::bad_opt_access` lint on fields
+    // types (as well as any others in future).
+    rustc_attr!(rustc_lint_opt_deny_field_access, Normal, template!(List: "message"), WarnFollowing, INTERNAL_UNSTABLE),
 
     // ==========================================================================
     // Internal attributes, Const related:
@@ -595,6 +648,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(
         rustc_do_not_const_check, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
     ),
+    // Ensure the argument to this function is &&str during const-check.
+    rustc_attr!(
+        rustc_const_panic_str, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
+    ),
 
     // ==========================================================================
     // Internal attributes, Layout related:
@@ -603,28 +660,75 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(
         rustc_layout_scalar_valid_range_start, Normal, template!(List: "value"), ErrorFollowing,
         "the `#[rustc_layout_scalar_valid_range_start]` attribute is just used to enable \
-        niche optimizations in libcore and will never be stable",
+        niche optimizations in libcore and libstd and will never be stable",
     ),
     rustc_attr!(
         rustc_layout_scalar_valid_range_end, Normal, template!(List: "value"), ErrorFollowing,
         "the `#[rustc_layout_scalar_valid_range_end]` attribute is just used to enable \
-        niche optimizations in libcore and will never be stable",
+        niche optimizations in libcore and libstd and will never be stable",
     ),
     rustc_attr!(
         rustc_nonnull_optimization_guaranteed, Normal, template!(Word), WarnFollowing,
         "the `#[rustc_nonnull_optimization_guaranteed]` attribute is just used to enable \
-        niche optimizations in libcore and will never be stable",
+        niche optimizations in libcore and libstd and will never be stable",
     ),
 
     // ==========================================================================
     // Internal attributes, Misc:
     // ==========================================================================
     gated!(
-        lang, Normal, template!(NameValueStr: "name"), DuplicatesOk, lang_items,
+        lang, Normal, template!(NameValueStr: "name"), DuplicatesOk, @only_local: true, lang_items,
         "language items are subject to change",
     ),
+    rustc_attr!(
+        rustc_pass_by_value, Normal, template!(Word), ErrorFollowing,
+        "#[rustc_pass_by_value] is used to mark types that must be passed by value instead of reference."
+    ),
+    rustc_attr!(
+        rustc_never_returns_null_ptr, Normal, template!(Word), ErrorFollowing,
+        "#[rustc_never_returns_null_ptr] is used to mark functions returning non-null pointers."
+    ),
+    rustc_attr!(
+        rustc_coherence_is_core, AttributeType::CrateLevel, template!(Word), ErrorFollowing, @only_local: true,
+        "#![rustc_coherence_is_core] allows inherent methods on builtin types, only intended to be used in `core`."
+    ),
+    rustc_attr!(
+        rustc_coinductive, AttributeType::Normal, template!(Word), WarnFollowing, @only_local: true,
+        "#![rustc_coinductive] changes a trait to be coinductive, allowing cycles in the trait solver."
+    ),
+    rustc_attr!(
+        rustc_allow_incoherent_impl, AttributeType::Normal, template!(Word), ErrorFollowing, @only_local: true,
+        "#[rustc_allow_incoherent_impl] has to be added to all impl items of an incoherent inherent impl."
+    ),
+    rustc_attr!(
+        rustc_deny_explicit_impl,
+        AttributeType::Normal,
+        template!(List: "implement_via_object = (true|false)"),
+        ErrorFollowing,
+        @only_local: true,
+        "#[rustc_deny_explicit_impl] enforces that a trait can have no user-provided impls"
+    ),
+    rustc_attr!(
+        rustc_has_incoherent_inherent_impls, AttributeType::Normal, template!(Word), ErrorFollowing,
+        "#[rustc_has_incoherent_inherent_impls] allows the addition of incoherent inherent impls for \
+         the given type by annotating all impl items with #[rustc_allow_incoherent_impl]."
+    ),
+    rustc_attr!(
+        rustc_box, AttributeType::Normal, template!(Word), ErrorFollowing,
+        "#[rustc_box] allows creating boxes \
+        and it is only intended to be used in `alloc`."
+    ),
+
+    rustc_attr!(
+        rustc_host, AttributeType::Normal, template!(Word), ErrorFollowing,
+        "#[rustc_host] annotates const generic parameters as the `host` effect param, \
+        and it is only intended for internal use and as a desugaring."
+    ),
+
     BuiltinAttribute {
         name: sym::rustc_diagnostic_item,
+        // FIXME: This can be `true` once we always use `tcx.is_diagnostic_item`.
+        only_local: false,
         type_: Normal,
         template: template!(NameValueStr: "name"),
         duplicates: ErrorFollowing,
@@ -645,7 +749,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "unboxed_closures are still evolving",
     ),
     rustc_attr!(
-        rustc_inherit_overflow_checks, Normal, template!(Word), WarnFollowing,
+        rustc_inherit_overflow_checks, Normal, template!(Word), WarnFollowing, @only_local: true,
         "the `#[rustc_inherit_overflow_checks]` attribute is just used to control \
         overflow checking behavior of several libcore functions that are inlined \
         across crates and will never be stable",
@@ -657,7 +761,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
          for reserving for `for<T> From<!> for T` impl"
     ),
     rustc_attr!(
-        rustc_test_marker, Normal, template!(Word), WarnFollowing,
+        rustc_test_marker, Normal, template!(NameValueStr: "name"), WarnFollowing,
         "the `#[rustc_test_marker]` attribute is used internally to track tests",
     ),
     rustc_attr!(
@@ -677,23 +781,41 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "the `#[rustc_skip_array_during_method_dispatch]` attribute is used to exclude a trait \
         from method dispatch when the receiver is an array, for compatibility in editions < 2021."
     ),
+    rustc_attr!(
+        rustc_must_implement_one_of, Normal, template!(List: "function1, function2, ..."), ErrorFollowing,
+        "the `#[rustc_must_implement_one_of]` attribute is used to change minimal complete \
+        definition of a trait, it's currently in experimental form and should be changed before \
+        being exposed outside of the std"
+    ),
+    rustc_attr!(
+        rustc_doc_primitive, Normal, template!(NameValueStr: "primitive name"), ErrorFollowing,
+        r#"`rustc_doc_primitive` is a rustc internal attribute"#,
+    ),
+    rustc_attr!(
+        rustc_safe_intrinsic, Normal, template!(Word), WarnFollowing,
+        "the `#[rustc_safe_intrinsic]` attribute is used internally to mark intrinsics as safe"
+    ),
 
     // ==========================================================================
     // Internal attributes, Testing:
     // ==========================================================================
 
+    rustc_attr!(TEST, rustc_effective_visibility, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_outlives, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_capture_analysis, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_insignificant_dtor, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_strict_coherence, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_variance, Normal, template!(Word), WarnFollowing),
+    rustc_attr!(TEST, rustc_variance_of_opaques, Normal, template!(Word), WarnFollowing),
+    rustc_attr!(TEST, rustc_hidden_type_of_opaques, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_layout, Normal, template!(List: "field1, field2, ..."), WarnFollowing),
+    rustc_attr!(TEST, rustc_abi, Normal, template!(List: "field1, field2, ..."), WarnFollowing),
     rustc_attr!(TEST, rustc_regions, Normal, template!(Word), WarnFollowing),
     rustc_attr!(
         TEST, rustc_error, Normal,
         template!(Word, List: "delay_span_bug_from_inside_query"), WarnFollowingWordOnly
     ),
-    rustc_attr!(TEST, rustc_dump_user_substs, Normal, template!(Word), WarnFollowing),
+    rustc_attr!(TEST, rustc_dump_user_args, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_evaluate_where_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(
         TEST, rustc_if_this_changed, Normal, template!(Word, List: "DepNode"), DuplicatesOk
@@ -722,6 +844,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(TEST, rustc_polymorphize_error, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_def_path, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_mir, Normal, template!(List: "arg1, arg2, ..."), DuplicatesOk),
+    gated!(
+        custom_mir, Normal, template!(List: r#"dialect = "...", phase = "...""#),
+        ErrorFollowing, "the `#[custom_mir]` attribute is just used for the Rust test suite",
+    ),
     rustc_attr!(TEST, rustc_dump_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_dump_env_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_object_lifetime_default, Normal, template!(Word), WarnFollowing),
@@ -741,8 +867,22 @@ pub fn is_builtin_attr_name(name: Symbol) -> bool {
     BUILTIN_ATTRIBUTE_MAP.get(&name).is_some()
 }
 
-pub static BUILTIN_ATTRIBUTE_MAP: SyncLazy<FxHashMap<Symbol, &BuiltinAttribute>> =
-    SyncLazy::new(|| {
+/// Whether this builtin attribute is only used in the local crate.
+/// If so, it is not encoded in the crate metadata.
+pub fn is_builtin_only_local(name: Symbol) -> bool {
+    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some_and(|attr| attr.only_local)
+}
+
+pub fn is_valid_for_get_attr(name: Symbol) -> bool {
+    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some_and(|attr| match attr.duplicates {
+        WarnFollowing | ErrorFollowing | ErrorPreceding | FutureWarnFollowing
+        | FutureWarnPreceding => true,
+        DuplicatesOk | WarnFollowingWordOnly => false,
+    })
+}
+
+pub static BUILTIN_ATTRIBUTE_MAP: LazyLock<FxHashMap<Symbol, &BuiltinAttribute>> =
+    LazyLock::new(|| {
         let mut map = FxHashMap::default();
         for attr in BUILTIN_ATTRIBUTES.iter() {
             if map.insert(attr.name, attr).is_some() {

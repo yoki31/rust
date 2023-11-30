@@ -18,10 +18,10 @@ pub trait MetadataExt {
     /// Unix platforms. The `os::unix::fs::MetadataExt` trait contains the
     /// cross-Unix abstractions contained within the raw stat.
     #[stable(feature = "metadata_ext", since = "1.1.0")]
-    #[rustc_deprecated(
+    #[deprecated(
         since = "1.8.0",
-        reason = "deprecated in favor of the accessor \
-                  methods of this trait"
+        note = "deprecated in favor of the accessor \
+                methods of this trait"
     )]
     #[allow(deprecated)]
     fn as_raw_stat(&self) -> &raw::stat;
@@ -76,12 +76,7 @@ impl MetadataExt for Metadata {
     fn as_raw_stat(&self) -> &raw::stat {
         // The methods below use libc::stat, so they work fine when libc is built with FreeBSD 12 ABI.
         // This method would just return nonsense.
-        #[cfg(freebsd12)]
         panic!("as_raw_stat not supported with FreeBSD 12 ABI");
-        #[cfg(not(freebsd12))]
-        unsafe {
-            &*(self.as_inner().as_inner() as *const libc::stat as *const raw::stat)
-        }
     }
     fn st_dev(&self) -> u64 {
         self.as_inner().as_inner().st_dev as u64
@@ -143,12 +138,7 @@ impl MetadataExt for Metadata {
     fn st_flags(&self) -> u32 {
         self.as_inner().as_inner().st_flags as u32
     }
-    #[cfg(freebsd12)]
     fn st_lspare(&self) -> u32 {
         panic!("st_lspare not supported with FreeBSD 12 ABI");
-    }
-    #[cfg(not(freebsd12))]
-    fn st_lspare(&self) -> u32 {
-        self.as_inner().as_inner().st_lspare as u32
     }
 }

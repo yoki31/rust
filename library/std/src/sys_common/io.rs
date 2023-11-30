@@ -8,6 +8,7 @@ pub mod test {
     use crate::env;
     use crate::fs;
     use crate::path::{Path, PathBuf};
+    use crate::thread;
     use rand::RngCore;
 
     pub struct TempDir(PathBuf);
@@ -29,13 +30,19 @@ pub mod test {
             // Gee, seeing how we're testing the fs module I sure hope that we
             // at least implement this correctly!
             let TempDir(ref p) = *self;
-            fs::remove_dir_all(p).unwrap();
+            let result = fs::remove_dir_all(p);
+            // Avoid panicking while panicking as this causes the process to
+            // immediately abort, without displaying test results.
+            if !thread::panicking() {
+                result.unwrap();
+            }
         }
     }
 
+    #[track_caller] // for `test_rng`
     pub fn tmpdir() -> TempDir {
         let p = env::temp_dir();
-        let mut r = rand::thread_rng();
+        let mut r = crate::test_helpers::test_rng();
         let ret = p.join(&format!("rust-{}", r.next_u32()));
         fs::create_dir(&ret).unwrap();
         TempDir(ret)

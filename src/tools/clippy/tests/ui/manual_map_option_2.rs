@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::manual_map)]
 #![allow(clippy::toplevel_ref_arg)]
 
@@ -48,9 +46,26 @@ fn main() {
     // Lint. `s` is captured by reference, so no lifetime issues.
     let s = Some(String::new());
     let _ = match &s {
-        Some(x) => Some({
-            if let Some(ref s) = s { (x.clone(), s) } else { panic!() }
-        }),
+        Some(x) => Some({ if let Some(ref s) = s { (x.clone(), s) } else { panic!() } }),
+        None => None,
+    };
+
+    // Issue #7820
+    unsafe fn f(x: u32) -> u32 {
+        x
+    }
+    unsafe {
+        let _ = match Some(0) {
+            Some(x) => Some(f(x)),
+            None => None,
+        };
+    }
+    let _ = match Some(0) {
+        Some(x) => unsafe { Some(f(x)) },
+        None => None,
+    };
+    let _ = match Some(0) {
+        Some(x) => Some(unsafe { f(x) }),
         None => None,
     };
 }

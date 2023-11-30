@@ -94,7 +94,7 @@ fn test_into_inner_poison() {
     assert!(m.is_poisoned());
     match Arc::try_unwrap(m).unwrap().into_inner() {
         Err(e) => assert_eq!(e.into_inner(), NonCopy(10)),
-        Ok(x) => panic!("into_inner of poisoned Mutex is Ok: {:?}", x),
+        Ok(x) => panic!("into_inner of poisoned Mutex is Ok: {x:?}"),
     }
 }
 
@@ -118,7 +118,7 @@ fn test_get_mut_poison() {
     assert!(m.is_poisoned());
     match Arc::try_unwrap(m).unwrap().get_mut() {
         Err(e) => assert_eq!(*e.into_inner(), NonCopy(10)),
-        Ok(x) => panic!("get_mut of poisoned Mutex is Ok: {:?}", x),
+        Ok(x) => panic!("get_mut of poisoned Mutex is Ok: {x:?}"),
     }
 }
 
@@ -181,7 +181,7 @@ fn test_mutex_arc_poison() {
     let arc2 = arc.clone();
     let _ = thread::spawn(move || {
         let lock = arc2.lock().unwrap();
-        assert_eq!(*lock, 2);
+        assert_eq!(*lock, 2); // deliberate assertion failure to poison the mutex
     })
     .join();
     assert!(arc.lock().is_err());

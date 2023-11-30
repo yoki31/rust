@@ -1,9 +1,10 @@
-// aux-build:option_helpers.rs
+//@aux-build:option_helpers.rs
 #![warn(clippy::search_is_some)]
+#![allow(clippy::useless_vec)]
 #![allow(dead_code)]
 extern crate option_helpers;
 use option_helpers::IteratorFalsePositives;
-
+//@no-rustfix
 #[rustfmt::skip]
 fn main() {
     let v = vec![3, 2, 1, 0, -1, -2, -3];
@@ -36,6 +37,9 @@ fn main() {
     // check that we don't lint if `find()` is called with
     // `Pattern` that is not a string
     let _ = "hello world".find(|c: char| c == 'o' || c == 'l').is_some();
+
+    let some_closure = |x: &u32| *x == 0;
+    let _ = (0..1).find(some_closure).is_some();
 }
 
 #[rustfmt::skip]
@@ -70,4 +74,7 @@ fn is_none() {
     // check that we don't lint if `find()` is called with
     // `Pattern` that is not a string
     let _ = "hello world".find(|c: char| c == 'o' || c == 'l').is_none();
+
+    let some_closure = |x: &u32| *x == 0;
+    let _ = (0..1).find(some_closure).is_none();
 }

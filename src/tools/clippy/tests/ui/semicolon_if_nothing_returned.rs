@@ -1,6 +1,5 @@
 #![warn(clippy::semicolon_if_nothing_returned)]
-#![allow(clippy::redundant_closure)]
-#![feature(label_break_value)]
+#![allow(clippy::redundant_closure, clippy::uninlined_format_args, clippy::needless_late_init)]
 
 fn get_unit() {}
 
@@ -109,4 +108,15 @@ fn macro_with_semicolon() {
         };
     }
     repro!();
+}
+
+fn function_returning_option() -> Option<i32> {
+    Some(1)
+}
+
+// No warning
+fn let_else_stmts() {
+    let Some(x) = function_returning_option() else {
+        return;
+    };
 }

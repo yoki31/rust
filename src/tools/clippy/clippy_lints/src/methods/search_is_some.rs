@@ -1,15 +1,14 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_sugg};
 use clippy_utils::source::{snippet, snippet_with_applicability};
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::sugg::deref_closure_args;
+use clippy_utils::ty::is_type_lang_item;
 use clippy_utils::{is_trait_method, strip_pat_refs};
-use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::PatKind;
 use rustc_lint::LateContext;
-use rustc_middle::ty;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::sym;
+use rustc_span::Span;
 
 use super::SEARCH_IS_SOME;
 
@@ -29,31 +28,33 @@ pub(super) fn check<'tcx>(
     let option_check_method = if is_some { "is_some" } else { "is_none" };
     // lint if caller of search is an Iterator
     if is_trait_method(cx, is_some_recv, sym::Iterator) {
-        let msg = format!(
-            "called `{}()` after searching an `Iterator` with `{}`",
-            option_check_method, search_method
-        );
+        let msg = format!("called `{option_check_method}()` after searching an `Iterator` with `{search_method}`");
         let search_snippet = snippet(cx, search_arg.span, "..");
         if search_snippet.lines().count() <= 1 {
             // suggest `any(|x| ..)` instead of `any(|&x| ..)` for `find(|&x| ..).is_some()`
             // suggest `any(|..| *..)` instead of `any(|..| **..)` for `find(|..| **..).is_some()`
-            let any_search_snippet = if_chain! {
-                if search_method == "find";
-                if let hir::ExprKind::Closure(_, _, body_id, ..) = search_arg.kind;
-                let closure_body = cx.tcx.hir().body(body_id);
-                if let Some(closure_arg) = closure_body.params.get(0);
-                then {
-                    if let hir::PatKind::Ref(..) = closure_arg.pat.kind {
-                        Some(search_snippet.replacen('&', "", 1))
-                    } else if let PatKind::Binding(_, _, ident, _) = strip_pat_refs(closure_arg.pat).kind {
-                        let name = &*ident.name.as_str();
-                        Some(search_snippet.replace(&format!("*{}", name), name))
+            let mut applicability = Applicability::MachineApplicable;
+            let any_search_snippet = if search_method == "find"
+                && let hir::ExprKind::Closure(&hir::Closure { body, .. }) = search_arg.kind
+                && let closure_body = cx.tcx.hir().body(body)
+                && let Some(closure_arg) = closure_body.params.first()
+            {
+                if let hir::PatKind::Ref(..) = closure_arg.pat.kind {
+                    Some(search_snippet.replacen('&', "", 1))
+                } else if let PatKind::Binding(..) = strip_pat_refs(closure_arg.pat).kind {
+                    // `find()` provides a reference to the item, but `any` does not,
+                    // so we should fix item usages for suggestion
+                    if let Some(closure_sugg) = deref_closure_args(cx, search_arg) {
+                        applicability = closure_sugg.applicability;
+                        Some(closure_sugg.suggestion)
                     } else {
-                        None
+                        Some(search_snippet.to_string())
                     }
                 } else {
                     None
                 }
+            } else {
+                None
             };
             // add note if not multi-line
             if is_some {
@@ -67,7 +68,7 @@ pub(super) fn check<'tcx>(
                         "any({})",
                         any_search_snippet.as_ref().map_or(&*search_snippet, String::as_str)
                     ),
-                    Applicability::MachineApplicable,
+                    applicability,
                 );
             } else {
                 let iter = snippet(cx, search_recv.span, "..");
@@ -78,11 +79,10 @@ pub(super) fn check<'tcx>(
                     &msg,
                     "use `!_.any()` instead",
                     format!(
-                        "!{}.any({})",
-                        iter,
+                        "!{iter}.any({})",
                         any_search_snippet.as_ref().map_or(&*search_snippet, String::as_str)
                     ),
-                    Applicability::MachineApplicable,
+                    applicability,
                 );
             }
         } else {
@@ -101,47 +101,43 @@ pub(super) fn check<'tcx>(
     else if search_method == "find" {
         let is_string_or_str_slice = |e| {
             let self_ty = cx.typeck_results().expr_ty(e).peel_refs();
-            if is_type_diagnostic_item(cx, self_ty, sym::String) {
+            if is_type_lang_item(cx, self_ty, hir::LangItem::String) {
                 true
             } else {
-                *self_ty.kind() == ty::Str
+                self_ty.is_str()
             }
         };
-        if_chain! {
-            if is_string_or_str_slice(search_recv);
-            if is_string_or_str_slice(search_arg);
-            then {
-                let msg = format!("called `{}()` after calling `find()` on a string", option_check_method);
-                match option_check_method {
-                    "is_some" => {
-                        let mut applicability = Applicability::MachineApplicable;
-                        let find_arg = snippet_with_applicability(cx, search_arg.span, "..", &mut applicability);
-                        span_lint_and_sugg(
-                            cx,
-                            SEARCH_IS_SOME,
-                            method_span.with_hi(expr.span.hi()),
-                            &msg,
-                            "use `contains()` instead",
-                            format!("contains({})", find_arg),
-                            applicability,
-                        );
-                    },
-                    "is_none" => {
-                        let string = snippet(cx, search_recv.span, "..");
-                        let mut applicability = Applicability::MachineApplicable;
-                        let find_arg = snippet_with_applicability(cx, search_arg.span, "..", &mut applicability);
-                        span_lint_and_sugg(
-                            cx,
-                            SEARCH_IS_SOME,
-                            expr.span,
-                            &msg,
-                            "use `!_.contains()` instead",
-                            format!("!{}.contains({})", string, find_arg),
-                            applicability,
-                        );
-                    },
-                    _ => (),
-                }
+        if is_string_or_str_slice(search_recv) && is_string_or_str_slice(search_arg) {
+            let msg = format!("called `{option_check_method}()` after calling `find()` on a string");
+            match option_check_method {
+                "is_some" => {
+                    let mut applicability = Applicability::MachineApplicable;
+                    let find_arg = snippet_with_applicability(cx, search_arg.span, "..", &mut applicability);
+                    span_lint_and_sugg(
+                        cx,
+                        SEARCH_IS_SOME,
+                        method_span.with_hi(expr.span.hi()),
+                        &msg,
+                        "use `contains()` instead",
+                        format!("contains({find_arg})"),
+                        applicability,
+                    );
+                },
+                "is_none" => {
+                    let string = snippet(cx, search_recv.span, "..");
+                    let mut applicability = Applicability::MachineApplicable;
+                    let find_arg = snippet_with_applicability(cx, search_arg.span, "..", &mut applicability);
+                    span_lint_and_sugg(
+                        cx,
+                        SEARCH_IS_SOME,
+                        expr.span,
+                        &msg,
+                        "use `!_.contains()` instead",
+                        format!("!{string}.contains({find_arg})"),
+                        applicability,
+                    );
+                },
+                _ => (),
             }
         }
     }

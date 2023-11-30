@@ -173,14 +173,17 @@ fn debug() {
 
     let udpsock = t!(UdpSocket::bind(&socket_addr));
     let udpsock_inner = udpsock.0.socket().as_raw();
-    let compare = format!("UdpSocket {{ addr: {:?}, {}: {:?} }}", socket_addr, name, udpsock_inner);
-    assert_eq!(format!("{:?}", udpsock), compare);
+    let compare = format!("UdpSocket {{ addr: {socket_addr:?}, {name}: {udpsock_inner:?} }}");
+    assert_eq!(format!("{udpsock:?}"), compare);
 }
 
 // FIXME: re-enabled openbsd/netbsd tests once their socket timeout code
 //        no longer has rounding errors.
 // VxWorks ignores SO_SNDTIMEO.
-#[cfg_attr(any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks"), ignore)]
+#[cfg_attr(
+    any(target_os = "netbsd", target_os = "openbsd", target_os = "vxworks", target_os = "nto"),
+    ignore
+)]
 #[test]
 fn timeouts() {
     let addr = next_test_ip4();
@@ -359,7 +362,7 @@ fn set_nonblocking() {
         match socket.recv(&mut buf) {
             Ok(_) => panic!("expected error"),
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => panic!("unexpected error {}", e),
+            Err(e) => panic!("unexpected error {e}"),
         }
     })
 }

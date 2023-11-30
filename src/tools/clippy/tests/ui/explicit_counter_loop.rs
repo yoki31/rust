@@ -1,26 +1,80 @@
 #![warn(clippy::explicit_counter_loop)]
-
+#![allow(clippy::uninlined_format_args, clippy::useless_vec)]
+//@no-rustfix
 fn main() {
     let mut vec = vec![1, 2, 3, 4];
     let mut _index = 0;
     for _v in &vec {
+        //~^ ERROR: the variable `_index` is used as a loop counter
+        //~| NOTE: `-D clippy::explicit-counter-loop` implied by `-D warnings`
         _index += 1
     }
 
     let mut _index = 1;
     _index = 0;
     for _v in &vec {
+        //~^ ERROR: the variable `_index` is used as a loop counter
         _index += 1
     }
 
     let mut _index = 0;
     for _v in &mut vec {
+        //~^ ERROR: the variable `_index` is used as a loop counter
         _index += 1;
     }
 
     let mut _index = 0;
     for _v in vec {
+        //~^ ERROR: the variable `_index` is used as a loop counter
         _index += 1;
+    }
+
+    let vec = [1, 2, 3, 4];
+    // Potential false positives
+    let mut _index = 0;
+    _index = 1;
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 0;
+    _index += 1;
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        _index = 1;
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        let mut _index = 0;
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        _index += 1;
+        _index = 0;
+    }
+
+    let mut _index = 0;
+    if true {
+        _index = 1
+    };
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 1;
+    if false {
+        _index = 0
+    };
+    for _v in &vec {
+        _index += 1
     }
 }
 
@@ -59,6 +113,7 @@ mod issue_1219 {
         let text = "banana";
         let mut count = 0;
         for ch in text.chars() {
+            //~^ ERROR: the variable `count` is used as a loop counter
             println!("{}", count);
             count += 1;
             if ch == 'a' {
@@ -70,6 +125,7 @@ mod issue_1219 {
         let text = "banana";
         let mut count = 0;
         for ch in text.chars() {
+            //~^ ERROR: the variable `count` is used as a loop counter
             println!("{}", count);
             count += 1;
             for i in 0..2 {
@@ -128,6 +184,7 @@ mod issue_1670 {
     pub fn test() {
         let mut count = 0;
         for _i in 3..10 {
+            //~^ ERROR: the variable `count` is used as a loop counter
             count += 1;
         }
     }
@@ -155,6 +212,69 @@ mod issue_4677 {
         for _i in slice {
             count += 1;
             println!("{}", count);
+        }
+    }
+}
+
+mod issue_7920 {
+    pub fn test() {
+        let slice = &[1, 2, 3];
+
+        let index_usize: usize = 0;
+        let mut idx_usize: usize = 0;
+
+        // should suggest `enumerate`
+        for _item in slice {
+            //~^ ERROR: the variable `idx_usize` is used as a loop counter
+            if idx_usize == index_usize {
+                break;
+            }
+
+            idx_usize += 1;
+        }
+
+        let index_u32: u32 = 0;
+        let mut idx_u32: u32 = 0;
+
+        // should suggest `zip`
+        for _item in slice {
+            //~^ ERROR: the variable `idx_u32` is used as a loop counter
+            //~| NOTE: `idx_u32` is of type `u32`, making it ineligible for `Iterator::enumera
+            if idx_u32 == index_u32 {
+                break;
+            }
+
+            idx_u32 += 1;
+        }
+    }
+}
+
+mod issue_10058 {
+    pub fn test() {
+        // should not lint since we are increasing counter potentially more than once in the loop
+        let values = [0, 1, 0, 1, 1, 1, 0, 1, 0, 1];
+        let mut counter = 0;
+        for value in values {
+            counter += 1;
+
+            if value == 0 {
+                continue;
+            }
+
+            counter += 1;
+        }
+    }
+
+    pub fn test2() {
+        // should not lint since we are increasing counter potentially more than once in the loop
+        let values = [0, 1, 0, 1, 1, 1, 0, 1, 0, 1];
+        let mut counter = 0;
+        for value in values {
+            counter += 1;
+
+            if value != 0 {
+                counter += 1;
+            }
         }
     }
 }

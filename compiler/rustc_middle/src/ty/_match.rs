@@ -18,24 +18,25 @@ use crate::ty::{self, InferConst, Ty, TyCtxt};
 /// Like subtyping, matching is really a binary relation, so the only
 /// important thing about the result is Ok/Err. Also, matching never
 /// affects any type variables or unification state.
-pub struct Match<'tcx> {
+pub struct MatchAgainstFreshVars<'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
 }
 
-impl Match<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Match<'tcx> {
-        Match { tcx, param_env }
+impl<'tcx> MatchAgainstFreshVars<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> MatchAgainstFreshVars<'tcx> {
+        MatchAgainstFreshVars { tcx, param_env }
     }
 }
 
-impl TypeRelation<'tcx> for Match<'tcx> {
+impl<'tcx> TypeRelation<'tcx> for MatchAgainstFreshVars<'tcx> {
     fn tag(&self) -> &'static str {
-        "Match"
+        "MatchAgainstFreshVars"
     }
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
+
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.param_env
     }
@@ -53,17 +54,17 @@ impl TypeRelation<'tcx> for Match<'tcx> {
         self.relate(a, b)
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn regions(
         &mut self,
         a: ty::Region<'tcx>,
         b: ty::Region<'tcx>,
     ) -> RelateResult<'tcx, ty::Region<'tcx>> {
-        debug!("{}.regions({:?}, {:?})", self.tag(), a, b);
         Ok(a)
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn tys(&mut self, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
-        debug!("{}.tys({:?}, {:?})", self.tag(), a, b);
         if a == b {
             return Ok(a);
         }
@@ -77,38 +78,38 @@ impl TypeRelation<'tcx> for Match<'tcx> {
             ) => Ok(a),
 
             (&ty::Infer(_), _) | (_, &ty::Infer(_)) => {
-                Err(TypeError::Sorts(relate::expected_found(self, &a, &b)))
+                Err(TypeError::Sorts(relate::expected_found(self, a, b)))
             }
 
-            (&ty::Error(_), _) | (_, &ty::Error(_)) => Ok(self.tcx().ty_error()),
+            (&ty::Error(guar), _) | (_, &ty::Error(guar)) => Ok(Ty::new_error(self.tcx(), guar)),
 
-            _ => relate::super_relate_tys(self, a, b),
+            _ => relate::structurally_relate_tys(self, a, b),
         }
     }
 
     fn consts(
         &mut self,
-        a: &'tcx ty::Const<'tcx>,
-        b: &'tcx ty::Const<'tcx>,
-    ) -> RelateResult<'tcx, &'tcx ty::Const<'tcx>> {
+        a: ty::Const<'tcx>,
+        b: ty::Const<'tcx>,
+    ) -> RelateResult<'tcx, ty::Const<'tcx>> {
         debug!("{}.consts({:?}, {:?})", self.tag(), a, b);
         if a == b {
             return Ok(a);
         }
 
-        match (a.val, b.val) {
+        match (a.kind(), b.kind()) {
             (_, ty::ConstKind::Infer(InferConst::Fresh(_))) => {
                 return Ok(a);
             }
 
             (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => {
-                return Err(TypeError::ConstMismatch(relate::expected_found(self, &a, &b)));
+                return Err(TypeError::ConstMismatch(relate::expected_found(self, a, b)));
             }
 
             _ => {}
         }
 
-        relate::super_relate_consts(self, a, b)
+        relate::structurally_relate_consts(self, a, b)
     }
 
     fn binders<T>(

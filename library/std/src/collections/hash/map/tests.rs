@@ -1,9 +1,10 @@
 use super::Entry::{Occupied, Vacant};
 use super::HashMap;
-use super::RandomState;
 use crate::assert_matches::assert_matches;
 use crate::cell::RefCell;
-use rand::{thread_rng, Rng};
+use crate::hash::RandomState;
+use crate::test_helpers::test_rng;
+use rand::Rng;
 use realstd::collections::TryReserveErrorKind::*;
 
 // https://github.com/rust-lang/rust/issues/62301
@@ -268,10 +269,13 @@ fn test_lots_of_insertions() {
 
     // Try this a few times to make sure we never screw up the hashmap's
     // internal state.
-    for _ in 0..10 {
+    let loops = if cfg!(miri) { 2 } else { 10 };
+    for _ in 0..loops {
         assert!(m.is_empty());
 
-        for i in 1..1001 {
+        let count = if cfg!(miri) { 101 } else { 1001 };
+
+        for i in 1..count {
             assert!(m.insert(i, i).is_none());
 
             for j in 1..=i {
@@ -279,42 +283,42 @@ fn test_lots_of_insertions() {
                 assert_eq!(r, Some(&j));
             }
 
-            for j in i + 1..1001 {
+            for j in i + 1..count {
                 let r = m.get(&j);
                 assert_eq!(r, None);
             }
         }
 
-        for i in 1001..2001 {
+        for i in count..(2 * count) {
             assert!(!m.contains_key(&i));
         }
 
         // remove forwards
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(m.remove(&i).is_some());
 
             for j in 1..=i {
                 assert!(!m.contains_key(&j));
             }
 
-            for j in i + 1..1001 {
+            for j in i + 1..count {
                 assert!(m.contains_key(&j));
             }
         }
 
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(!m.contains_key(&i));
         }
 
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(m.insert(i, i).is_none());
         }
 
         // remove backwards
-        for i in (1..1001).rev() {
+        for i in (1..count).rev() {
             assert!(m.remove(&i).is_some());
 
-            for j in i..1001 {
+            for j in i..count {
                 assert!(!m.contains_key(&j));
             }
 
@@ -420,8 +424,8 @@ fn test_iterate() {
 
 #[test]
 fn test_keys() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: HashMap<_, _> = vec.into_iter().collect();
+    let pairs = [(1, 'a'), (2, 'b'), (3, 'c')];
+    let map: HashMap<_, _> = pairs.into_iter().collect();
     let keys: Vec<_> = map.keys().cloned().collect();
     assert_eq!(keys.len(), 3);
     assert!(keys.contains(&1));
@@ -431,8 +435,8 @@ fn test_keys() {
 
 #[test]
 fn test_values() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: HashMap<_, _> = vec.into_iter().collect();
+    let pairs = [(1, 'a'), (2, 'b'), (3, 'c')];
+    let map: HashMap<_, _> = pairs.into_iter().collect();
     let values: Vec<_> = map.values().cloned().collect();
     assert_eq!(values.len(), 3);
     assert!(values.contains(&'a'));
@@ -442,8 +446,8 @@ fn test_values() {
 
 #[test]
 fn test_values_mut() {
-    let vec = vec![(1, 1), (2, 2), (3, 3)];
-    let mut map: HashMap<_, _> = vec.into_iter().collect();
+    let pairs = [(1, 1), (2, 2), (3, 3)];
+    let mut map: HashMap<_, _> = pairs.into_iter().collect();
     for value in map.values_mut() {
         *value = (*value) * 2
     }
@@ -456,8 +460,8 @@ fn test_values_mut() {
 
 #[test]
 fn test_into_keys() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: HashMap<_, _> = vec.into_iter().collect();
+    let pairs = [(1, 'a'), (2, 'b'), (3, 'c')];
+    let map: HashMap<_, _> = pairs.into_iter().collect();
     let keys: Vec<_> = map.into_keys().collect();
 
     assert_eq!(keys.len(), 3);
@@ -468,8 +472,8 @@ fn test_into_keys() {
 
 #[test]
 fn test_into_values() {
-    let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-    let map: HashMap<_, _> = vec.into_iter().collect();
+    let pairs = [(1, 'a'), (2, 'b'), (3, 'c')];
+    let map: HashMap<_, _> = pairs.into_iter().collect();
     let values: Vec<_> = map.into_values().collect();
 
     assert_eq!(values.len(), 3);
@@ -515,10 +519,10 @@ fn test_show() {
     map.insert(1, 2);
     map.insert(3, 4);
 
-    let map_str = format!("{:?}", map);
+    let map_str = format!("{map:?}");
 
     assert!(map_str == "{1: 2, 3: 4}" || map_str == "{3: 4, 1: 2}");
-    assert_eq!(format!("{:?}", empty), "{}");
+    assert_eq!(format!("{empty:?}"), "{}");
 }
 
 #[test]
@@ -702,21 +706,21 @@ fn test_entry_take_doesnt_corrupt() {
     // Test for #19292
     fn check(m: &HashMap<i32, ()>) {
         for k in m.keys() {
-            assert!(m.contains_key(k), "{} is in keys() but not in the map?", k);
+            assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
         }
     }
 
     let mut m = HashMap::new();
-    let mut rng = thread_rng();
+    let mut rng = test_rng();
 
     // Populate the map with some items.
     for _ in 0..50 {
-        let x = rng.gen_range(-10, 10);
+        let x = rng.gen_range(-10..10);
         m.insert(x, ());
     }
 
     for _ in 0..1000 {
-        let x = rng.gen_range(-10, 10);
+        let x = rng.gen_range(-10..10);
         match m.entry(x) {
             Vacant(_) => {}
             Occupied(e) => {
@@ -817,6 +821,8 @@ fn test_retain() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
+#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve() {
     let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
 
@@ -828,11 +834,21 @@ fn test_try_reserve() {
         "usize::MAX should trigger an overflow!"
     );
 
-    assert_matches!(
-        empty_bytes.try_reserve(MAX_USIZE / 8).map_err(|e| e.kind()),
-        Err(AllocError { .. }),
-        "usize::MAX / 8 should trigger an OOM!"
-    );
+    if let Err(AllocError { .. }) = empty_bytes.try_reserve(MAX_USIZE / 16).map_err(|e| e.kind()) {
+    } else {
+        // This may succeed if there is enough free memory. Attempt to
+        // allocate a few more hashmaps to ensure the allocation will fail.
+        let mut empty_bytes2: HashMap<u8, u8> = HashMap::new();
+        let _ = empty_bytes2.try_reserve(MAX_USIZE / 16);
+        let mut empty_bytes3: HashMap<u8, u8> = HashMap::new();
+        let _ = empty_bytes3.try_reserve(MAX_USIZE / 16);
+        let mut empty_bytes4: HashMap<u8, u8> = HashMap::new();
+        assert_matches!(
+            empty_bytes4.try_reserve(MAX_USIZE / 16).map_err(|e| e.kind()),
+            Err(AllocError { .. }),
+            "usize::MAX / 16 should trigger an OOM!"
+        );
+    }
 }
 
 #[test]
@@ -928,7 +944,7 @@ fn test_raw_entry() {
     }
 }
 
-mod test_drain_filter {
+mod test_extract_if {
     use super::*;
 
     use crate::panic::{catch_unwind, AssertUnwindSafe};
@@ -952,7 +968,7 @@ mod test_drain_filter {
     #[test]
     fn empty() {
         let mut map: HashMap<i32, i32> = HashMap::new();
-        map.drain_filter(|_, _| unreachable!("there's nothing to decide on"));
+        map.extract_if(|_, _| unreachable!("there's nothing to decide on")).for_each(drop);
         assert!(map.is_empty());
     }
 
@@ -960,7 +976,7 @@ mod test_drain_filter {
     fn consuming_nothing() {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
-        assert!(map.drain_filter(|_, _| false).eq_sorted(crate::iter::empty()));
+        assert!(map.extract_if(|_, _| false).eq_sorted(crate::iter::empty()));
         assert_eq!(map.len(), 3);
     }
 
@@ -968,7 +984,7 @@ mod test_drain_filter {
     fn consuming_all() {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.clone().collect();
-        assert!(map.drain_filter(|_, _| true).eq_sorted(pairs));
+        assert!(map.extract_if(|_, _| true).eq_sorted(pairs));
         assert!(map.is_empty());
     }
 
@@ -977,7 +993,7 @@ mod test_drain_filter {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(|_, v| {
                 *v += 6;
                 false
             })
@@ -992,7 +1008,7 @@ mod test_drain_filter {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(|_, v| {
                 *v += 6;
                 true
             })
@@ -1018,14 +1034,15 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         catch_unwind(move || {
-            drop(map.drain_filter(|_, _| {
+            map.extract_if(|_, _| {
                 PREDS.fetch_add(1, Ordering::SeqCst);
                 true
-            }))
+            })
+            .for_each(drop)
         })
         .unwrap_err();
 
-        assert_eq!(PREDS.load(Ordering::SeqCst), 3);
+        assert_eq!(PREDS.load(Ordering::SeqCst), 2);
         assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
 
@@ -1044,10 +1061,11 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         catch_unwind(AssertUnwindSafe(|| {
-            drop(map.drain_filter(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
+            map.extract_if(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
                 0 => true,
                 _ => panic!(),
-            }))
+            })
+            .for_each(drop)
         }))
         .unwrap_err();
 
@@ -1072,7 +1090,7 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         {
-            let mut it = map.drain_filter(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
+            let mut it = map.extract_if(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
                 0 => true,
                 _ => panic!(),
             });
@@ -1099,4 +1117,10 @@ fn from_array() {
     // If you make a change that causes this line to no longer infer,
     // that's a problem!
     let _must_not_require_type_annotation = HashMap::from([(1, 2)]);
+}
+
+#[test]
+fn const_with_hasher() {
+    const X: HashMap<(), (), ()> = HashMap::with_hasher(());
+    assert_eq!(X.len(), 0);
 }

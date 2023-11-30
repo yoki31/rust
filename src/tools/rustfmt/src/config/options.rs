@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use std::collections::{hash_set, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ pub enum NewlineStyle {
     Auto,
     /// Force CRLF (`\r\n`).
     Windows,
-    /// Force CR (`\n).
+    /// Force CR (`\n`).
     Unix,
     /// `\r\n` in Windows, `\n` on other platforms.
     Native,
@@ -218,29 +220,32 @@ pub enum Verbosity {
 pub struct WidthHeuristics {
     // Maximum width of the args of a function call before falling back
     // to vertical formatting.
-    pub fn_call_width: usize,
+    pub(crate) fn_call_width: usize,
     // Maximum width of the args of a function-like attributes before falling
     // back to vertical formatting.
-    pub attr_fn_like_width: usize,
+    pub(crate) attr_fn_like_width: usize,
     // Maximum width in the body of a struct lit before falling back to
     // vertical formatting.
-    pub struct_lit_width: usize,
+    pub(crate) struct_lit_width: usize,
     // Maximum width in the body of a struct variant before falling back
     // to vertical formatting.
-    pub struct_variant_width: usize,
+    pub(crate) struct_variant_width: usize,
     // Maximum width of an array literal before falling back to vertical
     // formatting.
-    pub array_width: usize,
+    pub(crate) array_width: usize,
     // Maximum length of a chain to fit on a single line.
-    pub chain_width: usize,
+    pub(crate) chain_width: usize,
     // Maximum line length for single line if-else expressions. A value
     // of zero means always break if-else expressions.
-    pub single_line_if_else_max_width: usize,
+    pub(crate) single_line_if_else_max_width: usize,
+    // Maximum line length for single line let-else statements. A value of zero means
+    // always format the divergent `else` block over multiple lines.
+    pub(crate) single_line_let_else_max_width: usize,
 }
 
 impl fmt::Display for WidthHeuristics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -255,6 +260,7 @@ impl WidthHeuristics {
             array_width: usize::max_value(),
             chain_width: usize::max_value(),
             single_line_if_else_max_width: 0,
+            single_line_let_else_max_width: 0,
         }
     }
 
@@ -267,6 +273,7 @@ impl WidthHeuristics {
             array_width: max_width,
             chain_width: max_width,
             single_line_if_else_max_width: max_width,
+            single_line_let_else_max_width: max_width,
         }
     }
 
@@ -288,6 +295,7 @@ impl WidthHeuristics {
             array_width: (60.0 * max_width_ratio).round() as usize,
             chain_width: (60.0 * max_width_ratio).round() as usize,
             single_line_if_else_max_width: (50.0 * max_width_ratio).round() as usize,
+            single_line_let_else_max_width: (50.0 * max_width_ratio).round() as usize,
         }
     }
 }
@@ -423,6 +431,10 @@ pub enum Edition {
     #[doc_hint = "2021"]
     /// Edition 2021.
     Edition2021,
+    #[value = "2024"]
+    #[doc_hint = "2024"]
+    /// Edition 2024.
+    Edition2024,
 }
 
 impl Default for Edition {
@@ -437,6 +449,7 @@ impl From<Edition> for rustc_span::edition::Edition {
             Edition::Edition2015 => Self::Edition2015,
             Edition::Edition2018 => Self::Edition2018,
             Edition::Edition2021 => Self::Edition2021,
+            Edition::Edition2024 => Self::Edition2024,
         }
     }
 }

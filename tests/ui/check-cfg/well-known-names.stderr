@@ -1,0 +1,34 @@
+warning: unexpected `cfg` condition name: `target_oz`
+  --> $DIR/well-known-names.rs:6:7
+   |
+LL | #[cfg(target_oz = "linux")]
+   |       ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unexpected_cfgs)]` on by default
+help: there is a config with a similar name and value
+   |
+LL | #[cfg(target_os = "linux")]
+   |       ~~~~~~~~~
+
+warning: unexpected `cfg` condition name: `features`
+  --> $DIR/well-known-names.rs:13:7
+   |
+LL | #[cfg(features = "foo")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = help: expected names are: `debug_assertions`, `doc`, `doctest`, `miri`, `overflow_checks`, `panic`, `proc_macro`, `relocation_model`, `sanitize`, `target_abi`, `target_arch`, `target_endian`, `target_env`, `target_family`, `target_feature`, `target_has_atomic`, `target_has_atomic_equal_alignment`, `target_has_atomic_load_store`, `target_os`, `target_pointer_width`, `target_thread_local`, `target_vendor`, `test`, `unix`, `windows`
+
+warning: unexpected `cfg` condition name: `feature`
+  --> $DIR/well-known-names.rs:17:7
+   |
+LL | #[cfg(feature = "foo")]
+   |       ^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition name: `uniw`
+  --> $DIR/well-known-names.rs:21:7
+   |
+LL | #[cfg(uniw)]
+   |       ^^^^ help: there is a config with a similar name: `unix`
+
+warning: 4 warnings emitted
+

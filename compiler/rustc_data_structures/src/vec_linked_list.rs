@@ -1,9 +1,9 @@
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 
 pub fn iter<Ls>(
     first: Option<Ls::LinkIndex>,
-    links: &'a Ls,
-) -> impl Iterator<Item = Ls::LinkIndex> + 'a
+    links: &Ls,
+) -> impl Iterator<Item = Ls::LinkIndex> + '_
 where
     Ls: Links,
 {

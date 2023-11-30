@@ -8,13 +8,20 @@
 //! LLVM.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(nll)]
-#![feature(never_type)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![feature(assert_matches)]
 #![feature(associated_type_bounds)]
 #![feature(exhaustive_patterns)]
+#![feature(iter_intersperse)]
+#![feature(let_chains)]
 #![feature(min_specialization)]
+#![feature(never_type)]
+#![feature(rustc_attrs)]
 #![feature(step_trait)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 
 use std::path::{Path, PathBuf};
 
@@ -26,15 +33,13 @@ extern crate tracing;
 
 pub mod abi;
 pub mod asm;
+pub mod json;
 pub mod spec;
 
 #[cfg(test)]
 mod tests;
 
-/// Requirements for a `StableHashingContext` to be used in this crate.
-/// This is a hack to allow using the `HashStable_Generic` derive macro
-/// instead of implementing everything in `rustc_middle`.
-pub trait HashStableContext {}
+pub use rustc_abi::HashStableContext;
 
 /// The name of rustc's own place to organize libraries.
 ///
@@ -47,12 +52,11 @@ const RUST_LIB_DIR: &str = "rustlib";
 /// `"lib*/rustlib/x86_64-unknown-linux-gnu"`.
 pub fn target_rustlib_path(sysroot: &Path, target_triple: &str) -> PathBuf {
     let libdir = find_libdir(sysroot);
-    std::array::IntoIter::new([
+    PathBuf::from_iter([
         Path::new(libdir.as_ref()),
         Path::new(RUST_LIB_DIR),
         Path::new(target_triple),
     ])
-    .collect::<PathBuf>()
 }
 
 /// The name of the directory rustc expects libraries to be located.

@@ -9,13 +9,13 @@ use rustc_middle::ty::TyCtxt;
 pub struct MultipleReturnTerminators;
 
 impl<'tcx> MirPass<'tcx> for MultipleReturnTerminators {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if tcx.sess.mir_opt_level() < 4 {
-            return;
-        }
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() >= 4
+    }
 
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         // find basic blocks with no statement and a return terminator
-        let mut bbs_simple_returns = BitSet::new_empty(body.basic_blocks().len());
+        let mut bbs_simple_returns = BitSet::new_empty(body.basic_blocks.len());
         let def_id = body.source.def_id();
         let bbs = body.basic_blocks_mut();
         for idx in bbs.indices() {
@@ -27,7 +27,7 @@ impl<'tcx> MirPass<'tcx> for MultipleReturnTerminators {
         }
 
         for bb in bbs {
-            if !tcx.consider_optimizing(|| format!("MultipleReturnTerminators {:?} ", def_id)) {
+            if !tcx.consider_optimizing(|| format!("MultipleReturnTerminators {def_id:?} ")) {
                 break;
             }
 
@@ -38,6 +38,6 @@ impl<'tcx> MirPass<'tcx> for MultipleReturnTerminators {
             }
         }
 
-        simplify::remove_dead_blocks(tcx, body)
+        simplify::remove_dead_blocks(body)
     }
 }

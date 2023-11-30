@@ -6,11 +6,9 @@ use rustc_middle::thir::*;
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Builds a block of MIR statements to evaluate the THIR `expr`.
-    /// If the original expression was an AST statement,
-    /// (e.g., `some().code(&here());`) then `opt_stmt_span` is the
-    /// span of that statement (including its semicolon, if any).
-    /// The scope is used if a statement temporary must be dropped.
-    crate fn stmt_expr(
+    ///
+    /// The `statement_scope` is used if a statement temporary must be dropped.
+    pub(crate) fn stmt_expr(
         &mut self,
         mut block: BasicBlock,
         expr: &Expr<'tcx>,
@@ -42,7 +40,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Generate better code for things that don't need to be
                 // dropped.
                 if lhs.ty.needs_drop(this.tcx, this.param_env) {
-                    let rhs = unpack!(block = this.as_local_operand(block, rhs));
+                    let rhs = unpack!(block = this.as_local_rvalue(block, rhs));
                     let lhs = unpack!(block = this.as_place(block, lhs));
                     unpack!(block = this.build_drop_and_replace(block, lhs_span, lhs, rhs));
                 } else {
@@ -59,7 +57,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // question raised here -- should we "freeze" the
                 // value of the lhs here?  I'm inclined to think not,
                 // since it seems closer to the semantics of the
-                // overloaded version, which takes `&mut self`.  This
+                // overloaded version, which takes `&mut self`. This
                 // only affects weird things like `x += {x += 1; x}`
                 // -- is that equal to `x + (x + 1)` or `2*(x+1)`?
 
@@ -101,38 +99,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 BreakableTarget::Return,
                 source_info,
             ),
-            ExprKind::LlvmInlineAsm { asm, ref outputs, ref inputs } => {
-                debug!("stmt_expr LlvmInlineAsm block_context.push(SubExpr) : {:?}", expr);
-                this.block_context.push(BlockFrame::SubExpr);
-                let outputs = outputs
-                    .into_iter()
-                    .copied()
-                    .map(|output| unpack!(block = this.as_place(block, &this.thir[output])))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                let inputs = inputs
-                    .into_iter()
-                    .copied()
-                    .map(|input| {
-                        let input = &this.thir[input];
-                        (input.span, unpack!(block = this.as_local_operand(block, &input)))
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                this.cfg.push(
-                    block,
-                    Statement {
-                        source_info,
-                        kind: StatementKind::LlvmInlineAsm(Box::new(LlvmInlineAsm {
-                            asm: asm.clone(),
-                            outputs,
-                            inputs,
-                        })),
-                    },
-                );
-                this.block_context.pop();
-                block.unit()
-            }
+            // FIXME(explicit_tail_calls): properly lower tail calls here
+            ExprKind::Become { value } => this.break_scope(
+                block,
+                Some(&this.thir[value]),
+                BreakableTarget::Return,
+                source_info,
+            ),
             _ => {
                 assert!(
                     statement_scope.is_some(),
@@ -147,26 +120,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 //
                 // it is usually better to focus on `the_value` rather
                 // than the entirety of block(s) surrounding it.
-                let adjusted_span = (|| {
-                    if let ExprKind::Block { body } = &expr.kind {
-                        if let Some(tail_expr) = body.expr {
-                            let mut expr = &this.thir[tail_expr];
-                            while let ExprKind::Block {
-                                body: Block { expr: Some(nested_expr), .. },
-                            }
-                            | ExprKind::Scope { value: nested_expr, .. } = expr.kind
+                let adjusted_span = if let ExprKind::Block { block } = expr.kind
+                    && let Some(tail_ex) = this.thir[block].expr
+                {
+                    let mut expr = &this.thir[tail_ex];
+                    loop {
+                        match expr.kind {
+                            ExprKind::Block { block }
+                                if let Some(nested_expr) = this.thir[block].expr =>
                             {
                                 expr = &this.thir[nested_expr];
                             }
-                            this.block_context.push(BlockFrame::TailExpr {
-                                tail_result_is_ignored: true,
-                                span: expr.span,
-                            });
-                            return Some(expr.span);
+                            ExprKind::Scope { value: nested_expr, .. } => {
+                                expr = &this.thir[nested_expr];
+                            }
+                            _ => break,
                         }
                     }
+                    this.block_context.push(BlockFrame::TailExpr {
+                        tail_result_is_ignored: true,
+                        span: expr.span,
+                    });
+                    Some(expr.span)
+                } else {
                     None
-                })();
+                };
 
                 let temp =
                     unpack!(block = this.as_temp(block, statement_scope, expr, Mutability::Not));

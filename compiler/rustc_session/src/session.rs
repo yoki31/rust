@@ -1,46 +1,52 @@
-use crate::cgu_reuse_tracker::CguReuseTracker;
 use crate::code_stats::CodeStats;
-pub use crate::code_stats::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
-use crate::config::{self, CrateType, OutputType, SwitchWithOptPath};
-use crate::parse::ParseSess;
+pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
+use crate::config::{
+    self, CrateType, InstrumentCoverage, OptLevel, OutFileName, OutputType,
+    RemapPathScopeComponents, SwitchWithOptPath,
+};
+use crate::config::{ErrorOutputType, Input};
+use crate::errors;
+use crate::parse::{add_feature_diagnostics, ParseSess};
 use crate::search_paths::{PathKind, SearchPath};
 use crate::{filesearch, lint};
 
 pub use rustc_ast::attr::MarkedAttrs;
 pub use rustc_ast::Attribute;
 use rustc_data_structures::flock;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::jobserver::{self, Client};
-use rustc_data_structures::profiling::{duration_to_secs_str, SelfProfiler, SelfProfilerRef};
+use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
 use rustc_data_structures::sync::{
-    self, AtomicU64, AtomicUsize, Lock, Lrc, OnceCell, OneThread, Ordering, Ordering::SeqCst,
+    AtomicU64, DynSend, DynSync, Lock, Lrc, OneThread, Ordering::SeqCst,
 };
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitterWriter;
-use rustc_errors::emitter::{Emitter, EmitterWriter, HumanReadableErrorType};
+use rustc_errors::emitter::{DynEmitter, EmitterWriter, HumanReadableErrorType};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
-use rustc_errors::{DiagnosticBuilder, DiagnosticId, ErrorReported};
+use rustc_errors::{
+    error_code, fallback_fluent_bundle, DiagnosticBuilder, DiagnosticId, DiagnosticMessage,
+    ErrorGuaranteed, FluentBundle, Handler, IntoDiagnostic, LazyFallbackBundle, MultiSpan, Noted,
+    TerminalUrl,
+};
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
-use rustc_span::source_map::{FileLoader, MultiSpan, RealFileLoader, SourceMap, Span};
-use rustc_span::{sym, SourceFileHashAlgorithm, Symbol};
+use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMap};
+use rustc_span::{SourceFileHashAlgorithm, Span, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
 use rustc_target::spec::{
-    SanitizerSet, SplitDebuginfo, StackProtector, Target, TargetTriple, TlsModel,
+    DebuginfoKind, SanitizerSet, SplitDebuginfo, StackProtector, Target, TargetTriple, TlsModel,
 };
 
+use std::any::Any;
 use std::cell::{self, RefCell};
 use std::env;
 use std::fmt;
-use std::io::Write;
-use std::num::NonZeroU32;
 use std::ops::{Div, Mul};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{atomic::AtomicBool, Arc};
 
 pub struct OptimizationFuel {
     /// If `-zfuel=crate=n` is specified, initially set to `n`, otherwise `0`.
@@ -88,7 +94,7 @@ impl From<usize> for Limit {
 
 impl fmt::Display for Limit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        self.0.fmt(f)
     }
 }
 
@@ -108,6 +114,12 @@ impl Mul<usize> for Limit {
     }
 }
 
+impl rustc_errors::IntoDiagnosticArg for Limit {
+    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+        self.to_string().into_diagnostic_arg()
+    }
+}
+
 #[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub struct Limits {
     /// The maximum recursion limit for potentially infinitely recursive
@@ -118,9 +130,16 @@ pub struct Limits {
     pub move_size_limit: Limit,
     /// The maximum length of types during monomorphization.
     pub type_length_limit: Limit,
-    /// The maximum blocks a const expression can evaluate.
-    pub const_eval_limit: Limit,
 }
+
+pub struct CompilerIO {
+    pub input: Input,
+    pub output_dir: Option<PathBuf>,
+    pub output_file: Option<OutFileName>,
+    pub temps_dir: Option<PathBuf>,
+}
+
+pub trait LintStoreMarker: Any + DynSync + DynSend {}
 
 /// Represents the data associated with a compilation
 /// session for a single crate.
@@ -132,34 +151,13 @@ pub struct Session {
     pub target_tlib_path: Lrc<SearchPath>,
     pub parse_sess: ParseSess,
     pub sysroot: PathBuf,
-    /// The name of the root source file of the crate, in the local file system.
-    /// `None` means that there is no source file.
-    pub local_crate_source_file: Option<PathBuf>,
-
-    /// Set of `(DiagnosticId, Option<Span>, message)` tuples tracking
-    /// (sub)diagnostics that have been set once, but should not be set again,
-    /// in order to avoid redundantly verbose output (Issue #24690, #44953).
-    pub one_time_diagnostics: Lock<FxHashSet<(DiagnosticMessageId, Option<Span>, String)>>,
-    crate_types: OnceCell<Vec<CrateType>>,
-    /// The `stable_crate_id` is constructed out of the crate name and all the
-    /// `-C metadata` arguments passed to the compiler. Its value forms a unique
-    /// global identifier for the crate. It is used to allow multiple crates
-    /// with the same name to coexist. See the
-    /// `rustc_codegen_llvm::back::symbol_names` module for more information.
-    pub stable_crate_id: OnceCell<StableCrateId>,
-
-    features: OnceCell<rustc_feature::Features>,
+    /// Input, input file path and output file path to this compilation process.
+    pub io: CompilerIO,
 
     incr_comp_session: OneThread<RefCell<IncrCompSession>>,
-    /// Used for incremental compilation tests. Will only be populated if
-    /// `-Zquery-dep-graph` is specified.
-    pub cgu_reuse_tracker: CguReuseTracker,
 
     /// Used by `-Z self-profile`.
     pub prof: SelfProfilerRef,
-
-    /// Some measurements that are being gathered during compilation.
-    pub perf_stats: PerfStats,
 
     /// Data about code being compiled, gathered during compilation.
     pub code_stats: CodeStats,
@@ -174,6 +172,12 @@ pub struct Session {
     /// false positives about a job server in our environment.
     pub jobserver: Client,
 
+    /// This only ever stores a `LintStore` but we don't want a dependency on that type here.
+    pub lint_store: Option<Lrc<dyn LintStoreMarker>>,
+
+    /// Should be set if any lints are registered in `lint_store`.
+    pub registered_lints: bool,
+
     /// Cap lint level specified by a driver specifically.
     pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
@@ -186,7 +190,7 @@ pub struct Session {
     pub ctfe_backtrace: Lock<CtfeBacktrace>,
 
     /// This tracks where `-Zunleash-the-miri-inside-of-you` was used to get around a
-    /// const check, optionally with the relevant feature gate.  We use this to
+    /// const check, optionally with the relevant feature gate. We use this to
     /// warn about unleashing, but with a single diagnostic instead of dozens that
     /// drown everything else in noise.
     miri_unleashed_features: Lock<Vec<(Span, Option<Symbol>)>>,
@@ -195,47 +199,52 @@ pub struct Session {
     pub asm_arch: Option<InlineAsmArch>,
 
     /// Set of enabled features for the current target.
-    pub target_features: FxHashSet<Symbol>,
+    pub target_features: FxIndexSet<Symbol>,
+
+    /// Set of enabled features for the current target, including unstable ones.
+    pub unstable_target_features: FxIndexSet<Symbol>,
+
+    /// The version of the rustc process, possibly including a commit hash and description.
+    pub cfg_version: &'static str,
+
+    /// The inner atomic value is set to true when a feature marked as `internal` is
+    /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
+    /// internal features are wontfix, and they are usually the cause of the ICEs.
+    /// None signifies that this is not tracked.
+    pub using_internal_features: Arc<AtomicBool>,
+
+    /// All commandline args used to invoke the compiler, with @file args fully expanded.
+    /// This will only be used within debug info, e.g. in the pdb file on windows
+    /// This is mainly useful for other tools that reads that debuginfo to figure out
+    /// how to call the compiler with the same arguments.
+    pub expanded_args: Vec<String>,
 }
 
-pub struct PerfStats {
-    /// The accumulated time spent on computing symbol hashes.
-    pub symbol_hash_time: Lock<Duration>,
-    /// Total number of values canonicalized queries constructed.
-    pub queries_canonicalized: AtomicUsize,
-    /// Number of times this query is invoked.
-    pub normalize_generic_arg_after_erasing_regions: AtomicUsize,
-    /// Number of times this query is invoked.
-    pub normalize_projection_ty: AtomicUsize,
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataKind {
+    None,
+    Uncompressed,
+    Compressed,
 }
 
-/// Enum to support dispatch of one-time diagnostics (in `Session.diag_once`).
-enum DiagnosticBuilderMethod {
-    Note,
-    SpanNote,
-    // Add more variants as needed to support one-time diagnostics.
+#[derive(Clone, Copy)]
+pub enum CodegenUnits {
+    /// Specified by the user. In this case we try fairly hard to produce the
+    /// number of CGUs requested.
+    User(usize),
+
+    /// A default value, i.e. not specified by the user. In this case we take
+    /// more liberties about CGU formation, e.g. avoid producing very small
+    /// CGUs.
+    Default(usize),
 }
 
-/// Trait implemented by error types. This should not be implemented manually. Instead, use
-/// `#[derive(SessionDiagnostic)]` -- see [rustc_macros::SessionDiagnostic].
-pub trait SessionDiagnostic<'a> {
-    /// Write out as a diagnostic out of `sess`.
-    #[must_use]
-    fn into_diagnostic(self, sess: &'a Session) -> DiagnosticBuilder<'a>;
-}
-
-/// Diagnostic message ID, used by `Session.one_time_diagnostics` to avoid
-/// emitting the same message more than once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DiagnosticMessageId {
-    ErrorId(u16), // EXXXX error code as integer
-    LintId(lint::LintId),
-    StabilityId(Option<NonZeroU32>), // issue number
-}
-
-impl From<&'static lint::Lint> for DiagnosticMessageId {
-    fn from(lint: &'static lint::Lint) -> Self {
-        DiagnosticMessageId::LintId(lint::LintId::of(lint))
+impl CodegenUnits {
+    pub fn as_usize(self) -> usize {
+        match self {
+            CodegenUnits::User(n) => n,
+            CodegenUnits::Default(n) => n,
+        }
     }
 }
 
@@ -244,30 +253,37 @@ impl Session {
         self.miri_unleashed_features.lock().push((span, feature_gate));
     }
 
+    pub fn local_crate_source_file(&self) -> Option<PathBuf> {
+        let path = self.io.input.opt_path()?;
+        if self.should_prefer_remapped_for_codegen() {
+            Some(self.opts.file_path_mapping().map_prefix(path).0.into_owned())
+        } else {
+            Some(path.to_path_buf())
+        }
+    }
+
     fn check_miri_unleashed_features(&self) {
         let unleashed_features = self.miri_unleashed_features.lock();
         if !unleashed_features.is_empty() {
             let mut must_err = false;
             // Create a diagnostic pointing at where things got unleashed.
-            let mut diag = self.struct_warn("skipping const checks");
-            for &(span, feature_gate) in unleashed_features.iter() {
-                // FIXME: `span_label` doesn't do anything, so we use "help" as a hack.
-                if let Some(feature_gate) = feature_gate {
-                    diag.span_help(span, &format!("skipping check for `{}` feature", feature_gate));
-                    // The unleash flag must *not* be used to just "hack around" feature gates.
-                    must_err = true;
-                } else {
-                    diag.span_help(span, "skipping check that does not even have a feature gate");
-                }
-            }
-            diag.emit();
+            self.emit_warning(errors::SkippingConstChecks {
+                unleashed_features: unleashed_features
+                    .iter()
+                    .map(|(span, gate)| {
+                        gate.map(|gate| {
+                            must_err = true;
+                            errors::UnleashedFeatureHelp::Named { span: *span, gate }
+                        })
+                        .unwrap_or(errors::UnleashedFeatureHelp::Unnamed { span: *span })
+                    })
+                    .collect(),
+            });
+
             // If we should err, make sure we did.
-            if must_err && !self.has_errors() {
+            if must_err && self.has_errors().is_none() {
                 // We have skipped a feature gate, and not run into other errors... reject.
-                self.err(
-                    "`-Zunleash-the-miri-inside-of-you` may not be used to circumvent feature \
-                     gates, except when testing error paths in the CTFE engine",
-                );
+                self.emit_err(errors::NotCircumventFeature);
             }
         }
     }
@@ -280,7 +296,7 @@ impl Session {
     }
 
     fn emit_future_breakage(&self) {
-        if !self.opts.debugging_opts.emit_future_incompat_report {
+        if !self.opts.json_future_incompat {
             return;
         }
 
@@ -291,167 +307,342 @@ impl Session {
         self.parse_sess.span_diagnostic.emit_future_breakage_report(diags);
     }
 
-    pub fn local_stable_crate_id(&self) -> StableCrateId {
-        self.stable_crate_id.get().copied().unwrap()
+    /// Returns true if the crate is a testing one.
+    pub fn is_test_crate(&self) -> bool {
+        self.opts.test
     }
 
-    pub fn crate_types(&self) -> &[CrateType] {
-        self.crate_types.get().unwrap().as_slice()
-    }
-
-    pub fn init_crate_types(&self, crate_types: Vec<CrateType>) {
-        self.crate_types.set(crate_types).expect("`crate_types` was initialized twice")
-    }
-
-    pub fn struct_span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
-        self.diagnostic().struct_span_warn(sp, msg)
-    }
-    pub fn struct_span_force_warn<S: Into<MultiSpan>>(
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_span_warn<S: Into<MultiSpan>>(
         &self,
         sp: S,
-        msg: &str,
-    ) -> DiagnosticBuilder<'_> {
-        self.diagnostic().struct_span_force_warn(sp, msg)
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, ()> {
+        self.diagnostic().struct_span_warn(sp, msg)
     }
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_span_warn_with_expectation<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+        id: lint::LintExpectationId,
+    ) -> DiagnosticBuilder<'_, ()> {
+        self.diagnostic().struct_span_warn_with_expectation(sp, msg, id)
+    }
+    #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_span_warn_with_code<S: Into<MultiSpan>>(
         &self,
         sp: S,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
         code: DiagnosticId,
-    ) -> DiagnosticBuilder<'_> {
+    ) -> DiagnosticBuilder<'_, ()> {
         self.diagnostic().struct_span_warn_with_code(sp, msg, code)
     }
-    pub fn struct_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_warn(&self, msg: impl Into<DiagnosticMessage>) -> DiagnosticBuilder<'_, ()> {
         self.diagnostic().struct_warn(msg)
     }
-    pub fn struct_force_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
-        self.diagnostic().struct_force_warn(msg)
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_warn_with_expectation(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+        id: lint::LintExpectationId,
+    ) -> DiagnosticBuilder<'_, ()> {
+        self.diagnostic().struct_warn_with_expectation(msg, id)
     }
-    pub fn struct_span_allow<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_span_allow<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, ()> {
         self.diagnostic().struct_span_allow(sp, msg)
     }
-    pub fn struct_allow(&self, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_allow(&self, msg: impl Into<DiagnosticMessage>) -> DiagnosticBuilder<'_, ()> {
         self.diagnostic().struct_allow(msg)
     }
-    pub fn struct_span_err<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_expect(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+        id: lint::LintExpectationId,
+    ) -> DiagnosticBuilder<'_, ()> {
+        self.diagnostic().struct_expect(msg, id)
+    }
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_span_err<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         self.diagnostic().struct_span_err(sp, msg)
     }
+    #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_span_err_with_code<S: Into<MultiSpan>>(
         &self,
         sp: S,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
         code: DiagnosticId,
-    ) -> DiagnosticBuilder<'_> {
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         self.diagnostic().struct_span_err_with_code(sp, msg, code)
     }
     // FIXME: This method should be removed (every error should have an associated error code).
-    pub fn struct_err(&self, msg: &str) -> DiagnosticBuilder<'_> {
-        self.diagnostic().struct_err(msg)
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_err(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
+        self.parse_sess.struct_err(msg)
     }
-    pub fn struct_err_with_code(&self, msg: &str, code: DiagnosticId) -> DiagnosticBuilder<'_> {
+    #[track_caller]
+    #[rustc_lint_diagnostics]
+    pub fn struct_err_with_code(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+        code: DiagnosticId,
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         self.diagnostic().struct_err_with_code(msg, code)
     }
-    pub fn struct_span_fatal<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_warn_with_code(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+        code: DiagnosticId,
+    ) -> DiagnosticBuilder<'_, ()> {
+        self.diagnostic().struct_warn_with_code(msg, code)
+    }
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn struct_span_fatal<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, !> {
         self.diagnostic().struct_span_fatal(sp, msg)
     }
+    #[rustc_lint_diagnostics]
     pub fn struct_span_fatal_with_code<S: Into<MultiSpan>>(
         &self,
         sp: S,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
         code: DiagnosticId,
-    ) -> DiagnosticBuilder<'_> {
+    ) -> DiagnosticBuilder<'_, !> {
         self.diagnostic().struct_span_fatal_with_code(sp, msg, code)
     }
-    pub fn struct_fatal(&self, msg: &str) -> DiagnosticBuilder<'_> {
+    #[rustc_lint_diagnostics]
+    pub fn struct_fatal(&self, msg: impl Into<DiagnosticMessage>) -> DiagnosticBuilder<'_, !> {
         self.diagnostic().struct_fatal(msg)
     }
 
-    pub fn span_fatal<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> ! {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn span_fatal<S: Into<MultiSpan>>(&self, sp: S, msg: impl Into<DiagnosticMessage>) -> ! {
         self.diagnostic().span_fatal(sp, msg)
     }
+    #[rustc_lint_diagnostics]
     pub fn span_fatal_with_code<S: Into<MultiSpan>>(
         &self,
         sp: S,
-        msg: &str,
+        msg: impl Into<DiagnosticMessage>,
         code: DiagnosticId,
     ) -> ! {
         self.diagnostic().span_fatal_with_code(sp, msg, code)
     }
-    pub fn fatal(&self, msg: &str) -> ! {
+    #[rustc_lint_diagnostics]
+    pub fn fatal(&self, msg: impl Into<DiagnosticMessage>) -> ! {
         self.diagnostic().fatal(msg).raise()
     }
-    pub fn span_err_or_warn<S: Into<MultiSpan>>(&self, is_warning: bool, sp: S, msg: &str) {
-        if is_warning {
-            self.span_warn(sp, msg);
-        } else {
-            self.span_err(sp, msg);
-        }
-    }
-    pub fn span_err<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
+    #[rustc_lint_diagnostics]
+    #[track_caller]
+    pub fn span_err<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> ErrorGuaranteed {
         self.diagnostic().span_err(sp, msg)
     }
-    pub fn span_err_with_code<S: Into<MultiSpan>>(&self, sp: S, msg: &str, code: DiagnosticId) {
-        self.diagnostic().span_err_with_code(sp, &msg, code)
+    #[rustc_lint_diagnostics]
+    pub fn span_err_with_code<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+        code: DiagnosticId,
+    ) {
+        self.diagnostic().span_err_with_code(sp, msg, code)
     }
-    pub fn err(&self, msg: &str) {
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn err(&self, msg: impl Into<DiagnosticMessage>) -> ErrorGuaranteed {
         self.diagnostic().err(msg)
     }
-    pub fn emit_err<'a>(&'a self, err: impl SessionDiagnostic<'a>) {
-        err.into_diagnostic(self).emit()
+    #[track_caller]
+    pub fn create_err<'a>(
+        &'a self,
+        err: impl IntoDiagnostic<'a>,
+    ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
+        self.parse_sess.create_err(err)
+    }
+    #[track_caller]
+    pub fn create_feature_err<'a>(
+        &'a self,
+        err: impl IntoDiagnostic<'a>,
+        feature: Symbol,
+    ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
+        let mut err = self.parse_sess.create_err(err);
+        if err.code.is_none() {
+            err.code = std::option::Option::Some(error_code!(E0658));
+        }
+        add_feature_diagnostics(&mut err, &self.parse_sess, feature);
+        err
+    }
+    #[track_caller]
+    pub fn emit_err<'a>(&'a self, err: impl IntoDiagnostic<'a>) -> ErrorGuaranteed {
+        self.parse_sess.emit_err(err)
+    }
+    #[track_caller]
+    pub fn create_warning<'a>(
+        &'a self,
+        err: impl IntoDiagnostic<'a, ()>,
+    ) -> DiagnosticBuilder<'a, ()> {
+        self.parse_sess.create_warning(err)
+    }
+    #[track_caller]
+    pub fn emit_warning<'a>(&'a self, warning: impl IntoDiagnostic<'a, ()>) {
+        self.parse_sess.emit_warning(warning)
+    }
+    #[track_caller]
+    pub fn create_note<'a>(
+        &'a self,
+        note: impl IntoDiagnostic<'a, Noted>,
+    ) -> DiagnosticBuilder<'a, Noted> {
+        self.parse_sess.create_note(note)
+    }
+    #[track_caller]
+    pub fn emit_note<'a>(&'a self, note: impl IntoDiagnostic<'a, Noted>) -> Noted {
+        self.parse_sess.emit_note(note)
+    }
+    #[track_caller]
+    pub fn create_fatal<'a>(
+        &'a self,
+        fatal: impl IntoDiagnostic<'a, !>,
+    ) -> DiagnosticBuilder<'a, !> {
+        self.parse_sess.create_fatal(fatal)
+    }
+    #[track_caller]
+    pub fn emit_fatal<'a>(&'a self, fatal: impl IntoDiagnostic<'a, !>) -> ! {
+        self.parse_sess.emit_fatal(fatal)
     }
     #[inline]
     pub fn err_count(&self) -> usize {
         self.diagnostic().err_count()
     }
-    pub fn has_errors(&self) -> bool {
+    pub fn has_errors(&self) -> Option<ErrorGuaranteed> {
         self.diagnostic().has_errors()
     }
-    pub fn has_errors_or_delayed_span_bugs(&self) -> bool {
+    pub fn has_errors_or_delayed_span_bugs(&self) -> Option<ErrorGuaranteed> {
         self.diagnostic().has_errors_or_delayed_span_bugs()
+    }
+    pub fn is_compilation_going_to_fail(&self) -> Option<ErrorGuaranteed> {
+        self.diagnostic().is_compilation_going_to_fail()
     }
     pub fn abort_if_errors(&self) {
         self.diagnostic().abort_if_errors();
     }
-    pub fn compile_status(&self) -> Result<(), ErrorReported> {
-        if self.diagnostic().has_errors_or_lint_errors() {
-            self.diagnostic().emit_stashed_diagnostics();
-            Err(ErrorReported)
+    pub fn compile_status(&self) -> Result<(), ErrorGuaranteed> {
+        if let Some(reported) = self.diagnostic().has_errors_or_lint_errors() {
+            let _ = self.diagnostic().emit_stashed_diagnostics();
+            Err(reported)
         } else {
             Ok(())
         }
     }
     // FIXME(matthewjasper) Remove this method, it should never be needed.
-    pub fn track_errors<F, T>(&self, f: F) -> Result<T, ErrorReported>
+    pub fn track_errors<F, T>(&self, f: F) -> Result<T, ErrorGuaranteed>
     where
         F: FnOnce() -> T,
     {
         let old_count = self.err_count();
         let result = f();
-        if self.err_count() == old_count { Ok(result) } else { Err(ErrorReported) }
+        if self.err_count() == old_count {
+            Ok(result)
+        } else {
+            Err(self.delay_span_bug(
+                rustc_span::DUMMY_SP,
+                "`self.err_count()` changed but an error was not emitted",
+            ))
+        }
     }
-    pub fn span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
+
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    #[track_caller]
+    pub fn span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().span_warn(sp, msg)
     }
-    pub fn span_warn_with_code<S: Into<MultiSpan>>(&self, sp: S, msg: &str, code: DiagnosticId) {
+
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn span_warn_with_code<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+        code: DiagnosticId,
+    ) {
         self.diagnostic().span_warn_with_code(sp, msg, code)
     }
-    pub fn warn(&self, msg: &str) {
+
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn warn(&self, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().warn(msg)
     }
-    /// Delay a span_bug() call until abort_if_errors()
+
+    /// Ensures that compilation cannot succeed.
+    ///
+    /// If this function has been called but no errors have been emitted and
+    /// compilation succeeds, it will cause an internal compiler error (ICE).
+    ///
+    /// This can be used in code paths that should never run on successful compilations.
+    /// For example, it can be used to create an [`ErrorGuaranteed`]
+    /// (but you should prefer threading through the [`ErrorGuaranteed`] from an error emission directly).
+    ///
+    /// If no span is available, use [`DUMMY_SP`].
+    ///
+    /// [`DUMMY_SP`]: rustc_span::DUMMY_SP
     #[track_caller]
-    pub fn delay_span_bug<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
+    pub fn delay_span_bug<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<String>,
+    ) -> ErrorGuaranteed {
         self.diagnostic().delay_span_bug(sp, msg)
     }
 
     /// Used for code paths of expensive computations that should only take place when
     /// warnings or errors are emitted. If no messages are emitted ("good path"), then
     /// it's likely a bug.
-    pub fn delay_good_path_bug(&self, msg: &str) {
-        if self.opts.debugging_opts.print_type_sizes
-            || self.opts.debugging_opts.query_dep_graph
-            || self.opts.debugging_opts.dump_mir.is_some()
-            || self.opts.debugging_opts.unpretty.is_some()
+    pub fn delay_good_path_bug(&self, msg: impl Into<DiagnosticMessage>) {
+        if self.opts.unstable_opts.print_type_sizes
+            || self.opts.unstable_opts.query_dep_graph
+            || self.opts.unstable_opts.dump_mir.is_some()
+            || self.opts.unstable_opts.unpretty.is_some()
             || self.opts.output_types.contains_key(&OutputType::Mir)
             || std::env::var_os("RUSTC_LOG").is_some()
         {
@@ -461,13 +652,32 @@ impl Session {
         self.diagnostic().delay_good_path_bug(msg)
     }
 
-    pub fn note_without_error(&self, msg: &str) {
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn note_without_error(&self, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().note_without_error(msg)
     }
-    pub fn span_note_without_error<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
+
+    #[track_caller]
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn span_note_without_error<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: impl Into<DiagnosticMessage>,
+    ) {
         self.diagnostic().span_note_without_error(sp, msg)
     }
-    pub fn struct_note_without_error(&self, msg: &str) -> DiagnosticBuilder<'_> {
+
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn struct_note_without_error(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, ()> {
         self.diagnostic().struct_note_without_error(msg)
     }
 
@@ -476,209 +686,60 @@ impl Session {
         &self.parse_sess.span_diagnostic
     }
 
-    pub fn with_disabled_diagnostic<T, F: FnOnce() -> T>(&self, f: F) -> T {
-        self.parse_sess.span_diagnostic.with_disabled_diagnostic(f)
-    }
-
-    /// Analogous to calling methods on the given `DiagnosticBuilder`, but
-    /// deduplicates on lint ID, span (if any), and message for this `Session`
-    fn diag_once<'a, 'b>(
-        &'a self,
-        diag_builder: &'b mut DiagnosticBuilder<'a>,
-        method: DiagnosticBuilderMethod,
-        msg_id: DiagnosticMessageId,
-        message: &str,
-        span_maybe: Option<Span>,
-    ) {
-        let id_span_message = (msg_id, span_maybe, message.to_owned());
-        let fresh = self.one_time_diagnostics.borrow_mut().insert(id_span_message);
-        if fresh {
-            match method {
-                DiagnosticBuilderMethod::Note => {
-                    diag_builder.note(message);
-                }
-                DiagnosticBuilderMethod::SpanNote => {
-                    let span = span_maybe.expect("`span_note` needs a span");
-                    diag_builder.span_note(span, message);
-                }
-            }
-        }
-    }
-
-    pub fn diag_span_note_once<'a, 'b>(
-        &'a self,
-        diag_builder: &'b mut DiagnosticBuilder<'a>,
-        msg_id: DiagnosticMessageId,
-        span: Span,
-        message: &str,
-    ) {
-        self.diag_once(
-            diag_builder,
-            DiagnosticBuilderMethod::SpanNote,
-            msg_id,
-            message,
-            Some(span),
-        );
-    }
-
-    pub fn diag_note_once<'a, 'b>(
-        &'a self,
-        diag_builder: &'b mut DiagnosticBuilder<'a>,
-        msg_id: DiagnosticMessageId,
-        message: &str,
-    ) {
-        self.diag_once(diag_builder, DiagnosticBuilderMethod::Note, msg_id, message, None);
-    }
-
     #[inline]
     pub fn source_map(&self) -> &SourceMap {
         self.parse_sess.source_map()
     }
-    pub fn verbose(&self) -> bool {
-        self.opts.debugging_opts.verbose
-    }
-    pub fn time_passes(&self) -> bool {
-        self.opts.debugging_opts.time_passes || self.opts.debugging_opts.time
-    }
-    pub fn instrument_mcount(&self) -> bool {
-        self.opts.debugging_opts.instrument_mcount
-    }
-    pub fn time_llvm_passes(&self) -> bool {
-        self.opts.debugging_opts.time_llvm_passes
-    }
-    pub fn meta_stats(&self) -> bool {
-        self.opts.debugging_opts.meta_stats
-    }
-    pub fn asm_comments(&self) -> bool {
-        self.opts.debugging_opts.asm_comments
-    }
-    pub fn verify_llvm_ir(&self) -> bool {
-        self.opts.debugging_opts.verify_llvm_ir || option_env!("RUSTC_VERIFY_LLVM_IR").is_some()
-    }
-    pub fn print_llvm_passes(&self) -> bool {
-        self.opts.debugging_opts.print_llvm_passes
-    }
-    pub fn binary_dep_depinfo(&self) -> bool {
-        self.opts.debugging_opts.binary_dep_depinfo
-    }
-    pub fn mir_opt_level(&self) -> usize {
-        self.opts
-            .debugging_opts
-            .mir_opt_level
-            .unwrap_or_else(|| if self.opts.optimize != config::OptLevel::No { 2 } else { 1 })
+
+    /// Returns `true` if internal lints should be added to the lint store - i.e. if
+    /// `-Zunstable-options` is provided and this isn't rustdoc (internal lints can trigger errors
+    /// to be emitted under rustdoc).
+    pub fn enable_internal_lints(&self) -> bool {
+        self.unstable_options() && !self.opts.actually_rustdoc
     }
 
-    /// Gets the features enabled for the current compilation session.
-    /// DO NOT USE THIS METHOD if there is a TyCtxt available, as it circumvents
-    /// dependency tracking. Use tcx.features() instead.
-    #[inline]
-    pub fn features_untracked(&self) -> &rustc_feature::Features {
-        self.features.get().unwrap()
+    pub fn instrument_coverage(&self) -> bool {
+        self.opts.cg.instrument_coverage() != InstrumentCoverage::Off
     }
 
-    pub fn init_features(&self, features: rustc_feature::Features) {
-        match self.features.set(features) {
-            Ok(()) => {}
-            Err(_) => panic!("`features` was initialized twice"),
-        }
+    pub fn instrument_coverage_branch(&self) -> bool {
+        self.opts.cg.instrument_coverage() == InstrumentCoverage::Branch
     }
 
-    /// Calculates the flavor of LTO to use for this compilation.
-    pub fn lto(&self) -> config::Lto {
-        // If our target has codegen requirements ignore the command line
-        if self.target.requires_lto {
-            return config::Lto::Fat;
-        }
-
-        // If the user specified something, return that. If they only said `-C
-        // lto` and we've for whatever reason forced off ThinLTO via the CLI,
-        // then ensure we can't use a ThinLTO.
-        match self.opts.cg.lto {
-            config::LtoCli::Unspecified => {
-                // The compiler was invoked without the `-Clto` flag. Fall
-                // through to the default handling
-            }
-            config::LtoCli::No => {
-                // The user explicitly opted out of any kind of LTO
-                return config::Lto::No;
-            }
-            config::LtoCli::Yes | config::LtoCli::Fat | config::LtoCli::NoParam => {
-                // All of these mean fat LTO
-                return config::Lto::Fat;
-            }
-            config::LtoCli::Thin => {
-                return if self.opts.cli_forced_thinlto_off {
-                    config::Lto::Fat
-                } else {
-                    config::Lto::Thin
-                };
-            }
-        }
-
-        // Ok at this point the target doesn't require anything and the user
-        // hasn't asked for anything. Our next decision is whether or not
-        // we enable "auto" ThinLTO where we use multiple codegen units and
-        // then do ThinLTO over those codegen units. The logic below will
-        // either return `No` or `ThinLocal`.
-
-        // If processing command line options determined that we're incompatible
-        // with ThinLTO (e.g., `-C lto --emit llvm-ir`) then return that option.
-        if self.opts.cli_forced_thinlto_off {
-            return config::Lto::No;
-        }
-
-        // If `-Z thinlto` specified process that, but note that this is mostly
-        // a deprecated option now that `-C lto=thin` exists.
-        if let Some(enabled) = self.opts.debugging_opts.thinlto {
-            if enabled {
-                return config::Lto::ThinLocal;
-            } else {
-                return config::Lto::No;
-            }
-        }
-
-        // If there's only one codegen unit and LTO isn't enabled then there's
-        // no need for ThinLTO so just return false.
-        if self.codegen_units() == 1 {
-            return config::Lto::No;
-        }
-
-        // Now we're in "defaults" territory. By default we enable ThinLTO for
-        // optimized compiles (anything greater than O0).
-        match self.opts.optimize {
-            config::OptLevel::No => config::Lto::No,
-            _ => config::Lto::ThinLocal,
-        }
+    pub fn instrument_coverage_except_unused_generics(&self) -> bool {
+        self.opts.cg.instrument_coverage() == InstrumentCoverage::ExceptUnusedGenerics
     }
 
-    /// Returns the panic strategy for this compile session. If the user explicitly selected one
-    /// using '-C panic', use that, otherwise use the panic strategy defined by the target.
-    pub fn panic_strategy(&self) -> PanicStrategy {
-        self.opts.cg.panic.unwrap_or(self.target.panic_strategy)
-    }
-    pub fn fewer_names(&self) -> bool {
-        if let Some(fewer_names) = self.opts.debugging_opts.fewer_names {
-            fewer_names
-        } else {
-            let more_names = self.opts.output_types.contains_key(&OutputType::LlvmAssembly)
-                || self.opts.output_types.contains_key(&OutputType::Bitcode)
-                // AddressSanitizer and MemorySanitizer use alloca name when reporting an issue.
-                || self.opts.debugging_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::MEMORY);
-            !more_names
-        }
+    pub fn instrument_coverage_except_unused_functions(&self) -> bool {
+        self.opts.cg.instrument_coverage() == InstrumentCoverage::ExceptUnusedFunctions
     }
 
-    pub fn unstable_options(&self) -> bool {
-        self.opts.debugging_opts.unstable_options
-    }
-    pub fn is_nightly_build(&self) -> bool {
-        self.opts.unstable_features.is_nightly_build()
-    }
     pub fn is_sanitizer_cfi_enabled(&self) -> bool {
-        self.opts.debugging_opts.sanitizer.contains(SanitizerSet::CFI)
+        self.opts.unstable_opts.sanitizer.contains(SanitizerSet::CFI)
     }
-    pub fn overflow_checks(&self) -> bool {
-        self.opts.cg.overflow_checks.unwrap_or(self.opts.debug_assertions)
+
+    pub fn is_sanitizer_cfi_canonical_jump_tables_disabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(false)
+    }
+
+    pub fn is_sanitizer_cfi_canonical_jump_tables_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_generalize_pointers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_generalize_pointers == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_normalize_integers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_normalize_integers == Some(true)
+    }
+
+    pub fn is_sanitizer_kcfi_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer.contains(SanitizerSet::KCFI)
+    }
+
+    pub fn is_split_lto_unit_enabled(&self) -> bool {
+        self.opts.unstable_opts.split_lto_unit == Some(true)
     }
 
     /// Check whether this compile session and crate type use static crt.
@@ -692,6 +753,8 @@ impl Session {
         let found_negative = requested_features.clone().any(|r| r == "-crt-static");
         let found_positive = requested_features.clone().any(|r| r == "+crt-static");
 
+        // JUSTIFICATION: necessary use of crate_types directly (see FIXME below)
+        #[allow(rustc::bad_opt_access)]
         if found_positive || found_negative {
             found_positive
         } else if crate_type == Some(CrateType::ProcMacro)
@@ -706,71 +769,21 @@ impl Session {
         }
     }
 
-    pub fn relocation_model(&self) -> RelocModel {
-        self.opts.cg.relocation_model.unwrap_or(self.target.relocation_model)
-    }
-
-    pub fn code_model(&self) -> Option<CodeModel> {
-        self.opts.cg.code_model.or(self.target.code_model)
-    }
-
-    pub fn tls_model(&self) -> TlsModel {
-        self.opts.debugging_opts.tls_model.unwrap_or(self.target.tls_model)
-    }
-
     pub fn is_wasi_reactor(&self) -> bool {
         self.target.options.os == "wasi"
             && matches!(
-                self.opts.debugging_opts.wasi_exec_model,
+                self.opts.unstable_opts.wasi_exec_model,
                 Some(config::WasiExecModel::Reactor)
             )
     }
 
-    pub fn split_debuginfo(&self) -> SplitDebuginfo {
-        self.opts.cg.split_debuginfo.unwrap_or(self.target.split_debuginfo)
-    }
-
-    pub fn stack_protector(&self) -> StackProtector {
-        if self.target.options.supports_stack_protector {
-            self.opts.debugging_opts.stack_protector
-        } else {
-            StackProtector::None
-        }
-    }
-
+    /// Returns `true` if the target can use the current split debuginfo configuration.
     pub fn target_can_use_split_dwarf(&self) -> bool {
-        !self.target.is_like_windows && !self.target.is_like_osx
-    }
-
-    pub fn must_emit_unwind_tables(&self) -> bool {
-        // This is used to control the emission of the `uwtable` attribute on
-        // LLVM functions.
-        //
-        // Unwind tables are needed when compiling with `-C panic=unwind`, but
-        // LLVM won't omit unwind tables unless the function is also marked as
-        // `nounwind`, so users are allowed to disable `uwtable` emission.
-        // Historically rustc always emits `uwtable` attributes by default, so
-        // even they can be disabled, they're still emitted by default.
-        //
-        // On some targets (including windows), however, exceptions include
-        // other events such as illegal instructions, segfaults, etc. This means
-        // that on Windows we end up still needing unwind tables even if the `-C
-        // panic=abort` flag is passed.
-        //
-        // You can also find more info on why Windows needs unwind tables in:
-        //      https://bugzilla.mozilla.org/show_bug.cgi?id=1302078
-        //
-        // If a target requires unwind tables, then they must be emitted.
-        // Otherwise, we can defer to the `-C force-unwind-tables=<yes/no>`
-        // value, if it is provided, or disable them, if not.
-        self.target.requires_uwtable
-            || self.opts.cg.force_unwind_tables.unwrap_or(
-                self.panic_strategy() == PanicStrategy::Unwind || self.target.default_uwtable,
-            )
+        self.target.debuginfo_kind == DebuginfoKind::Dwarf
     }
 
     pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
-        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.to_u64())
+        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())
     }
 
     pub fn target_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
@@ -794,13 +807,12 @@ impl Session {
 
     /// Returns a list of directories where target-specific tool binaries are located.
     pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
-        let rustlib_path = rustc_target::target_rustlib_path(&self.sysroot, &config::host_triple());
-        let p = std::array::IntoIter::new([
+        let rustlib_path = rustc_target::target_rustlib_path(&self.sysroot, config::host_triple());
+        let p = PathBuf::from_iter([
             Path::new(&self.sysroot),
             Path::new(&rustlib_path),
             Path::new("bin"),
-        ])
-        .collect::<PathBuf>();
+        ]);
         if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
     }
 
@@ -865,31 +877,16 @@ impl Session {
         self.opts.incremental.as_ref().map(|_| self.incr_comp_session_dir())
     }
 
-    pub fn print_perf_stats(&self) {
-        eprintln!(
-            "Total time spent computing symbol hashes:      {}",
-            duration_to_secs_str(*self.perf_stats.symbol_hash_time.lock())
-        );
-        eprintln!(
-            "Total queries canonicalized:                   {}",
-            self.perf_stats.queries_canonicalized.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "normalize_generic_arg_after_erasing_regions:   {}",
-            self.perf_stats.normalize_generic_arg_after_erasing_regions.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "normalize_projection_ty:                       {}",
-            self.perf_stats.normalize_projection_ty.load(Ordering::Relaxed)
-        );
-    }
-
     /// We want to know if we're allowed to do an optimization for crate foo from -z fuel=foo=n.
     /// This expends fuel if applicable, and records fuel if applicable.
-    pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
+    pub fn consider_optimizing(
+        &self,
+        get_crate_name: impl Fn() -> Symbol,
+        msg: impl Fn() -> String,
+    ) -> bool {
         let mut ret = true;
-        if let Some((ref c, _)) = self.opts.debugging_opts.fuel {
-            if c == crate_name {
+        if let Some((ref c, _)) = self.opts.unstable_opts.fuel {
+            if c == get_crate_name().as_str() {
                 assert_eq!(self.threads(), 1);
                 let mut fuel = self.optimization_fuel.lock();
                 ret = fuel.remaining != 0;
@@ -898,7 +895,7 @@ impl Session {
                         // We only call `msg` in case we can actually emit warnings.
                         // Otherwise, this could cause a `delay_good_path_bug` to
                         // trigger (issue #79546).
-                        self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                        self.emit_warning(errors::OptimisationFuelExhausted { msg: msg() });
                     }
                     fuel.out_of_fuel = true;
                 } else if fuel.remaining > 0 {
@@ -906,8 +903,8 @@ impl Session {
                 }
             }
         }
-        if let Some(ref c) = self.opts.debugging_opts.print_fuel {
-            if c == crate_name {
+        if let Some(ref c) = self.opts.unstable_opts.print_fuel {
+            if c == get_crate_name().as_str() {
                 assert_eq!(self.threads(), 1);
                 self.print_fuel.fetch_add(1, SeqCst);
             }
@@ -915,27 +912,261 @@ impl Session {
         ret
     }
 
+    /// Is this edition 2015?
+    pub fn is_rust_2015(&self) -> bool {
+        self.edition().is_rust_2015()
+    }
+
+    /// Are we allowed to use features from the Rust 2018 edition?
+    pub fn at_least_rust_2018(&self) -> bool {
+        self.edition().at_least_rust_2018()
+    }
+
+    /// Are we allowed to use features from the Rust 2021 edition?
+    pub fn at_least_rust_2021(&self) -> bool {
+        self.edition().at_least_rust_2021()
+    }
+
+    /// Are we allowed to use features from the Rust 2024 edition?
+    pub fn at_least_rust_2024(&self) -> bool {
+        self.edition().at_least_rust_2024()
+    }
+
+    /// Returns `true` if we should use the PLT for shared library calls.
+    pub fn needs_plt(&self) -> bool {
+        // Check if the current target usually wants PLT to be enabled.
+        // The user can use the command line flag to override it.
+        let want_plt = self.target.plt_by_default;
+
+        let dbg_opts = &self.opts.unstable_opts;
+
+        let relro_level = dbg_opts.relro_level.unwrap_or(self.target.relro_level);
+
+        // Only enable this optimization by default if full relro is also enabled.
+        // In this case, lazy binding was already unavailable, so nothing is lost.
+        // This also ensures `-Wl,-z,now` is supported by the linker.
+        let full_relro = RelroLevel::Full == relro_level;
+
+        // If user didn't explicitly forced us to use / skip the PLT,
+        // then use it unless the target doesn't want it by default or the full relro forces it on.
+        dbg_opts.plt.unwrap_or(want_plt || !full_relro)
+    }
+
+    /// Checks if LLVM lifetime markers should be emitted.
+    pub fn emit_lifetime_markers(&self) -> bool {
+        self.opts.optimize != config::OptLevel::No
+        // AddressSanitizer and KernelAddressSanitizer uses lifetimes to detect use after scope bugs.
+        // MemorySanitizer uses lifetimes to detect use of uninitialized stack variables.
+        // HWAddressSanitizer will use lifetimes to detect use after scope bugs in the future.
+        || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
+    }
+
+    pub fn diagnostic_width(&self) -> usize {
+        let default_column_width = 140;
+        if let Some(width) = self.opts.diagnostic_width {
+            width
+        } else if self.opts.unstable_opts.ui_testing {
+            default_column_width
+        } else {
+            termize::dimensions().map_or(default_column_width, |(w, _)| w)
+        }
+    }
+}
+
+// JUSTIFICATION: defn of the suggested wrapper fns
+#[allow(rustc::bad_opt_access)]
+impl Session {
+    pub fn verbose(&self) -> bool {
+        self.opts.unstable_opts.verbose
+    }
+
+    pub fn print_llvm_stats(&self) -> bool {
+        self.opts.unstable_opts.print_codegen_stats
+    }
+
+    pub fn verify_llvm_ir(&self) -> bool {
+        self.opts.unstable_opts.verify_llvm_ir || option_env!("RUSTC_VERIFY_LLVM_IR").is_some()
+    }
+
+    pub fn binary_dep_depinfo(&self) -> bool {
+        self.opts.unstable_opts.binary_dep_depinfo
+    }
+
+    pub fn mir_opt_level(&self) -> usize {
+        self.opts
+            .unstable_opts
+            .mir_opt_level
+            .unwrap_or_else(|| if self.opts.optimize != OptLevel::No { 2 } else { 1 })
+    }
+
+    /// Calculates the flavor of LTO to use for this compilation.
+    pub fn lto(&self) -> config::Lto {
+        // If our target has codegen requirements ignore the command line
+        if self.target.requires_lto {
+            return config::Lto::Fat;
+        }
+
+        // If the user specified something, return that. If they only said `-C
+        // lto` and we've for whatever reason forced off ThinLTO via the CLI,
+        // then ensure we can't use a ThinLTO.
+        match self.opts.cg.lto {
+            config::LtoCli::Unspecified => {
+                // The compiler was invoked without the `-Clto` flag. Fall
+                // through to the default handling
+            }
+            config::LtoCli::No => {
+                // The user explicitly opted out of any kind of LTO
+                return config::Lto::No;
+            }
+            config::LtoCli::Yes | config::LtoCli::Fat | config::LtoCli::NoParam => {
+                // All of these mean fat LTO
+                return config::Lto::Fat;
+            }
+            config::LtoCli::Thin => {
+                // The user explicitly asked for ThinLTO
+                return config::Lto::Thin;
+            }
+        }
+
+        // Ok at this point the target doesn't require anything and the user
+        // hasn't asked for anything. Our next decision is whether or not
+        // we enable "auto" ThinLTO where we use multiple codegen units and
+        // then do ThinLTO over those codegen units. The logic below will
+        // either return `No` or `ThinLocal`.
+
+        // If processing command line options determined that we're incompatible
+        // with ThinLTO (e.g., `-C lto --emit llvm-ir`) then return that option.
+        if self.opts.cli_forced_local_thinlto_off {
+            return config::Lto::No;
+        }
+
+        // If `-Z thinlto` specified process that, but note that this is mostly
+        // a deprecated option now that `-C lto=thin` exists.
+        if let Some(enabled) = self.opts.unstable_opts.thinlto {
+            if enabled {
+                return config::Lto::ThinLocal;
+            } else {
+                return config::Lto::No;
+            }
+        }
+
+        // If there's only one codegen unit and LTO isn't enabled then there's
+        // no need for ThinLTO so just return false.
+        if self.codegen_units().as_usize() == 1 {
+            return config::Lto::No;
+        }
+
+        // Now we're in "defaults" territory. By default we enable ThinLTO for
+        // optimized compiles (anything greater than O0).
+        match self.opts.optimize {
+            config::OptLevel::No => config::Lto::No,
+            _ => config::Lto::ThinLocal,
+        }
+    }
+
+    /// Returns the panic strategy for this compile session. If the user explicitly selected one
+    /// using '-C panic', use that, otherwise use the panic strategy defined by the target.
+    pub fn panic_strategy(&self) -> PanicStrategy {
+        self.opts.cg.panic.unwrap_or(self.target.panic_strategy)
+    }
+
+    pub fn fewer_names(&self) -> bool {
+        if let Some(fewer_names) = self.opts.unstable_opts.fewer_names {
+            fewer_names
+        } else {
+            let more_names = self.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+                || self.opts.output_types.contains_key(&OutputType::Bitcode)
+                // AddressSanitizer and MemorySanitizer use alloca name when reporting an issue.
+                || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::MEMORY);
+            !more_names
+        }
+    }
+
+    pub fn unstable_options(&self) -> bool {
+        self.opts.unstable_opts.unstable_options
+    }
+
+    pub fn is_nightly_build(&self) -> bool {
+        self.opts.unstable_features.is_nightly_build()
+    }
+
+    pub fn overflow_checks(&self) -> bool {
+        self.opts.cg.overflow_checks.unwrap_or(self.opts.debug_assertions)
+    }
+
+    pub fn relocation_model(&self) -> RelocModel {
+        self.opts.cg.relocation_model.unwrap_or(self.target.relocation_model)
+    }
+
+    pub fn code_model(&self) -> Option<CodeModel> {
+        self.opts.cg.code_model.or(self.target.code_model)
+    }
+
+    pub fn tls_model(&self) -> TlsModel {
+        self.opts.unstable_opts.tls_model.unwrap_or(self.target.tls_model)
+    }
+
+    pub fn split_debuginfo(&self) -> SplitDebuginfo {
+        self.opts.cg.split_debuginfo.unwrap_or(self.target.split_debuginfo)
+    }
+
+    pub fn stack_protector(&self) -> StackProtector {
+        if self.target.options.supports_stack_protector {
+            self.opts.unstable_opts.stack_protector
+        } else {
+            StackProtector::None
+        }
+    }
+
+    pub fn must_emit_unwind_tables(&self) -> bool {
+        // This is used to control the emission of the `uwtable` attribute on
+        // LLVM functions.
+        //
+        // Unwind tables are needed when compiling with `-C panic=unwind`, but
+        // LLVM won't omit unwind tables unless the function is also marked as
+        // `nounwind`, so users are allowed to disable `uwtable` emission.
+        // Historically rustc always emits `uwtable` attributes by default, so
+        // even they can be disabled, they're still emitted by default.
+        //
+        // On some targets (including windows), however, exceptions include
+        // other events such as illegal instructions, segfaults, etc. This means
+        // that on Windows we end up still needing unwind tables even if the `-C
+        // panic=abort` flag is passed.
+        //
+        // You can also find more info on why Windows needs unwind tables in:
+        //      https://bugzilla.mozilla.org/show_bug.cgi?id=1302078
+        //
+        // If a target requires unwind tables, then they must be emitted.
+        // Otherwise, we can defer to the `-C force-unwind-tables=<yes/no>`
+        // value, if it is provided, or disable them, if not.
+        self.target.requires_uwtable
+            || self.opts.cg.force_unwind_tables.unwrap_or(
+                self.panic_strategy() == PanicStrategy::Unwind || self.target.default_uwtable,
+            )
+    }
+
     /// Returns the number of query threads that should be used for this
     /// compilation
+    #[inline]
     pub fn threads(&self) -> usize {
-        self.opts.debugging_opts.threads
+        self.opts.unstable_opts.threads
     }
 
     /// Returns the number of codegen units that should be used for this
     /// compilation
-    pub fn codegen_units(&self) -> usize {
+    pub fn codegen_units(&self) -> CodegenUnits {
         if let Some(n) = self.opts.cli_forced_codegen_units {
-            return n;
+            return CodegenUnits::User(n);
         }
         if let Some(n) = self.target.default_codegen_units {
-            return n as usize;
+            return CodegenUnits::Default(n as usize);
         }
 
         // If incremental compilation is turned on, we default to a high number
         // codegen units in order to reduce the "collateral damage" small
         // changes cause.
         if self.opts.incremental.is_some() {
-            return 256;
+            return CodegenUnits::Default(256);
         }
 
         // Why is 16 codegen units the default all the time?
@@ -988,191 +1219,159 @@ impl Session {
         // As a result 16 was chosen here! Mostly because it was a power of 2
         // and most benchmarks agreed it was roughly a local optimum. Not very
         // scientific.
-        16
+        CodegenUnits::Default(16)
     }
 
     pub fn teach(&self, code: &DiagnosticId) -> bool {
-        self.opts.debugging_opts.teach && self.diagnostic().must_teach(code)
-    }
-
-    pub fn rust_2015(&self) -> bool {
-        self.opts.edition == Edition::Edition2015
-    }
-
-    /// Are we allowed to use features from the Rust 2018 edition?
-    pub fn rust_2018(&self) -> bool {
-        self.opts.edition >= Edition::Edition2018
-    }
-
-    /// Are we allowed to use features from the Rust 2021 edition?
-    pub fn rust_2021(&self) -> bool {
-        self.opts.edition >= Edition::Edition2021
+        self.opts.unstable_opts.teach && self.diagnostic().must_teach(code)
     }
 
     pub fn edition(&self) -> Edition {
         self.opts.edition
     }
 
-    /// Returns `true` if we cannot skip the PLT for shared library calls.
-    pub fn needs_plt(&self) -> bool {
-        // Check if the current target usually needs PLT to be enabled.
-        // The user can use the command line flag to override it.
-        let needs_plt = self.target.needs_plt;
-
-        let dbg_opts = &self.opts.debugging_opts;
-
-        let relro_level = dbg_opts.relro_level.unwrap_or(self.target.relro_level);
-
-        // Only enable this optimization by default if full relro is also enabled.
-        // In this case, lazy binding was already unavailable, so nothing is lost.
-        // This also ensures `-Wl,-z,now` is supported by the linker.
-        let full_relro = RelroLevel::Full == relro_level;
-
-        // If user didn't explicitly forced us to use / skip the PLT,
-        // then try to skip it where possible.
-        dbg_opts.plt.unwrap_or(needs_plt || !full_relro)
-    }
-
-    /// Checks if LLVM lifetime markers should be emitted.
-    pub fn emit_lifetime_markers(&self) -> bool {
-        self.opts.optimize != config::OptLevel::No
-        // AddressSanitizer uses lifetimes to detect use after scope bugs.
-        // MemorySanitizer uses lifetimes to detect use of uninitialized stack variables.
-        // HWAddressSanitizer will use lifetimes to detect use after scope bugs in the future.
-        || self.opts.debugging_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
-    }
-
     pub fn link_dead_code(&self) -> bool {
         self.opts.cg.link_dead_code.unwrap_or(false)
     }
 
-    pub fn instrument_coverage(&self) -> bool {
-        self.opts.debugging_opts.instrument_coverage.unwrap_or(config::InstrumentCoverage::Off)
-            != config::InstrumentCoverage::Off
+    pub fn should_prefer_remapped_for_codegen(&self) -> bool {
+        // bail out, if any of the requested crate types aren't:
+        // "compiled executables or libraries"
+        for crate_type in &self.opts.crate_types {
+            match crate_type {
+                CrateType::Executable
+                | CrateType::Dylib
+                | CrateType::Rlib
+                | CrateType::Staticlib
+                | CrateType::Cdylib => continue,
+                CrateType::ProcMacro => return false,
+            }
+        }
+
+        let has_split_debuginfo = match self.split_debuginfo() {
+            SplitDebuginfo::Off => false,
+            SplitDebuginfo::Packed => true,
+            SplitDebuginfo::Unpacked => true,
+        };
+
+        let remap_path_scopes = &self.opts.unstable_opts.remap_path_scope;
+        let mut prefer_remapped = false;
+
+        if remap_path_scopes.contains(RemapPathScopeComponents::UNSPLIT_DEBUGINFO) {
+            prefer_remapped |= !has_split_debuginfo;
+        }
+
+        if remap_path_scopes.contains(RemapPathScopeComponents::SPLIT_DEBUGINFO) {
+            prefer_remapped |= has_split_debuginfo;
+        }
+
+        prefer_remapped
     }
 
-    pub fn instrument_coverage_except_unused_generics(&self) -> bool {
-        self.opts.debugging_opts.instrument_coverage.unwrap_or(config::InstrumentCoverage::Off)
-            == config::InstrumentCoverage::ExceptUnusedGenerics
-    }
+    pub fn should_prefer_remapped_for_split_debuginfo_paths(&self) -> bool {
+        let has_split_debuginfo = match self.split_debuginfo() {
+            SplitDebuginfo::Off => false,
+            SplitDebuginfo::Packed | SplitDebuginfo::Unpacked => true,
+        };
 
-    pub fn instrument_coverage_except_unused_functions(&self) -> bool {
-        self.opts.debugging_opts.instrument_coverage.unwrap_or(config::InstrumentCoverage::Off)
-            == config::InstrumentCoverage::ExceptUnusedFunctions
-    }
-
-    pub fn is_proc_macro_attr(&self, attr: &Attribute) -> bool {
-        [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
-            .iter()
-            .any(|kind| attr.has_name(*kind))
-    }
-
-    pub fn contains_name(&self, attrs: &[Attribute], name: Symbol) -> bool {
-        attrs.iter().any(|item| item.has_name(name))
-    }
-
-    pub fn find_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> Option<&'a Attribute> {
-        attrs.iter().find(|attr| attr.has_name(name))
-    }
-
-    pub fn filter_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> impl Iterator<Item = &'a Attribute> {
-        attrs.iter().filter(move |attr| attr.has_name(name))
-    }
-
-    pub fn first_attr_value_str_by_name(
-        &self,
-        attrs: &[Attribute],
-        name: Symbol,
-    ) -> Option<Symbol> {
-        attrs.iter().find(|at| at.has_name(name)).and_then(|at| at.value_str())
+        self.opts
+            .unstable_opts
+            .remap_path_scope
+            .contains(RemapPathScopeComponents::SPLIT_DEBUGINFO_PATH)
+            && has_split_debuginfo
     }
 }
 
+// JUSTIFICATION: part of session construction
+#[allow(rustc::bad_opt_access)]
 fn default_emitter(
     sopts: &config::Options,
     registry: rustc_errors::registry::Registry,
     source_map: Lrc<SourceMap>,
-    emitter_dest: Option<Box<dyn Write + Send>>,
-) -> Box<dyn Emitter + sync::Send> {
-    let macro_backtrace = sopts.debugging_opts.macro_backtrace;
-    match (sopts.error_format, emitter_dest) {
-        (config::ErrorOutputType::HumanReadable(kind), dst) => {
+    bundle: Option<Lrc<FluentBundle>>,
+    fallback_bundle: LazyFallbackBundle,
+) -> Box<DynEmitter> {
+    let macro_backtrace = sopts.unstable_opts.macro_backtrace;
+    let track_diagnostics = sopts.unstable_opts.track_diagnostics;
+    let terminal_url = match sopts.unstable_opts.terminal_urls {
+        TerminalUrl::Auto => {
+            match (std::env::var("COLORTERM").as_deref(), std::env::var("TERM").as_deref()) {
+                (Ok("truecolor"), Ok("xterm-256color"))
+                    if sopts.unstable_features.is_nightly_build() =>
+                {
+                    TerminalUrl::Yes
+                }
+                _ => TerminalUrl::No,
+            }
+        }
+        t => t,
+    };
+    match sopts.error_format {
+        config::ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
 
             if let HumanReadableErrorType::AnnotateSnippet(_) = kind {
-                let emitter =
-                    AnnotateSnippetEmitterWriter::new(Some(source_map), short, macro_backtrace);
-                Box::new(emitter.ui_testing(sopts.debugging_opts.ui_testing))
+                let emitter = AnnotateSnippetEmitterWriter::new(
+                    Some(source_map),
+                    bundle,
+                    fallback_bundle,
+                    short,
+                    macro_backtrace,
+                );
+                Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             } else {
-                let emitter = match dst {
-                    None => EmitterWriter::stderr(
-                        color_config,
-                        Some(source_map),
-                        short,
-                        sopts.debugging_opts.teach,
-                        sopts.debugging_opts.terminal_width,
-                        macro_backtrace,
-                    ),
-                    Some(dst) => EmitterWriter::new(
-                        dst,
-                        Some(source_map),
-                        short,
-                        false, // no teach messages when writing to a buffer
-                        false, // no colors when writing to a buffer
-                        None,  // no terminal width
-                        macro_backtrace,
-                    ),
-                };
-                Box::new(emitter.ui_testing(sopts.debugging_opts.ui_testing))
+                let emitter = EmitterWriter::stderr(color_config, fallback_bundle)
+                    .fluent_bundle(bundle)
+                    .sm(Some(source_map))
+                    .short_message(short)
+                    .teach(sopts.unstable_opts.teach)
+                    .diagnostic_width(sopts.diagnostic_width)
+                    .macro_backtrace(macro_backtrace)
+                    .track_diagnostics(track_diagnostics)
+                    .terminal_url(terminal_url)
+                    .ignored_directories_in_source_blocks(
+                        sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
+                    );
+                Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             }
         }
-        (config::ErrorOutputType::Json { pretty, json_rendered }, None) => Box::new(
+        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(
             JsonEmitter::stderr(
                 Some(registry),
                 source_map,
+                bundle,
+                fallback_bundle,
                 pretty,
                 json_rendered,
-                sopts.debugging_opts.terminal_width,
+                sopts.diagnostic_width,
                 macro_backtrace,
+                track_diagnostics,
+                terminal_url,
             )
-            .ui_testing(sopts.debugging_opts.ui_testing),
-        ),
-        (config::ErrorOutputType::Json { pretty, json_rendered }, Some(dst)) => Box::new(
-            JsonEmitter::new(
-                dst,
-                Some(registry),
-                source_map,
-                pretty,
-                json_rendered,
-                sopts.debugging_opts.terminal_width,
-                macro_backtrace,
-            )
-            .ui_testing(sopts.debugging_opts.ui_testing),
+            .ui_testing(sopts.unstable_opts.ui_testing)
+            .ignored_directories_in_source_blocks(
+                sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
+            ),
         ),
     }
 }
 
-pub enum DiagnosticOutput {
-    Default,
-    Raw(Box<dyn Write + Send>),
-}
-
+// JUSTIFICATION: literally session construction
+#[allow(rustc::bad_opt_access)]
 pub fn build_session(
+    handler: &EarlyErrorHandler,
     sopts: config::Options,
-    local_crate_source_file: Option<PathBuf>,
+    io: CompilerIO,
+    bundle: Option<Lrc<rustc_errors::FluentBundle>>,
     registry: rustc_errors::registry::Registry,
-    diagnostics_output: DiagnosticOutput,
+    fluent_resources: Vec<&'static str>,
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
     file_loader: Option<Box<dyn FileLoader + Send + Sync + 'static>>,
     target_override: Option<Target>,
+    cfg_version: &'static str,
+    ice_file: Option<PathBuf>,
+    using_internal_features: Arc<AtomicBool>,
+    expanded_args: Vec<String>,
 ) -> Session {
     // FIXME: This is not general enough to make the warning lint completely override
     // normal diagnostic warnings, since the warning lint can also be denied and changed
@@ -1180,36 +1379,28 @@ pub fn build_session(
     let warnings_allow = sopts
         .lint_opts
         .iter()
-        .filter(|&&(ref key, _)| *key == "warnings")
-        .map(|&(_, ref level)| *level == lint::Allow)
-        .last()
-        .unwrap_or(false);
-    let cap_lints_allow = sopts.lint_cap.map_or(false, |cap| cap == lint::Allow);
+        .rfind(|&(key, _)| *key == "warnings")
+        .is_some_and(|&(_, level)| level == lint::Allow);
+    let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
-
-    let write_dest = match diagnostics_output {
-        DiagnosticOutput::Default => None,
-        DiagnosticOutput::Raw(write) => Some(write),
-    };
 
     let sysroot = match &sopts.maybe_sysroot {
         Some(sysroot) => sysroot.clone(),
-        None => filesearch::get_or_default_sysroot(),
+        None => filesearch::get_or_default_sysroot().expect("Failed finding sysroot"),
     };
 
-    let target_cfg = config::build_target_config(&sopts, target_override, &sysroot);
+    let target_cfg = config::build_target_config(handler, &sopts, target_override, &sysroot);
     let host_triple = TargetTriple::from_triple(config::host_triple());
-    let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
-        early_error(sopts.error_format, &format!("Error loading host specification: {}", e))
-    });
+    let (host, target_warnings) = Target::search(&host_triple, &sysroot)
+        .unwrap_or_else(|e| handler.early_error(format!("Error loading host specification: {e}")));
     for warning in target_warnings.warning_messages() {
-        early_warn(sopts.error_format, &warning)
+        handler.early_warn(warning)
     }
 
     let loader = file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
-    let hash_kind = sopts.debugging_opts.src_hash_algorithm.unwrap_or_else(|| {
+    let hash_kind = sopts.unstable_opts.src_hash_algorithm.unwrap_or_else(|| {
         if target_cfg.is_like_msvc {
-            SourceFileHashAlgorithm::Sha1
+            SourceFileHashAlgorithm::Sha256
         } else {
             SourceFileHashAlgorithm::Md5
         }
@@ -1219,14 +1410,20 @@ pub fn build_session(
         sopts.file_path_mapping(),
         hash_kind,
     ));
-    let emitter = default_emitter(&sopts, registry, source_map.clone(), write_dest);
 
-    let span_diagnostic = rustc_errors::Handler::with_emitter_and_flags(
-        emitter,
-        sopts.debugging_opts.diagnostic_handler_flags(can_emit_warnings),
+    let fallback_bundle = fallback_fluent_bundle(
+        fluent_resources,
+        sopts.unstable_opts.translate_directionality_markers,
     );
+    let emitter = default_emitter(&sopts, registry, source_map.clone(), bundle, fallback_bundle);
 
-    let self_profiler = if let SwitchWithOptPath::Enabled(ref d) = sopts.debugging_opts.self_profile
+    let mut span_diagnostic = rustc_errors::Handler::with_emitter(emitter)
+        .with_flags(sopts.unstable_opts.diagnostic_handler_flags(can_emit_warnings));
+    if let Some(ice_file) = ice_file {
+        span_diagnostic = span_diagnostic.with_ice_file(ice_file);
+    }
+
+    let self_profiler = if let SwitchWithOptPath::Enabled(ref d) = sopts.unstable_opts.self_profile
     {
         let directory =
             if let Some(ref directory) = d { directory } else { std::path::Path::new(".") };
@@ -1234,12 +1431,13 @@ pub fn build_session(
         let profiler = SelfProfiler::new(
             directory,
             sopts.crate_name.as_deref(),
-            &sopts.debugging_opts.self_profile_events,
+            sopts.unstable_opts.self_profile_events.as_deref(),
+            &sopts.unstable_opts.self_profile_counter,
         );
         match profiler {
             Ok(profiler) => Some(Arc::new(profiler)),
             Err(e) => {
-                early_warn(sopts.error_format, &format!("failed to create profiler: {}", e));
+                handler.early_warn(format!("failed to create profiler: {e}"));
                 None
             }
         }
@@ -1248,7 +1446,7 @@ pub fn build_session(
     };
 
     let mut parse_sess = ParseSess::with_span_handler(span_diagnostic, source_map);
-    parse_sess.assume_incomplete_release = sopts.debugging_opts.assume_incomplete_release;
+    parse_sess.assume_incomplete_release = sopts.unstable_opts.assume_incomplete_release;
 
     let host_triple = config::host_triple();
     let target_triple = sopts.target_triple.triple();
@@ -1261,27 +1459,15 @@ pub fn build_session(
         Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
     };
 
-    let file_path_mapping = sopts.file_path_mapping();
-
-    let local_crate_source_file =
-        local_crate_source_file.map(|path| file_path_mapping.map_prefix(path).0);
-
     let optimization_fuel = Lock::new(OptimizationFuel {
-        remaining: sopts.debugging_opts.fuel.as_ref().map_or(0, |i| i.1),
+        remaining: sopts.unstable_opts.fuel.as_ref().map_or(0, |&(_, i)| i),
         out_of_fuel: false,
     });
     let print_fuel = AtomicU64::new(0);
 
-    let cgu_reuse_tracker = if sopts.debugging_opts.query_dep_graph {
-        CguReuseTracker::new()
-    } else {
-        CguReuseTracker::new_disabled()
-    };
-
     let prof = SelfProfilerRef::new(
         self_profiler,
-        sopts.debugging_opts.time_passes || sopts.debugging_opts.time,
-        sopts.debugging_opts.time_passes,
+        sopts.unstable_opts.time_passes.then(|| sopts.unstable_opts.time_passes_format),
     );
 
     let ctfe_backtrace = Lock::new(match env::var("RUSTC_CTFE_BACKTRACE") {
@@ -1301,29 +1487,24 @@ pub fn build_session(
         target_tlib_path,
         parse_sess,
         sysroot,
-        local_crate_source_file,
-        one_time_diagnostics: Default::default(),
-        crate_types: OnceCell::new(),
-        stable_crate_id: OnceCell::new(),
-        features: OnceCell::new(),
+        io,
         incr_comp_session: OneThread::new(RefCell::new(IncrCompSession::NotInitialized)),
-        cgu_reuse_tracker,
         prof,
-        perf_stats: PerfStats {
-            symbol_hash_time: Lock::new(Duration::from_secs(0)),
-            queries_canonicalized: AtomicUsize::new(0),
-            normalize_generic_arg_after_erasing_regions: AtomicUsize::new(0),
-            normalize_projection_ty: AtomicUsize::new(0),
-        },
         code_stats: Default::default(),
         optimization_fuel,
         print_fuel,
         jobserver: jobserver::client(),
+        lint_store: None,
+        registered_lints: false,
         driver_lint_caps,
         ctfe_backtrace,
         miri_unleashed_features: Lock::new(Default::default()),
         asm_arch,
-        target_features: FxHashSet::default(),
+        target_features: Default::default(),
+        unstable_target_features: Default::default(),
+        cfg_version,
+        using_internal_features,
+        expanded_args,
     };
 
     validate_commandline_args_with_session_available(&sess);
@@ -1331,8 +1512,12 @@ pub fn build_session(
     sess
 }
 
-// If it is useful to have a Session available already for validating a
-// commandline argument, you can do so here.
+/// Validate command line arguments with a `Session`.
+///
+/// If it is useful to have a Session available already for validating a commandline argument, you
+/// can do so here.
+// JUSTIFICATION: needs to access args to validate them
+#[allow(rustc::bad_opt_access)]
 fn validate_commandline_args_with_session_available(sess: &Session) {
     // Since we don't know if code in an rlib will be linked to statically or
     // dynamically downstream, rustc generates `__imp_` symbols that help linkers
@@ -1345,85 +1530,152 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         && sess.opts.cg.prefer_dynamic
         && sess.target.is_like_windows
     {
-        sess.err(
-            "Linker plugin based LTO is not supported together with \
-                  `-C prefer-dynamic` when targeting Windows-like targets",
-        );
+        sess.emit_err(errors::LinkerPluginToWindowsNotSupported);
     }
 
     // Make sure that any given profiling data actually exists so LLVM can't
     // decide to silently skip PGO.
     if let Some(ref path) = sess.opts.cg.profile_use {
         if !path.exists() {
-            sess.err(&format!(
-                "File `{}` passed to `-C profile-use` does not exist.",
-                path.display()
-            ));
+            sess.emit_err(errors::ProfileUseFileDoesNotExist { path });
         }
     }
 
     // Do the same for sample profile data.
-    if let Some(ref path) = sess.opts.debugging_opts.profile_sample_use {
+    if let Some(ref path) = sess.opts.unstable_opts.profile_sample_use {
         if !path.exists() {
-            sess.err(&format!(
-                "File `{}` passed to `-C profile-sample-use` does not exist.",
-                path.display()
-            ));
+            sess.emit_err(errors::ProfileSampleUseFileDoesNotExist { path });
         }
     }
 
     // Unwind tables cannot be disabled if the target requires them.
     if let Some(include_uwtables) = sess.opts.cg.force_unwind_tables {
         if sess.target.requires_uwtable && !include_uwtables {
-            sess.err(
-                "target requires unwind tables, they cannot be disabled with \
-                     `-C force-unwind-tables=no`.",
-            );
+            sess.emit_err(errors::TargetRequiresUnwindTables);
         }
     }
 
     // Sanitizers can only be used on platforms that we know have working sanitizer codegen.
     let supported_sanitizers = sess.target.options.supported_sanitizers;
-    let unsupported_sanitizers = sess.opts.debugging_opts.sanitizer - supported_sanitizers;
+    let unsupported_sanitizers = sess.opts.unstable_opts.sanitizer - supported_sanitizers;
     match unsupported_sanitizers.into_iter().count() {
         0 => {}
-        1 => sess
-            .err(&format!("{} sanitizer is not supported for this target", unsupported_sanitizers)),
-        _ => sess.err(&format!(
-            "{} sanitizers are not supported for this target",
-            unsupported_sanitizers
-        )),
+        1 => {
+            sess.emit_err(errors::SanitizerNotSupported { us: unsupported_sanitizers.to_string() });
+        }
+        _ => {
+            sess.emit_err(errors::SanitizersNotSupported {
+                us: unsupported_sanitizers.to_string(),
+            });
+        }
     }
     // Cannot mix and match sanitizers.
-    let mut sanitizer_iter = sess.opts.debugging_opts.sanitizer.into_iter();
+    let mut sanitizer_iter = sess.opts.unstable_opts.sanitizer.into_iter();
     if let (Some(first), Some(second)) = (sanitizer_iter.next(), sanitizer_iter.next()) {
-        sess.err(&format!("`-Zsanitizer={}` is incompatible with `-Zsanitizer={}`", first, second));
+        sess.emit_err(errors::CannotMixAndMatchSanitizers {
+            first: first.to_string(),
+            second: second.to_string(),
+        });
     }
 
     // Cannot enable crt-static with sanitizers on Linux
-    if sess.crt_static(None) && !sess.opts.debugging_opts.sanitizer.is_empty() {
-        sess.err(
-            "sanitizer is incompatible with statically linked libc, \
-                                disable it using `-C target-feature=-crt-static`",
-        );
+    if sess.crt_static(None) && !sess.opts.unstable_opts.sanitizer.is_empty() {
+        sess.emit_err(errors::CannotEnableCrtStaticLinux);
     }
 
     // LLVM CFI requires LTO.
-    if sess.is_sanitizer_cfi_enabled() {
-        if sess.opts.cg.lto == config::LtoCli::Unspecified
-            || sess.opts.cg.lto == config::LtoCli::No
-            || sess.opts.cg.lto == config::LtoCli::Thin
-        {
-            sess.err("`-Zsanitizer=cfi` requires `-Clto`");
+    if sess.is_sanitizer_cfi_enabled()
+        && !(sess.lto() == config::Lto::Fat || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SanitizerCfiRequiresLto);
+    }
+
+    // LLVM CFI using rustc LTO requires a single codegen unit.
+    if sess.is_sanitizer_cfi_enabled()
+        && sess.lto() == config::Lto::Fat
+        && !(sess.codegen_units().as_usize() == 1)
+    {
+        sess.emit_err(errors::SanitizerCfiRequiresSingleCodegenUnit);
+    }
+
+    // LLVM CFI is incompatible with LLVM KCFI.
+    if sess.is_sanitizer_cfi_enabled() && sess.is_sanitizer_kcfi_enabled() {
+        sess.emit_err(errors::CannotMixAndMatchSanitizers {
+            first: "cfi".to_string(),
+            second: "kcfi".to_string(),
+        });
+    }
+
+    // Canonical jump tables requires CFI.
+    if sess.is_sanitizer_cfi_canonical_jump_tables_disabled() {
+        if !sess.is_sanitizer_cfi_enabled() {
+            sess.emit_err(errors::SanitizerCfiCanonicalJumpTablesRequiresCfi);
         }
     }
 
-    if sess.opts.debugging_opts.stack_protector != StackProtector::None {
+    // LLVM CFI pointer generalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiGeneralizePointersRequiresCfi);
+        }
+    }
+
+    // LLVM CFI integer normalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_normalize_integers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiNormalizeIntegersRequiresCfi);
+        }
+    }
+
+    // LTO unit splitting requires LTO.
+    if sess.is_split_lto_unit_enabled()
+        && !(sess.lto() == config::Lto::Fat
+            || sess.lto() == config::Lto::Thin
+            || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SplitLtoUnitRequiresLto);
+    }
+
+    // VFE requires LTO.
+    if sess.lto() != config::Lto::Fat {
+        if sess.opts.unstable_opts.virtual_function_elimination {
+            sess.emit_err(errors::UnstableVirtualFunctionElimination);
+        }
+    }
+
+    if sess.opts.unstable_opts.stack_protector != StackProtector::None {
         if !sess.target.options.supports_stack_protector {
-            sess.warn(&format!(
-                "`-Z stack-protector={}` is not supported for target {} and will be ignored",
-                sess.opts.debugging_opts.stack_protector, sess.opts.target_triple
-            ))
+            sess.emit_warning(errors::StackProtectorNotSupportedForTarget {
+                stack_protector: sess.opts.unstable_opts.stack_protector,
+                target_triple: &sess.opts.target_triple,
+            });
+        }
+    }
+
+    if sess.opts.unstable_opts.branch_protection.is_some() && sess.target.arch != "aarch64" {
+        sess.emit_err(errors::BranchProtectionRequiresAArch64);
+    }
+
+    if let Some(dwarf_version) = sess.opts.unstable_opts.dwarf_version {
+        if dwarf_version > 5 {
+            sess.emit_err(errors::UnsupportedDwarfVersion { dwarf_version });
+        }
+    }
+
+    if !sess.target.options.supported_split_debuginfo.contains(&sess.split_debuginfo())
+        && !sess.opts.unstable_opts.unstable_options
+    {
+        sess.emit_err(errors::SplitDebugInfoUnstablePlatform { debuginfo: sess.split_debuginfo() });
+    }
+
+    if sess.opts.unstable_opts.instrument_xray.is_some() && !sess.target.options.supports_xray {
+        sess.emit_err(errors::InstrumentationNotSupported { us: "XRay".to_string() });
+    }
+
+    if let Some(flavor) = sess.opts.cg.linker_flavor {
+        if let Some(compatible_list) = sess.target.linker_flavor.check_compatibility(flavor) {
+            let flavor = flavor.desc();
+            sess.emit_err(errors::IncompatibleLinkerFlavor { flavor, compatible_list });
         }
     }
 }
@@ -1446,35 +1698,142 @@ pub enum IncrCompSession {
     InvalidBecauseOfErrors { session_directory: PathBuf },
 }
 
-pub fn early_error_no_abort(output: config::ErrorOutputType, msg: &str) {
-    let emitter: Box<dyn Emitter + sync::Send> = match output {
-        config::ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
-            Box::new(EmitterWriter::stderr(color_config, None, short, false, None, false))
-        }
-        config::ErrorOutputType::Json { pretty, json_rendered } => {
-            Box::new(JsonEmitter::basic(pretty, json_rendered, None, false))
-        }
-    };
-    let handler = rustc_errors::Handler::with_emitter(true, None, emitter);
-    handler.struct_fatal(msg).emit();
+/// A wrapper around an [`Handler`] that is used for early error emissions.
+pub struct EarlyErrorHandler {
+    handler: Handler,
 }
 
-pub fn early_error(output: config::ErrorOutputType, msg: &str) -> ! {
-    early_error_no_abort(output, msg);
-    rustc_errors::FatalError.raise();
+impl EarlyErrorHandler {
+    pub fn new(output: ErrorOutputType) -> Self {
+        let emitter = mk_emitter(output);
+        Self { handler: rustc_errors::Handler::with_emitter(emitter) }
+    }
+
+    pub fn abort_if_errors(&self) {
+        self.handler.abort_if_errors()
+    }
+
+    /// Swap out the underlying handler once we acquire the user's preference on error emission
+    /// format. Any errors prior to that will cause an abort and all stashed diagnostics of the
+    /// previous handler will be emitted.
+    pub fn abort_if_error_and_set_error_format(&mut self, output: ErrorOutputType) {
+        self.handler.abort_if_errors();
+
+        let emitter = mk_emitter(output);
+        self.handler = Handler::with_emitter(emitter);
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn early_note(&self, msg: impl Into<DiagnosticMessage>) {
+        self.handler.struct_note_without_error(msg).emit()
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn early_help(&self, msg: impl Into<DiagnosticMessage>) {
+        self.handler.struct_help(msg).emit()
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    #[must_use = "ErrorGuaranteed must be returned from `run_compiler` in order to exit with a non-zero status code"]
+    pub fn early_error_no_abort(&self, msg: impl Into<DiagnosticMessage>) -> ErrorGuaranteed {
+        self.handler.struct_err(msg).emit()
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn early_error(&self, msg: impl Into<DiagnosticMessage>) -> ! {
+        self.handler.struct_fatal(msg).emit()
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub(crate) fn early_struct_error(
+        &self,
+        msg: impl Into<DiagnosticMessage>,
+    ) -> DiagnosticBuilder<'_, !> {
+        self.handler.struct_fatal(msg)
+    }
+
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    pub fn early_warn(&self, msg: impl Into<DiagnosticMessage>) {
+        self.handler.struct_warn(msg).emit()
+    }
 }
 
-pub fn early_warn(output: config::ErrorOutputType, msg: &str) {
-    let emitter: Box<dyn Emitter + sync::Send> = match output {
+fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
+    // FIXME(#100717): early errors aren't translated at the moment, so this is fine, but it will
+    // need to reference every crate that might emit an early error for translation to work.
+    let fallback_bundle =
+        fallback_fluent_bundle(vec![rustc_errors::DEFAULT_LOCALE_RESOURCE], false);
+    let emitter: Box<DynEmitter> = match output {
         config::ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
-            Box::new(EmitterWriter::stderr(color_config, None, short, false, None, false))
+            Box::new(EmitterWriter::stderr(color_config, fallback_bundle).short_message(short))
         }
-        config::ErrorOutputType::Json { pretty, json_rendered } => {
-            Box::new(JsonEmitter::basic(pretty, json_rendered, None, false))
-        }
+        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(JsonEmitter::basic(
+            pretty,
+            json_rendered,
+            None,
+            fallback_bundle,
+            None,
+            false,
+            false,
+            TerminalUrl::No,
+        )),
     };
-    let handler = rustc_errors::Handler::with_emitter(true, None, emitter);
-    handler.struct_warn(msg).emit();
+    emitter
+}
+
+pub trait RemapFileNameExt {
+    type Output<'a>
+    where
+        Self: 'a;
+
+    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_>;
+
+    fn for_codegen(&self, sess: &Session) -> Self::Output<'_>;
+}
+
+impl RemapFileNameExt for rustc_span::FileName {
+    type Output<'a> = rustc_span::FileNameDisplay<'a>;
+
+    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_> {
+        if sess.opts.unstable_opts.remap_path_scope.contains(scopes) {
+            self.prefer_remapped_unconditionaly()
+        } else {
+            self.prefer_local()
+        }
+    }
+
+    fn for_codegen(&self, sess: &Session) -> Self::Output<'_> {
+        if sess.should_prefer_remapped_for_codegen() {
+            self.prefer_remapped_unconditionaly()
+        } else {
+            self.prefer_local()
+        }
+    }
+}
+
+impl RemapFileNameExt for rustc_span::RealFileName {
+    type Output<'a> = &'a Path;
+
+    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_> {
+        if sess.opts.unstable_opts.remap_path_scope.contains(scopes) {
+            self.remapped_path_if_available()
+        } else {
+            self.local_path_if_available()
+        }
+    }
+
+    fn for_codegen(&self, sess: &Session) -> Self::Output<'_> {
+        if sess.should_prefer_remapped_for_codegen() {
+            self.remapped_path_if_available()
+        } else {
+            self.local_path_if_available()
+        }
+    }
 }

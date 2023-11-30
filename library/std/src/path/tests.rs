@@ -1,12 +1,12 @@
 use super::*;
 
-use crate::collections::hash_map::DefaultHasher;
 use crate::collections::{BTreeSet, HashSet};
-use crate::hash::Hasher;
+use crate::hash::{DefaultHasher, Hasher};
 use crate::rc::Rc;
 use crate::sync::Arc;
 use core::hint::black_box;
 
+#[allow(unknown_lints, unused_macro_rules)]
 macro_rules! t (
     ($path:expr, iter: $iter:expr) => (
         {
@@ -971,15 +971,15 @@ pub fn test_decompositions_windows() {
     file_prefix: None
     );
 
-    t!("\\\\?\\C:/foo",
-    iter: ["\\\\?\\C:/foo"],
+    t!("\\\\?\\C:/foo/bar",
+    iter: ["\\\\?\\C:", "\\", "foo/bar"],
     has_root: true,
     is_absolute: true,
-    parent: None,
-    file_name: None,
-    file_stem: None,
+    parent: Some("\\\\?\\C:/"),
+    file_name: Some("foo/bar"),
+    file_stem: Some("foo/bar"),
     extension: None,
-    file_prefix: None
+    file_prefix: Some("foo/bar")
     );
 
     t!("\\\\.\\foo\\bar",
@@ -1182,7 +1182,7 @@ pub fn test_prefix_ext() {
 #[test]
 pub fn test_push() {
     macro_rules! tp (
-        ($path:expr, $push:expr, $expected:expr) => ( {
+        ($path:expr, $push:expr, $expected:expr) => ({
             let mut actual = PathBuf::from($path);
             actual.push($push);
             assert!(actual.to_str() == Some($expected),
@@ -1280,7 +1280,7 @@ pub fn test_push() {
 #[test]
 pub fn test_pop() {
     macro_rules! tp (
-        ($path:expr, $expected:expr, $output:expr) => ( {
+        ($path:expr, $expected:expr, $output:expr) => ({
             let mut actual = PathBuf::from($path);
             let output = actual.pop();
             assert!(actual.to_str() == Some($expected) && output == $output,
@@ -1334,7 +1334,7 @@ pub fn test_pop() {
 #[test]
 pub fn test_set_file_name() {
     macro_rules! tfn (
-            ($path:expr, $file:expr, $expected:expr) => ( {
+        ($path:expr, $file:expr, $expected:expr) => ({
             let mut p = PathBuf::from($path);
             p.set_file_name($file);
             assert!(p.to_str() == Some($expected),
@@ -1368,7 +1368,7 @@ pub fn test_set_file_name() {
 #[test]
 pub fn test_set_extension() {
     macro_rules! tfe (
-            ($path:expr, $ext:expr, $expected:expr, $output:expr) => ( {
+        ($path:expr, $ext:expr, $expected:expr, $output:expr) => ({
             let mut p = PathBuf::from($path);
             let output = p.set_extension($ext);
             assert!(p.to_str() == Some($expected) && output == $output,
@@ -1391,6 +1391,46 @@ pub fn test_set_extension() {
     tfe!("..", "foo", "..", false);
     tfe!("foo/..", "bar", "foo/..", false);
     tfe!("/", "foo", "/", false);
+}
+
+#[test]
+pub fn test_with_extension() {
+    macro_rules! twe (
+        ($input:expr, $extension:expr, $expected:expr) => ({
+            let input = Path::new($input);
+            let output = input.with_extension($extension);
+
+            assert!(
+                output.to_str() == Some($expected),
+                "calling Path::new({:?}).with_extension({:?}): Expected {:?}, got {:?}",
+                $input, $extension, $expected, output,
+            );
+        });
+    );
+
+    twe!("foo", "txt", "foo.txt");
+    twe!("foo.bar", "txt", "foo.txt");
+    twe!("foo.bar.baz", "txt", "foo.bar.txt");
+    twe!(".test", "txt", ".test.txt");
+    twe!("foo.txt", "", "foo");
+    twe!("foo", "", "foo");
+    twe!("", "foo", "");
+    twe!(".", "foo", ".");
+    twe!("foo/", "bar", "foo.bar");
+    twe!("foo/.", "bar", "foo.bar");
+    twe!("..", "foo", "..");
+    twe!("foo/..", "bar", "foo/..");
+    twe!("/", "foo", "/");
+
+    // New extension is smaller than file name
+    twe!("aaa_aaa_aaa", "bbb_bbb", "aaa_aaa_aaa.bbb_bbb");
+    // New extension is greater than file name
+    twe!("bbb_bbb", "aaa_aaa_aaa", "bbb_bbb.aaa_aaa_aaa");
+
+    // New extension is smaller than previous extension
+    twe!("ccc.aaa_aaa_aaa", "bbb_bbb", "ccc.bbb_bbb");
+    // New extension is greater than previous extension
+    twe!("ccc.bbb_bbb", "aaa_aaa_aaa", "ccc.aaa_aaa_aaa");
 }
 
 #[test]
@@ -1420,8 +1460,7 @@ fn test_eq_receivers() {
 
 #[test]
 pub fn test_compare() {
-    use crate::collections::hash_map::DefaultHasher;
-    use crate::hash::{Hash, Hasher};
+    use crate::hash::{DefaultHasher, Hash, Hasher};
 
     fn hash<T: Hash>(t: T) -> u64 {
         let mut s = DefaultHasher::new();
@@ -1498,6 +1537,20 @@ pub fn test_compare() {
     relative_from: Some("")
     );
 
+    tc!("foo/.", "foo",
+    eq: true,
+    starts_with: true,
+    ends_with: true,
+    relative_from: Some("")
+    );
+
+    tc!("foo/./bar", "foo/bar",
+    eq: true,
+    starts_with: true,
+    ends_with: true,
+    relative_from: Some("")
+    );
+
     tc!("foo/bar", "foo",
     eq: false,
     starts_with: true,
@@ -1541,6 +1594,27 @@ pub fn test_compare() {
         ends_with: true,
         relative_from: Some("")
         );
+
+        tc!(r"C:\foo\.\bar.txt", r"C:\foo\bar.txt",
+        eq: true,
+        starts_with: true,
+        ends_with: true,
+        relative_from: Some("")
+        );
+
+        tc!(r"C:\foo\.", r"C:\foo",
+        eq: true,
+        starts_with: true,
+        ends_with: true,
+        relative_from: Some("")
+        );
+
+        tc!(r"\\?\C:\foo\.\bar.txt", r"\\?\C:\foo\bar.txt",
+        eq: false,
+        starts_with: false,
+        ends_with: false,
+        relative_from: None
+        );
     }
 }
 
@@ -1551,17 +1625,17 @@ fn test_components_debug() {
     let mut components = path.components();
 
     let expected = "Components([RootDir, Normal(\"tmp\")])";
-    let actual = format!("{:?}", components);
+    let actual = format!("{components:?}");
     assert_eq!(expected, actual);
 
     let _ = components.next().unwrap();
     let expected = "Components([Normal(\"tmp\")])";
-    let actual = format!("{:?}", components);
+    let actual = format!("{components:?}");
     assert_eq!(expected, actual);
 
     let _ = components.next().unwrap();
     let expected = "Components([])";
-    let actual = format!("{:?}", components);
+    let actual = format!("{components:?}");
     assert_eq!(expected, actual);
 }
 
@@ -1573,17 +1647,17 @@ fn test_iter_debug() {
     let mut iter = path.iter();
 
     let expected = "Iter([\"/\", \"tmp\"])";
-    let actual = format!("{:?}", iter);
+    let actual = format!("{iter:?}");
     assert_eq!(expected, actual);
 
     let _ = iter.next().unwrap();
     let expected = "Iter([\"tmp\"])";
-    let actual = format!("{:?}", iter);
+    let actual = format!("{iter:?}");
     assert_eq!(expected, actual);
 
     let _ = iter.next().unwrap();
     let expected = "Iter([])";
-    let actual = format!("{:?}", iter);
+    let actual = format!("{iter:?}");
     assert_eq!(expected, actual);
 }
 
@@ -1633,7 +1707,7 @@ fn into_rc() {
 #[test]
 fn test_ord() {
     macro_rules! ord(
-        ($ord:ident, $left:expr, $right:expr) => ( {
+        ($ord:ident, $left:expr, $right:expr) => ({
             use core::cmp::Ordering;
 
             let left = Path::new($left);
@@ -1665,11 +1739,78 @@ fn test_ord() {
     ord!(Equal, "foo/bar", "foo/bar//");
 }
 
+#[test]
+#[cfg(unix)]
+fn test_unix_absolute() {
+    use crate::path::absolute;
+
+    assert!(absolute("").is_err());
+
+    let relative = "a/b";
+    let mut expected = crate::env::current_dir().unwrap();
+    expected.push(relative);
+    assert_eq!(absolute(relative).unwrap().as_os_str(), expected.as_os_str());
+
+    // Test how components are collected.
+    assert_eq!(absolute("/a/b/c").unwrap().as_os_str(), Path::new("/a/b/c").as_os_str());
+    assert_eq!(absolute("/a//b/c").unwrap().as_os_str(), Path::new("/a/b/c").as_os_str());
+    assert_eq!(absolute("//a/b/c").unwrap().as_os_str(), Path::new("//a/b/c").as_os_str());
+    assert_eq!(absolute("///a/b/c").unwrap().as_os_str(), Path::new("/a/b/c").as_os_str());
+    assert_eq!(absolute("/a/b/c/").unwrap().as_os_str(), Path::new("/a/b/c/").as_os_str());
+    assert_eq!(
+        absolute("/a/./b/../c/.././..").unwrap().as_os_str(),
+        Path::new("/a/b/../c/../..").as_os_str()
+    );
+
+    // Test leading `.` and `..` components
+    let curdir = crate::env::current_dir().unwrap();
+    assert_eq!(absolute("./a").unwrap().as_os_str(), curdir.join("a").as_os_str());
+    assert_eq!(absolute("../a").unwrap().as_os_str(), curdir.join("../a").as_os_str()); // return /pwd/../a
+}
+
+#[test]
+#[cfg(windows)]
+fn test_windows_absolute() {
+    use crate::path::absolute;
+    // An empty path is an error.
+    assert!(absolute("").is_err());
+
+    let relative = r"a\b";
+    let mut expected = crate::env::current_dir().unwrap();
+    expected.push(relative);
+    assert_eq!(absolute(relative).unwrap().as_os_str(), expected.as_os_str());
+
+    macro_rules! unchanged(
+        ($path:expr) => {
+            assert_eq!(absolute($path).unwrap().as_os_str(), Path::new($path).as_os_str());
+        }
+    );
+
+    unchanged!(r"C:\path\to\file");
+    unchanged!(r"C:\path\to\file\");
+    unchanged!(r"\\server\share\to\file");
+    unchanged!(r"\\server.\share.\to\file");
+    unchanged!(r"\\.\PIPE\name");
+    unchanged!(r"\\.\C:\path\to\COM1");
+    unchanged!(r"\\?\C:\path\to\file");
+    unchanged!(r"\\?\UNC\server\share\to\file");
+    unchanged!(r"\\?\PIPE\name");
+    // Verbatim paths are always unchanged, no matter what.
+    unchanged!(r"\\?\path.\to/file..");
+
+    assert_eq!(
+        absolute(r"C:\path..\to.\file.").unwrap().as_os_str(),
+        Path::new(r"C:\path..\to\file").as_os_str()
+    );
+    assert_eq!(absolute(r"COM1").unwrap().as_os_str(), Path::new(r"\\.\COM1").as_os_str());
+}
+
 #[bench]
+#[cfg_attr(miri, ignore)] // Miri isn't fast...
 fn bench_path_cmp_fast_path_buf_sort(b: &mut test::Bencher) {
     let prefix = "my/home";
     let mut paths: Vec<_> =
-        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {}.rs", num))).collect();
+        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {num}.rs"))).collect();
 
     paths.sort();
 
@@ -1679,10 +1820,11 @@ fn bench_path_cmp_fast_path_buf_sort(b: &mut test::Bencher) {
 }
 
 #[bench]
+#[cfg_attr(miri, ignore)] // Miri isn't fast...
 fn bench_path_cmp_fast_path_long(b: &mut test::Bencher) {
     let prefix = "/my/home/is/my/castle/and/my/castle/has/a/rusty/workbench/";
     let paths: Vec<_> =
-        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {}.rs", num))).collect();
+        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {num}.rs"))).collect();
 
     let mut set = BTreeSet::new();
 
@@ -1697,10 +1839,11 @@ fn bench_path_cmp_fast_path_long(b: &mut test::Bencher) {
 }
 
 #[bench]
+#[cfg_attr(miri, ignore)] // Miri isn't fast...
 fn bench_path_cmp_fast_path_short(b: &mut test::Bencher) {
     let prefix = "my/home";
     let paths: Vec<_> =
-        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {}.rs", num))).collect();
+        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {num}.rs"))).collect();
 
     let mut set = BTreeSet::new();
 
@@ -1715,10 +1858,11 @@ fn bench_path_cmp_fast_path_short(b: &mut test::Bencher) {
 }
 
 #[bench]
+#[cfg_attr(miri, ignore)] // Miri isn't fast...
 fn bench_path_hashset(b: &mut test::Bencher) {
     let prefix = "/my/home/is/my/castle/and/my/castle/has/a/rusty/workbench/";
     let paths: Vec<_> =
-        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {}.rs", num))).collect();
+        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {num}.rs"))).collect();
 
     let mut set = HashSet::new();
 
@@ -1733,10 +1877,11 @@ fn bench_path_hashset(b: &mut test::Bencher) {
 }
 
 #[bench]
+#[cfg_attr(miri, ignore)] // Miri isn't fast...
 fn bench_path_hashset_miss(b: &mut test::Bencher) {
     let prefix = "/my/home/is/my/castle/and/my/castle/has/a/rusty/workbench/";
     let paths: Vec<_> =
-        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {}.rs", num))).collect();
+        (0..1000).map(|num| PathBuf::from(prefix).join(format!("file {num}.rs"))).collect();
 
     let mut set = HashSet::new();
 

@@ -13,13 +13,14 @@ ignore = [
 
     # tests for now are not formatted, as they are sometimes pretty-printing constrained
     # (and generally rustfmt can move around comments in UI-testing incompatible ways)
-    "src/test",
+    "tests",
 
     # do not format submodules
+    # FIXME: sync submodule list with tidy/bootstrap/etc
+    # tidy/src/walk.rs:filter_dirs
     "library/backtrace",
     "library/portable-simd",
     "library/stdarch",
-    "compiler/rustc_codegen_cranelift",
     "compiler/rustc_codegen_gcc",
     "src/doc/book",
     "src/doc/edition-guide",
@@ -32,8 +33,11 @@ ignore = [
     "src/tools/cargo",
     "src/tools/clippy",
     "src/tools/miri",
-    "src/tools/rls",
     "src/tools/rust-analyzer",
     "src/tools/rustfmt",
-    "src/tools/rust-installer",
+
+    # these are ignored by a standard cargo fmt run
+    "compiler/rustc_codegen_cranelift/y.rs", # running rustfmt breaks this file
+    "compiler/rustc_codegen_cranelift/scripts",
+    "compiler/rustc_codegen_cranelift/example/gen_block_iterate.rs", # uses edition 2024
 ]

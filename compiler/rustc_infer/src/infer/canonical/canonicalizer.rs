@@ -6,21 +6,18 @@
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
 use crate::infer::canonical::{
-    Canonical, CanonicalTyVarKind, CanonicalVarInfo, CanonicalVarKind, Canonicalized,
-    OriginalQueryValues,
+    Canonical, CanonicalTyVarKind, CanonicalVarInfo, CanonicalVarKind, OriginalQueryValues,
 };
 use crate::infer::InferCtxt;
-use rustc_middle::ty::flags::FlagComputation;
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
-use rustc_middle::ty::subst::GenericArg;
-use rustc_middle::ty::{self, BoundVar, InferConst, List, Ty, TyCtxt, TypeFlags};
-use std::sync::atomic::Ordering;
+use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
+use rustc_middle::ty::GenericArg;
+use rustc_middle::ty::{self, BoundVar, InferConst, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use smallvec::SmallVec;
 
-impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
+impl<'tcx> InferCtxt<'tcx> {
     /// Canonicalizes a query value `V`. When we canonicalize a query,
     /// we not only canonicalize unbound inference variables, but we
     /// *also* replace all free regions whatsoever. So for example a
@@ -40,13 +37,34 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
         &self,
         value: V,
         query_state: &mut OriginalQueryValues<'tcx>,
-    ) -> Canonicalized<'tcx, V>
+    ) -> Canonical<'tcx, V>
     where
-        V: TypeFoldable<'tcx>,
+        V: TypeFoldable<TyCtxt<'tcx>>,
     {
-        self.tcx.sess.perf_stats.queries_canonicalized.fetch_add(1, Ordering::Relaxed);
-
         Canonicalizer::canonicalize(value, self, self.tcx, &CanonicalizeAllFreeRegions, query_state)
+    }
+
+    /// Like [Self::canonicalize_query], but preserves distinct universes. For
+    /// example, canonicalizing `&'?0: Trait<'?1>`, where `'?0` is in `U1` and
+    /// `'?1` is in `U3` would be canonicalized to have `?0` in `U1` and `'?1`
+    /// in `U2`.
+    ///
+    /// This is used for Chalk integration.
+    pub fn canonicalize_query_preserving_universes<V>(
+        &self,
+        value: V,
+        query_state: &mut OriginalQueryValues<'tcx>,
+    ) -> Canonical<'tcx, V>
+    where
+        V: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        Canonicalizer::canonicalize(
+            value,
+            self,
+            self.tcx,
+            &CanonicalizeAllFreeRegionsPreservingUniverses,
+            query_state,
+        )
     }
 
     /// Canonicalizes a query *response* `V`. When we canonicalize a
@@ -62,9 +80,9 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
     ///
     /// with a mapping M that maps `'?0` to `'static`. But if we found that there
     /// exists only one possible impl of `Trait`, and it looks like
-    ///
-    ///     impl<T> Trait<'static> for T { .. }
-    ///
+    /// ```ignore (illustrative)
+    /// impl<T> Trait<'static> for T { .. }
+    /// ```
     /// then we would prepare a query result R that (among other
     /// things) includes a mapping to `'?0 := 'static`. When
     /// canonicalizing this query result R, we would leave this
@@ -74,9 +92,9 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
     /// out the [chapter in the rustc dev guide][c].
     ///
     /// [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html#canonicalizing-the-query-result
-    pub fn canonicalize_response<V>(&self, value: V) -> Canonicalized<'tcx, V>
+    pub fn canonicalize_response<V>(&self, value: V) -> Canonical<'tcx, V>
     where
-        V: TypeFoldable<'tcx>,
+        V: TypeFoldable<TyCtxt<'tcx>>,
     {
         let mut query_state = OriginalQueryValues::default();
         Canonicalizer::canonicalize(
@@ -88,9 +106,9 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
         )
     }
 
-    pub fn canonicalize_user_type_annotation<V>(&self, value: V) -> Canonicalized<'tcx, V>
+    pub fn canonicalize_user_type_annotation<V>(&self, value: V) -> Canonical<'tcx, V>
     where
-        V: TypeFoldable<'tcx>,
+        V: TypeFoldable<TyCtxt<'tcx>>,
     {
         let mut query_state = OriginalQueryValues::default();
         Canonicalizer::canonicalize(
@@ -110,12 +128,10 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
         &self,
         value: V,
         query_state: &mut OriginalQueryValues<'tcx>,
-    ) -> Canonicalized<'tcx, V>
+    ) -> Canonical<'tcx, V>
     where
-        V: TypeFoldable<'tcx>,
+        V: TypeFoldable<TyCtxt<'tcx>>,
     {
-        self.tcx.sess.perf_stats.queries_canonicalized.fetch_add(1, Ordering::Relaxed);
-
         Canonicalizer::canonicalize(
             value,
             self,
@@ -133,46 +149,41 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
 /// maximally general query. But if we are canonicalizing a *query
 /// response*, then we don't typically replace free regions, as they
 /// must have been introduced from other parts of the system.
-trait CanonicalizeRegionMode {
-    fn canonicalize_free_region(
+trait CanonicalizeMode {
+    fn canonicalize_free_region<'tcx>(
         &self,
         canonicalizer: &mut Canonicalizer<'_, 'tcx>,
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx>;
 
     fn any(&self) -> bool;
+
+    // Do we preserve universe of variables.
+    fn preserve_universes(&self) -> bool;
 }
 
 struct CanonicalizeQueryResponse;
 
-impl CanonicalizeRegionMode for CanonicalizeQueryResponse {
-    fn canonicalize_free_region(
+impl CanonicalizeMode for CanonicalizeQueryResponse {
+    fn canonicalize_free_region<'tcx>(
         &self,
         canonicalizer: &mut Canonicalizer<'_, 'tcx>,
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
-        match r {
-            ty::ReFree(_)
-            | ty::ReErased
-            | ty::ReStatic
-            | ty::ReEmpty(ty::UniverseIndex::ROOT)
-            | ty::ReEarlyBound(..) => r,
+        match *r {
+            ty::ReLateParam(_) | ty::ReErased | ty::ReStatic | ty::ReEarlyParam(..) => r,
 
             ty::RePlaceholder(placeholder) => canonicalizer.canonical_var_for_region(
-                CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderRegion(*placeholder) },
+                CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderRegion(placeholder) },
                 r,
             ),
 
             ty::ReVar(vid) => {
-                let universe = canonicalizer.region_var_universe(*vid);
+                let universe = canonicalizer.region_var_universe(vid);
                 canonicalizer.canonical_var_for_region(
                     CanonicalVarInfo { kind: CanonicalVarKind::Region(universe) },
                     r,
                 )
-            }
-
-            ty::ReEmpty(ui) => {
-                bug!("canonicalizing 'empty in universe {:?}", ui) // FIXME
             }
 
             _ => {
@@ -184,12 +195,10 @@ impl CanonicalizeRegionMode for CanonicalizeQueryResponse {
                 // rust-lang/rust#57464: `impl Trait` can leak local
                 // scopes (in manner violating typeck). Therefore, use
                 // `delay_span_bug` to allow type error over an ICE.
-                ty::tls::with(|tcx| {
-                    tcx.sess.delay_span_bug(
-                        rustc_span::DUMMY_SP,
-                        &format!("unexpected region in query response: `{:?}`", r),
-                    );
-                });
+                canonicalizer.tcx.sess.delay_span_bug(
+                    rustc_span::DUMMY_SP,
+                    format!("unexpected region in query response: `{r:?}`"),
+                );
                 r
             }
         }
@@ -198,20 +207,28 @@ impl CanonicalizeRegionMode for CanonicalizeQueryResponse {
     fn any(&self) -> bool {
         false
     }
+
+    fn preserve_universes(&self) -> bool {
+        true
+    }
 }
 
 struct CanonicalizeUserTypeAnnotation;
 
-impl CanonicalizeRegionMode for CanonicalizeUserTypeAnnotation {
-    fn canonicalize_free_region(
+impl CanonicalizeMode for CanonicalizeUserTypeAnnotation {
+    fn canonicalize_free_region<'tcx>(
         &self,
         canonicalizer: &mut Canonicalizer<'_, 'tcx>,
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
-        match r {
-            ty::ReEarlyBound(_) | ty::ReFree(_) | ty::ReErased | ty::ReStatic => r,
+        match *r {
+            ty::ReEarlyParam(_)
+            | ty::ReLateParam(_)
+            | ty::ReErased
+            | ty::ReStatic
+            | ty::ReError(_) => r,
             ty::ReVar(_) => canonicalizer.canonical_var_for_region_in_root_universe(r),
-            _ => {
+            ty::RePlaceholder(..) | ty::ReBound(..) => {
                 // We only expect region names that the user can type.
                 bug!("unexpected region in query response: `{:?}`", r)
             }
@@ -221,12 +238,16 @@ impl CanonicalizeRegionMode for CanonicalizeUserTypeAnnotation {
     fn any(&self) -> bool {
         false
     }
+
+    fn preserve_universes(&self) -> bool {
+        false
+    }
 }
 
 struct CanonicalizeAllFreeRegions;
 
-impl CanonicalizeRegionMode for CanonicalizeAllFreeRegions {
-    fn canonicalize_free_region(
+impl CanonicalizeMode for CanonicalizeAllFreeRegions {
+    fn canonicalize_free_region<'tcx>(
         &self,
         canonicalizer: &mut Canonicalizer<'_, 'tcx>,
         r: ty::Region<'tcx>,
@@ -237,50 +258,78 @@ impl CanonicalizeRegionMode for CanonicalizeAllFreeRegions {
     fn any(&self) -> bool {
         true
     }
+
+    fn preserve_universes(&self) -> bool {
+        false
+    }
 }
 
-struct CanonicalizeFreeRegionsOtherThanStatic;
+struct CanonicalizeAllFreeRegionsPreservingUniverses;
 
-impl CanonicalizeRegionMode for CanonicalizeFreeRegionsOtherThanStatic {
-    fn canonicalize_free_region(
+impl CanonicalizeMode for CanonicalizeAllFreeRegionsPreservingUniverses {
+    fn canonicalize_free_region<'tcx>(
         &self,
         canonicalizer: &mut Canonicalizer<'_, 'tcx>,
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
-        if let ty::ReStatic = r {
-            r
-        } else {
-            canonicalizer.canonical_var_for_region_in_root_universe(r)
-        }
+        let universe = canonicalizer.infcx.universe_of_region(r);
+        canonicalizer.canonical_var_for_region(
+            CanonicalVarInfo { kind: CanonicalVarKind::Region(universe) },
+            r,
+        )
     }
 
     fn any(&self) -> bool {
         true
     }
+
+    fn preserve_universes(&self) -> bool {
+        true
+    }
+}
+
+struct CanonicalizeFreeRegionsOtherThanStatic;
+
+impl CanonicalizeMode for CanonicalizeFreeRegionsOtherThanStatic {
+    fn canonicalize_free_region<'tcx>(
+        &self,
+        canonicalizer: &mut Canonicalizer<'_, 'tcx>,
+        r: ty::Region<'tcx>,
+    ) -> ty::Region<'tcx> {
+        if r.is_static() { r } else { canonicalizer.canonical_var_for_region_in_root_universe(r) }
+    }
+
+    fn any(&self) -> bool {
+        true
+    }
+
+    fn preserve_universes(&self) -> bool {
+        false
+    }
 }
 
 struct Canonicalizer<'cx, 'tcx> {
-    infcx: &'cx InferCtxt<'cx, 'tcx>,
+    infcx: &'cx InferCtxt<'tcx>,
     tcx: TyCtxt<'tcx>,
     variables: SmallVec<[CanonicalVarInfo<'tcx>; 8]>,
     query_state: &'cx mut OriginalQueryValues<'tcx>,
     // Note that indices is only used once `var_values` is big enough to be
     // heap-allocated.
     indices: FxHashMap<GenericArg<'tcx>, BoundVar>,
-    canonicalize_region_mode: &'cx dyn CanonicalizeRegionMode,
+    canonicalize_mode: &'cx dyn CanonicalizeMode,
     needs_canonical_flags: TypeFlags,
 
     binder_index: ty::DebruijnIndex,
 }
 
-impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
-    fn tcx<'b>(&'b self) -> TyCtxt<'tcx> {
+impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Canonicalizer<'cx, 'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
     fn fold_binder<T>(&mut self, t: ty::Binder<'tcx, T>) -> ty::Binder<'tcx, T>
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         self.binder_index.shift_in(1);
         let t = t.super_fold_with(self);
@@ -290,7 +339,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
 
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
         match *r {
-            ty::ReLateBound(index, ..) => {
+            ty::ReBound(index, ..) => {
                 if index >= self.binder_index {
                     bug!("escaping late-bound region during canonicalization");
                 } else {
@@ -299,33 +348,40 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             }
 
             ty::ReVar(vid) => {
-                let resolved_vid = self
+                let resolved = self
                     .infcx
                     .inner
                     .borrow_mut()
                     .unwrap_region_constraints()
-                    .opportunistic_resolve_var(vid);
+                    .opportunistic_resolve_var(self.tcx, vid);
                 debug!(
-                    "canonical: region var found with vid {:?}, \
-                     opportunistically resolved to {:?}",
-                    vid, r
+                    "canonical: region var found with vid {vid:?}, \
+                     opportunistically resolved to {resolved:?}",
                 );
-                let r = self.tcx.reuse_or_mk_region(r, ty::ReVar(resolved_vid));
-                self.canonicalize_region_mode.canonicalize_free_region(self, r)
+                self.canonicalize_mode.canonicalize_free_region(self, resolved)
             }
 
             ty::ReStatic
-            | ty::ReEarlyBound(..)
-            | ty::ReFree(_)
-            | ty::ReEmpty(_)
+            | ty::ReEarlyParam(..)
+            | ty::ReError(_)
+            | ty::ReLateParam(_)
             | ty::RePlaceholder(..)
-            | ty::ReErased => self.canonicalize_region_mode.canonicalize_free_region(self, r),
+            | ty::ReErased => self.canonicalize_mode.canonicalize_free_region(self, r),
         }
     }
 
-    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
+    fn fold_ty(&mut self, mut t: Ty<'tcx>) -> Ty<'tcx> {
         match *t.kind() {
-            ty::Infer(ty::TyVar(vid)) => {
+            ty::Infer(ty::TyVar(mut vid)) => {
+                // We need to canonicalize the *root* of our ty var.
+                // This is so that our canonical response correctly reflects
+                // any equated inference vars correctly!
+                let root_vid = self.infcx.root_var(vid);
+                if root_vid != vid {
+                    t = Ty::new_var(self.infcx.tcx, root_vid);
+                    vid = root_vid;
+                }
+
                 debug!("canonical: type var found with vid {:?}", vid);
                 match self.infcx.probe_ty_var(vid) {
                     // `t` could be a float / int variable; canonicalize that instead.
@@ -337,8 +393,10 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
                     // `TyVar(vid)` is unresolved, track its universe index in the canonicalized
                     // result.
                     Err(mut ui) => {
-                        // FIXME: perf problem described in #55921.
-                        ui = ty::UniverseIndex::ROOT;
+                        if !self.canonicalize_mode.preserve_universes() {
+                            // FIXME: perf problem described in #55921.
+                            ui = ty::UniverseIndex::ROOT;
+                        }
                         self.canonicalize_ty_var(
                             CanonicalVarInfo {
                                 kind: CanonicalVarKind::Ty(CanonicalTyVarKind::General(ui)),
@@ -349,24 +407,42 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
                 }
             }
 
-            ty::Infer(ty::IntVar(_)) => self.canonicalize_ty_var(
-                CanonicalVarInfo { kind: CanonicalVarKind::Ty(CanonicalTyVarKind::Int) },
-                t,
-            ),
-
-            ty::Infer(ty::FloatVar(_)) => self.canonicalize_ty_var(
-                CanonicalVarInfo { kind: CanonicalVarKind::Ty(CanonicalTyVarKind::Float) },
-                t,
-            ),
+            ty::Infer(ty::IntVar(vid)) => {
+                let nt = self.infcx.opportunistic_resolve_int_var(vid);
+                if nt != t {
+                    return self.fold_ty(nt);
+                } else {
+                    self.canonicalize_ty_var(
+                        CanonicalVarInfo { kind: CanonicalVarKind::Ty(CanonicalTyVarKind::Int) },
+                        t,
+                    )
+                }
+            }
+            ty::Infer(ty::FloatVar(vid)) => {
+                let nt = self.infcx.opportunistic_resolve_float_var(vid);
+                if nt != t {
+                    return self.fold_ty(nt);
+                } else {
+                    self.canonicalize_ty_var(
+                        CanonicalVarInfo { kind: CanonicalVarKind::Ty(CanonicalTyVarKind::Float) },
+                        t,
+                    )
+                }
+            }
 
             ty::Infer(ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
                 bug!("encountered a fresh type during canonicalization")
             }
 
-            ty::Placeholder(placeholder) => self.canonicalize_ty_var(
-                CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderTy(placeholder) },
-                t,
-            ),
+            ty::Placeholder(mut placeholder) => {
+                if !self.canonicalize_mode.preserve_universes() {
+                    placeholder.universe = ty::UniverseIndex::ROOT;
+                }
+                self.canonicalize_ty_var(
+                    CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderTy(placeholder) },
+                    t,
+                )
+            }
 
             ty::Bound(debruijn, _) => {
                 if debruijn >= self.binder_index {
@@ -377,8 +453,8 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             }
 
             ty::Closure(..)
-            | ty::Generator(..)
-            | ty::GeneratorWitness(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..)
             | ty::Bool
             | ty::Char
             | ty::Int(..)
@@ -396,10 +472,9 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             | ty::Dynamic(..)
             | ty::Never
             | ty::Tuple(..)
-            | ty::Projection(..)
+            | ty::Alias(..)
             | ty::Foreign(..)
-            | ty::Param(..)
-            | ty::Opaque(..) => {
+            | ty::Param(..) => {
                 if t.flags().intersects(self.needs_canonical_flags) {
                     t.super_fold_with(self)
                 } else {
@@ -409,9 +484,18 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
         }
     }
 
-    fn fold_const(&mut self, ct: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {
-        match ct.val {
-            ty::ConstKind::Infer(InferConst::Var(vid)) => {
+    fn fold_const(&mut self, mut ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        match ct.kind() {
+            ty::ConstKind::Infer(InferConst::Var(mut vid)) => {
+                // We need to canonicalize the *root* of our const var.
+                // This is so that our canonical response correctly reflects
+                // any equated inference vars correctly!
+                let root_vid = self.infcx.root_const_var(vid);
+                if root_vid != vid {
+                    ct = ty::Const::new_var(self.infcx.tcx, root_vid, ct.ty());
+                    vid = root_vid;
+                }
+
                 debug!("canonical: const var found with vid {:?}", vid);
                 match self.infcx.probe_const_var(vid) {
                     Ok(c) => {
@@ -422,10 +506,23 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
                     // `ConstVar(vid)` is unresolved, track its universe index in the
                     // canonicalized result
                     Err(mut ui) => {
-                        // FIXME: perf problem described in #55921.
-                        ui = ty::UniverseIndex::ROOT;
+                        if !self.canonicalize_mode.preserve_universes() {
+                            // FIXME: perf problem described in #55921.
+                            ui = ty::UniverseIndex::ROOT;
+                        }
                         return self.canonicalize_const_var(
-                            CanonicalVarInfo { kind: CanonicalVarKind::Const(ui) },
+                            CanonicalVarInfo { kind: CanonicalVarKind::Const(ui, ct.ty()) },
+                            ct,
+                        );
+                    }
+                }
+            }
+            ty::ConstKind::Infer(InferConst::EffectVar(vid)) => {
+                match self.infcx.probe_effect_var(vid) {
+                    Some(value) => return self.fold_const(value.as_const(self.infcx.tcx)),
+                    None => {
+                        return self.canonicalize_const_var(
+                            CanonicalVarInfo { kind: CanonicalVarKind::Effect },
                             ct,
                         );
                     }
@@ -436,22 +533,27 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             }
             ty::ConstKind::Bound(debruijn, _) => {
                 if debruijn >= self.binder_index {
-                    bug!("escaping bound type during canonicalization")
+                    bug!("escaping bound const during canonicalization")
                 } else {
                     return ct;
                 }
             }
             ty::ConstKind::Placeholder(placeholder) => {
                 return self.canonicalize_const_var(
-                    CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderConst(placeholder) },
+                    CanonicalVarInfo {
+                        kind: CanonicalVarKind::PlaceholderConst(placeholder, ct.ty()),
+                    },
                     ct,
                 );
             }
             _ => {}
         }
 
-        let flags = FlagComputation::for_const(ct);
-        if flags.intersects(self.needs_canonical_flags) { ct.super_fold_with(self) } else { ct }
+        if ct.flags().intersects(self.needs_canonical_flags) {
+            ct.super_fold_with(self)
+        } else {
+            ct
+        }
     }
 }
 
@@ -460,24 +562,18 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
     /// `canonicalize_query` and `canonicalize_response`.
     fn canonicalize<V>(
         value: V,
-        infcx: &InferCtxt<'_, 'tcx>,
+        infcx: &InferCtxt<'tcx>,
         tcx: TyCtxt<'tcx>,
-        canonicalize_region_mode: &dyn CanonicalizeRegionMode,
+        canonicalize_region_mode: &dyn CanonicalizeMode,
         query_state: &mut OriginalQueryValues<'tcx>,
-    ) -> Canonicalized<'tcx, V>
+    ) -> Canonical<'tcx, V>
     where
-        V: TypeFoldable<'tcx>,
+        V: TypeFoldable<TyCtxt<'tcx>>,
     {
         let needs_canonical_flags = if canonicalize_region_mode.any() {
-            TypeFlags::NEEDS_INFER |
-            TypeFlags::HAS_POTENTIAL_FREE_REGIONS | // `HAS_RE_PLACEHOLDER` implies `HAS_POTENTIAL_FREE_REGIONS`
-            TypeFlags::HAS_TY_PLACEHOLDER |
-            TypeFlags::HAS_CT_PLACEHOLDER
+            TypeFlags::HAS_INFER | TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_FREE_REGIONS
         } else {
-            TypeFlags::NEEDS_INFER
-                | TypeFlags::HAS_RE_PLACEHOLDER
-                | TypeFlags::HAS_TY_PLACEHOLDER
-                | TypeFlags::HAS_CT_PLACEHOLDER
+            TypeFlags::HAS_INFER | TypeFlags::HAS_PLACEHOLDER
         };
 
         // Fast path: nothing that needs to be canonicalized.
@@ -493,7 +589,7 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         let mut canonicalizer = Canonicalizer {
             infcx,
             tcx,
-            canonicalize_region_mode,
+            canonicalize_mode: canonicalize_region_mode,
             needs_canonical_flags,
             variables: SmallVec::new(),
             query_state,
@@ -504,10 +600,11 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
 
         // Once we have canonicalized `out_value`, it should not
         // contain anything that ties it to this inference context
-        // anymore, so it should live in the global arena.
-        debug_assert!(!out_value.needs_infer());
+        // anymore.
+        debug_assert!(!out_value.has_infer() && !out_value.has_placeholders());
 
-        let canonical_variables = tcx.intern_canonical_var_infos(&canonicalizer.variables);
+        let canonical_variables =
+            tcx.mk_canonical_var_infos(&canonicalizer.universe_canonicalized_variables());
 
         let max_universe = canonical_variables
             .iter()
@@ -526,6 +623,19 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         let Canonicalizer { variables, query_state, indices, .. } = self;
 
         let var_values = &mut query_state.var_values;
+
+        let universe = info.universe();
+        if universe != ty::UniverseIndex::ROOT {
+            assert!(self.canonicalize_mode.preserve_universes());
+
+            // Insert universe into the universe map. To preserve the order of the
+            // universes in the value being canonicalized, we don't update the
+            // universe in `info` until we have finished canonicalizing.
+            match query_state.universe_map.binary_search(&universe) {
+                Err(idx) => query_state.universe_map.insert(idx, universe),
+                Ok(_) => {}
+            }
+        }
 
         // This code is hot. `variables` and `var_values` are usually small
         // (fewer than 8 elements ~95% of the time). They are SmallVec's to
@@ -569,6 +679,65 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         }
     }
 
+    /// Replaces the universe indexes used in `var_values` with their index in
+    /// `query_state.universe_map`. This minimizes the maximum universe used in
+    /// the canonicalized value.
+    fn universe_canonicalized_variables(self) -> SmallVec<[CanonicalVarInfo<'tcx>; 8]> {
+        if self.query_state.universe_map.len() == 1 {
+            return self.variables;
+        }
+
+        let reverse_universe_map: FxHashMap<ty::UniverseIndex, ty::UniverseIndex> = self
+            .query_state
+            .universe_map
+            .iter()
+            .enumerate()
+            .map(|(idx, universe)| (*universe, ty::UniverseIndex::from_usize(idx)))
+            .collect();
+
+        self.variables
+            .iter()
+            .map(|v| CanonicalVarInfo {
+                kind: match v.kind {
+                    CanonicalVarKind::Ty(CanonicalTyVarKind::Int | CanonicalTyVarKind::Float)
+                    | CanonicalVarKind::Effect => {
+                        return *v;
+                    }
+                    CanonicalVarKind::Ty(CanonicalTyVarKind::General(u)) => {
+                        CanonicalVarKind::Ty(CanonicalTyVarKind::General(reverse_universe_map[&u]))
+                    }
+                    CanonicalVarKind::Region(u) => {
+                        CanonicalVarKind::Region(reverse_universe_map[&u])
+                    }
+                    CanonicalVarKind::Const(u, t) => {
+                        CanonicalVarKind::Const(reverse_universe_map[&u], t)
+                    }
+                    CanonicalVarKind::PlaceholderTy(placeholder) => {
+                        CanonicalVarKind::PlaceholderTy(ty::Placeholder {
+                            universe: reverse_universe_map[&placeholder.universe],
+                            ..placeholder
+                        })
+                    }
+                    CanonicalVarKind::PlaceholderRegion(placeholder) => {
+                        CanonicalVarKind::PlaceholderRegion(ty::Placeholder {
+                            universe: reverse_universe_map[&placeholder.universe],
+                            ..placeholder
+                        })
+                    }
+                    CanonicalVarKind::PlaceholderConst(placeholder, t) => {
+                        CanonicalVarKind::PlaceholderConst(
+                            ty::Placeholder {
+                                universe: reverse_universe_map[&placeholder.universe],
+                                ..placeholder
+                            },
+                            t,
+                        )
+                    }
+                },
+            })
+            .collect()
+    }
+
     /// Shorthand helper that creates a canonical region variable for
     /// `r` (always in the root universe). The reason that we always
     /// put these variables into the root universe is because this
@@ -605,9 +774,8 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
         let var = self.canonical_var(info, r.into());
-        let br = ty::BoundRegion { var, kind: ty::BrAnon(var.as_u32()) };
-        let region = ty::ReLateBound(self.binder_index, br);
-        self.tcx().mk_region(region)
+        let br = ty::BoundRegion { var, kind: ty::BrAnon };
+        ty::Region::new_bound(self.interner(), self.binder_index, br)
     }
 
     /// Given a type variable `ty_var` of the given kind, first check
@@ -621,7 +789,7 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
             self.fold_ty(bound_to)
         } else {
             let var = self.canonical_var(info, ty_var.into());
-            self.tcx().mk_ty(ty::Bound(self.binder_index, var.into()))
+            Ty::new_bound(self.tcx, self.binder_index, var.into())
         }
     }
 
@@ -632,18 +800,15 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
     fn canonicalize_const_var(
         &mut self,
         info: CanonicalVarInfo<'tcx>,
-        const_var: &'tcx ty::Const<'tcx>,
-    ) -> &'tcx ty::Const<'tcx> {
+        const_var: ty::Const<'tcx>,
+    ) -> ty::Const<'tcx> {
         let infcx = self.infcx;
         let bound_to = infcx.shallow_resolve(const_var);
         if bound_to != const_var {
             self.fold_const(bound_to)
         } else {
             let var = self.canonical_var(info, const_var.into());
-            self.tcx().mk_const(ty::Const {
-                val: ty::ConstKind::Bound(self.binder_index, var),
-                ty: self.fold_ty(const_var.ty),
-            })
+            ty::Const::new_bound(self.tcx, self.binder_index, var, self.fold_ty(const_var.ty()))
         }
     }
 }

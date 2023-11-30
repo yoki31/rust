@@ -1,23 +1,21 @@
-use rustc_index::bit_set::BitSet;
-use rustc_middle::mir::{self, BasicBlock, Location, SwitchTargets};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::mir::{
+    self, BasicBlock, CallReturnPlaces, Location, SwitchTargets, TerminatorEdges,
+};
 use std::ops::RangeInclusive;
 
 use super::visitor::{ResultsVisitable, ResultsVisitor};
 use super::{Analysis, Effect, EffectIndex, GenKillAnalysis, GenKillSet, SwitchIntTarget};
 
 pub trait Direction {
-    fn is_forward() -> bool;
+    const IS_FORWARD: bool;
 
-    fn is_backward() -> bool {
-        !Self::is_forward()
-    }
+    const IS_BACKWARD: bool = !Self::IS_FORWARD;
 
     /// Applies all effects between the given `EffectIndex`s.
     ///
     /// `effects.start()` must precede or equal `effects.end()` in this direction.
-    fn apply_effects_in_range<A>(
-        analysis: &A,
+    fn apply_effects_in_range<'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
@@ -25,38 +23,39 @@ pub trait Direction {
     ) where
         A: Analysis<'tcx>;
 
-    fn apply_effects_in_block<A>(
-        analysis: &A,
+    fn apply_effects_in_block<'mir, 'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
+        block_data: &'mir mir::BasicBlockData<'tcx>,
+        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
+    ) -> TerminatorEdges<'mir, 'tcx>
+    where
         A: Analysis<'tcx>;
 
-    fn gen_kill_effects_in_block<A>(
-        analysis: &A,
+    fn gen_kill_statement_effects_in_block<'tcx, A>(
+        analysis: &mut A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
     ) where
         A: GenKillAnalysis<'tcx>;
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        results: &R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, FlowState = F>,
+        results: &mut R,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
     ) where
         R: ResultsVisitable<'tcx, FlowState = F>;
 
-    fn join_state_into_successors_of<A>(
-        analysis: &A,
-        tcx: TyCtxt<'tcx>,
+    fn join_state_into_successors_of<'tcx, A>(
+        analysis: &mut A,
         body: &mir::Body<'tcx>,
-        dead_unwinds: Option<&BitSet<BasicBlock>>,
         exit_state: &mut A::Domain,
-        block: (BasicBlock, &'_ mir::BasicBlockData<'tcx>),
+        block: BasicBlock,
+        edges: TerminatorEdges<'_, 'tcx>,
         propagate: impl FnMut(BasicBlock, &A::Domain),
     ) where
         A: Analysis<'tcx>;
@@ -66,43 +65,42 @@ pub trait Direction {
 pub struct Backward;
 
 impl Direction for Backward {
-    fn is_forward() -> bool {
-        false
-    }
+    const IS_FORWARD: bool = false;
 
-    fn apply_effects_in_block<A>(
-        analysis: &A,
+    fn apply_effects_in_block<'mir, 'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
+        block_data: &'mir mir::BasicBlockData<'tcx>,
+        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
+    ) -> TerminatorEdges<'mir, 'tcx>
+    where
         A: Analysis<'tcx>,
     {
         let terminator = block_data.terminator();
         let location = Location { block, statement_index: block_data.statements.len() };
         analysis.apply_before_terminator_effect(state, terminator, location);
-        analysis.apply_terminator_effect(state, terminator, location);
-
-        for (statement_index, statement) in block_data.statements.iter().enumerate().rev() {
-            let location = Location { block, statement_index };
-            analysis.apply_before_statement_effect(state, statement, location);
-            analysis.apply_statement_effect(state, statement, location);
+        let edges = analysis.apply_terminator_effect(state, terminator, location);
+        if let Some(statement_effect) = statement_effect {
+            statement_effect(block, state)
+        } else {
+            for (statement_index, statement) in block_data.statements.iter().enumerate().rev() {
+                let location = Location { block, statement_index };
+                analysis.apply_before_statement_effect(state, statement, location);
+                analysis.apply_statement_effect(state, statement, location);
+            }
         }
+        edges
     }
 
-    fn gen_kill_effects_in_block<A>(
-        analysis: &A,
+    fn gen_kill_statement_effects_in_block<'tcx, A>(
+        analysis: &mut A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
     ) where
         A: GenKillAnalysis<'tcx>,
     {
-        let terminator = block_data.terminator();
-        let location = Location { block, statement_index: block_data.statements.len() };
-        analysis.before_terminator_effect(trans, terminator, location);
-        analysis.terminator_effect(trans, terminator, location);
-
         for (statement_index, statement) in block_data.statements.iter().enumerate().rev() {
             let location = Location { block, statement_index };
             analysis.before_statement_effect(trans, statement, location);
@@ -110,8 +108,8 @@ impl Direction for Backward {
         }
     }
 
-    fn apply_effects_in_range<A>(
-        analysis: &A,
+    fn apply_effects_in_range<'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
@@ -187,81 +185,99 @@ impl Direction for Backward {
         analysis.apply_statement_effect(state, statement, location);
     }
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        results: &R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, FlowState = F>,
+        results: &mut R,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
     ) where
         R: ResultsVisitable<'tcx, FlowState = F>,
     {
         results.reset_to_block_entry(state, block);
 
-        vis.visit_block_end(&state, block_data, block);
+        vis.visit_block_end(results, state, block_data, block);
 
         // Terminator
         let loc = Location { block, statement_index: block_data.statements.len() };
         let term = block_data.terminator();
         results.reconstruct_before_terminator_effect(state, term, loc);
-        vis.visit_terminator_before_primary_effect(state, term, loc);
+        vis.visit_terminator_before_primary_effect(results, state, term, loc);
         results.reconstruct_terminator_effect(state, term, loc);
-        vis.visit_terminator_after_primary_effect(state, term, loc);
+        vis.visit_terminator_after_primary_effect(results, state, term, loc);
 
         for (statement_index, stmt) in block_data.statements.iter().enumerate().rev() {
             let loc = Location { block, statement_index };
             results.reconstruct_before_statement_effect(state, stmt, loc);
-            vis.visit_statement_before_primary_effect(state, stmt, loc);
+            vis.visit_statement_before_primary_effect(results, state, stmt, loc);
             results.reconstruct_statement_effect(state, stmt, loc);
-            vis.visit_statement_after_primary_effect(state, stmt, loc);
+            vis.visit_statement_after_primary_effect(results, state, stmt, loc);
         }
 
-        vis.visit_block_start(state, block_data, block);
+        vis.visit_block_start(results, state, block_data, block);
     }
 
-    fn join_state_into_successors_of<A>(
-        analysis: &A,
-        _tcx: TyCtxt<'tcx>,
+    fn join_state_into_successors_of<'tcx, A>(
+        analysis: &mut A,
         body: &mir::Body<'tcx>,
-        dead_unwinds: Option<&BitSet<BasicBlock>>,
         exit_state: &mut A::Domain,
-        (bb, _bb_data): (BasicBlock, &'_ mir::BasicBlockData<'tcx>),
+        bb: BasicBlock,
+        _edges: TerminatorEdges<'_, 'tcx>,
         mut propagate: impl FnMut(BasicBlock, &A::Domain),
     ) where
         A: Analysis<'tcx>,
     {
-        for pred in body.predecessors()[bb].iter().copied() {
+        for pred in body.basic_blocks.predecessors()[bb].iter().copied() {
             match body[pred].terminator().kind {
                 // Apply terminator-specific edge effects.
                 //
                 // FIXME(ecstaticmorse): Avoid cloning the exit state unconditionally.
-                mir::TerminatorKind::Call {
-                    destination: Some((return_place, dest)),
-                    ref func,
-                    ref args,
-                    ..
+                mir::TerminatorKind::Call { destination, target: Some(dest), .. } if dest == bb => {
+                    let mut tmp = exit_state.clone();
+                    analysis.apply_call_return_effect(
+                        &mut tmp,
+                        pred,
+                        CallReturnPlaces::Call(destination),
+                    );
+                    propagate(pred, &tmp);
+                }
+
+                mir::TerminatorKind::InlineAsm {
+                    destination: Some(dest), ref operands, ..
                 } if dest == bb => {
                     let mut tmp = exit_state.clone();
-                    analysis.apply_call_return_effect(&mut tmp, pred, func, args, return_place);
+                    analysis.apply_call_return_effect(
+                        &mut tmp,
+                        pred,
+                        CallReturnPlaces::InlineAsm(operands),
+                    );
                     propagate(pred, &tmp);
                 }
 
                 mir::TerminatorKind::Yield { resume, resume_arg, .. } if resume == bb => {
                     let mut tmp = exit_state.clone();
-                    analysis.apply_yield_resume_effect(&mut tmp, resume, resume_arg);
+                    analysis.apply_call_return_effect(
+                        &mut tmp,
+                        resume,
+                        CallReturnPlaces::Yield(resume_arg),
+                    );
                     propagate(pred, &tmp);
                 }
 
-                // Ignore dead unwinds.
-                mir::TerminatorKind::Call { cleanup: Some(unwind), .. }
-                | mir::TerminatorKind::Assert { cleanup: Some(unwind), .. }
-                | mir::TerminatorKind::Drop { unwind: Some(unwind), .. }
-                | mir::TerminatorKind::DropAndReplace { unwind: Some(unwind), .. }
-                | mir::TerminatorKind::FalseUnwind { unwind: Some(unwind), .. }
-                    if unwind == bb =>
-                {
-                    if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
-                        propagate(pred, exit_state);
+                mir::TerminatorKind::SwitchInt { targets: _, ref discr } => {
+                    let mut applier = BackwardSwitchIntEdgeEffectsApplier {
+                        body,
+                        pred,
+                        exit_state,
+                        bb,
+                        propagate: &mut propagate,
+                        effects_applied: false,
+                    };
+
+                    analysis.apply_switch_int_edge_effects(pred, discr, &mut applier);
+
+                    if !applier.effects_applied {
+                        propagate(pred, exit_state)
                     }
                 }
 
@@ -271,36 +287,71 @@ impl Direction for Backward {
     }
 }
 
+struct BackwardSwitchIntEdgeEffectsApplier<'mir, 'tcx, D, F> {
+    body: &'mir mir::Body<'tcx>,
+    pred: BasicBlock,
+    exit_state: &'mir mut D,
+    bb: BasicBlock,
+    propagate: &'mir mut F,
+    effects_applied: bool,
+}
+
+impl<D, F> super::SwitchIntEdgeEffects<D> for BackwardSwitchIntEdgeEffectsApplier<'_, '_, D, F>
+where
+    D: Clone,
+    F: FnMut(BasicBlock, &D),
+{
+    fn apply(&mut self, mut apply_edge_effect: impl FnMut(&mut D, SwitchIntTarget)) {
+        assert!(!self.effects_applied);
+
+        let values = &self.body.basic_blocks.switch_sources()[&(self.bb, self.pred)];
+        let targets = values.iter().map(|&value| SwitchIntTarget { value, target: self.bb });
+
+        let mut tmp = None;
+        for target in targets {
+            let tmp = opt_clone_from_or_clone(&mut tmp, self.exit_state);
+            apply_edge_effect(tmp, target);
+            (self.propagate)(self.pred, tmp);
+        }
+
+        self.effects_applied = true;
+    }
+}
+
 /// Dataflow that runs from the entry of a block (the first statement), to its exit (terminator).
 pub struct Forward;
 
 impl Direction for Forward {
-    fn is_forward() -> bool {
-        true
-    }
+    const IS_FORWARD: bool = true;
 
-    fn apply_effects_in_block<A>(
-        analysis: &A,
+    fn apply_effects_in_block<'mir, 'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
+        block_data: &'mir mir::BasicBlockData<'tcx>,
+        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
+    ) -> TerminatorEdges<'mir, 'tcx>
+    where
         A: Analysis<'tcx>,
     {
-        for (statement_index, statement) in block_data.statements.iter().enumerate() {
-            let location = Location { block, statement_index };
-            analysis.apply_before_statement_effect(state, statement, location);
-            analysis.apply_statement_effect(state, statement, location);
+        if let Some(statement_effect) = statement_effect {
+            statement_effect(block, state)
+        } else {
+            for (statement_index, statement) in block_data.statements.iter().enumerate() {
+                let location = Location { block, statement_index };
+                analysis.apply_before_statement_effect(state, statement, location);
+                analysis.apply_statement_effect(state, statement, location);
+            }
         }
 
         let terminator = block_data.terminator();
         let location = Location { block, statement_index: block_data.statements.len() };
         analysis.apply_before_terminator_effect(state, terminator, location);
-        analysis.apply_terminator_effect(state, terminator, location);
+        analysis.apply_terminator_effect(state, terminator, location)
     }
 
-    fn gen_kill_effects_in_block<A>(
-        analysis: &A,
+    fn gen_kill_statement_effects_in_block<'tcx, A>(
+        analysis: &mut A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
@@ -312,15 +363,10 @@ impl Direction for Forward {
             analysis.before_statement_effect(trans, statement, location);
             analysis.statement_effect(trans, statement, location);
         }
-
-        let terminator = block_data.terminator();
-        let location = Location { block, statement_index: block_data.statements.len() };
-        analysis.before_terminator_effect(trans, terminator, location);
-        analysis.terminator_effect(trans, terminator, location);
     }
 
-    fn apply_effects_in_range<A>(
-        analysis: &A,
+    fn apply_effects_in_range<'tcx, A>(
+        analysis: &mut A,
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &mir::BasicBlockData<'tcx>,
@@ -392,104 +438,66 @@ impl Direction for Forward {
         }
     }
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        results: &R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, FlowState = F>,
+        results: &mut R,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
     ) where
         R: ResultsVisitable<'tcx, FlowState = F>,
     {
         results.reset_to_block_entry(state, block);
 
-        vis.visit_block_start(state, block_data, block);
+        vis.visit_block_start(results, state, block_data, block);
 
         for (statement_index, stmt) in block_data.statements.iter().enumerate() {
             let loc = Location { block, statement_index };
             results.reconstruct_before_statement_effect(state, stmt, loc);
-            vis.visit_statement_before_primary_effect(state, stmt, loc);
+            vis.visit_statement_before_primary_effect(results, state, stmt, loc);
             results.reconstruct_statement_effect(state, stmt, loc);
-            vis.visit_statement_after_primary_effect(state, stmt, loc);
+            vis.visit_statement_after_primary_effect(results, state, stmt, loc);
         }
 
         let loc = Location { block, statement_index: block_data.statements.len() };
         let term = block_data.terminator();
         results.reconstruct_before_terminator_effect(state, term, loc);
-        vis.visit_terminator_before_primary_effect(state, term, loc);
+        vis.visit_terminator_before_primary_effect(results, state, term, loc);
         results.reconstruct_terminator_effect(state, term, loc);
-        vis.visit_terminator_after_primary_effect(state, term, loc);
+        vis.visit_terminator_after_primary_effect(results, state, term, loc);
 
-        vis.visit_block_end(state, block_data, block);
+        vis.visit_block_end(results, state, block_data, block);
     }
 
-    fn join_state_into_successors_of<A>(
-        analysis: &A,
-        _tcx: TyCtxt<'tcx>,
+    fn join_state_into_successors_of<'tcx, A>(
+        analysis: &mut A,
         _body: &mir::Body<'tcx>,
-        dead_unwinds: Option<&BitSet<BasicBlock>>,
         exit_state: &mut A::Domain,
-        (bb, bb_data): (BasicBlock, &'_ mir::BasicBlockData<'tcx>),
+        bb: BasicBlock,
+        edges: TerminatorEdges<'_, 'tcx>,
         mut propagate: impl FnMut(BasicBlock, &A::Domain),
     ) where
         A: Analysis<'tcx>,
     {
-        use mir::TerminatorKind::*;
-        match bb_data.terminator().kind {
-            Return | Resume | Abort | GeneratorDrop | Unreachable => {}
-
-            Goto { target } => propagate(target, exit_state),
-
-            Assert { target, cleanup: unwind, expected: _, msg: _, cond: _ }
-            | Drop { target, unwind, place: _ }
-            | DropAndReplace { target, unwind, value: _, place: _ }
-            | FalseUnwind { real_target: target, unwind } => {
-                if let Some(unwind) = unwind {
-                    if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
-                        propagate(unwind, exit_state);
-                    }
-                }
-
+        match edges {
+            TerminatorEdges::None => {}
+            TerminatorEdges::Single(target) => propagate(target, exit_state),
+            TerminatorEdges::Double(target, unwind) => {
                 propagate(target, exit_state);
+                propagate(unwind, exit_state);
             }
-
-            FalseEdge { real_target, imaginary_target } => {
-                propagate(real_target, exit_state);
-                propagate(imaginary_target, exit_state);
-            }
-
-            Yield { resume: target, drop, resume_arg, value: _ } => {
-                if let Some(drop) = drop {
-                    propagate(drop, exit_state);
+            TerminatorEdges::AssignOnReturn { return_, cleanup, place } => {
+                // This must be done *first*, otherwise the unwind path will see the assignments.
+                if let Some(cleanup) = cleanup {
+                    propagate(cleanup, exit_state);
                 }
-
-                analysis.apply_yield_resume_effect(exit_state, target, resume_arg);
-                propagate(target, exit_state);
-            }
-
-            Call { cleanup, destination, ref func, ref args, from_hir_call: _, fn_span: _ } => {
-                if let Some(unwind) = cleanup {
-                    if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
-                        propagate(unwind, exit_state);
-                    }
-                }
-
-                if let Some((dest_place, target)) = destination {
-                    // N.B.: This must be done *last*, otherwise the unwind path will see the call
-                    // return effect.
-                    analysis.apply_call_return_effect(exit_state, bb, func, args, dest_place);
-                    propagate(target, exit_state);
+                if let Some(return_) = return_ {
+                    analysis.apply_call_return_effect(exit_state, bb, place);
+                    propagate(return_, exit_state);
                 }
             }
-
-            InlineAsm { template: _, operands: _, options: _, line_spans: _, destination } => {
-                if let Some(target) = destination {
-                    propagate(target, exit_state);
-                }
-            }
-
-            SwitchInt { ref targets, ref discr, switch_ty: _ } => {
-                let mut applier = SwitchIntEdgeEffectApplier {
+            TerminatorEdges::SwitchInt { targets, discr } => {
+                let mut applier = ForwardSwitchIntEdgeEffectsApplier {
                     exit_state,
                     targets,
                     propagate,
@@ -498,8 +506,11 @@ impl Direction for Forward {
 
                 analysis.apply_switch_int_edge_effects(bb, discr, &mut applier);
 
-                let SwitchIntEdgeEffectApplier {
-                    exit_state, mut propagate, effects_applied, ..
+                let ForwardSwitchIntEdgeEffectsApplier {
+                    exit_state,
+                    mut propagate,
+                    effects_applied,
+                    ..
                 } = applier;
 
                 if !effects_applied {
@@ -512,15 +523,15 @@ impl Direction for Forward {
     }
 }
 
-struct SwitchIntEdgeEffectApplier<'a, D, F> {
-    exit_state: &'a mut D,
-    targets: &'a SwitchTargets,
+struct ForwardSwitchIntEdgeEffectsApplier<'mir, D, F> {
+    exit_state: &'mir mut D,
+    targets: &'mir SwitchTargets,
     propagate: F,
 
     effects_applied: bool,
 }
 
-impl<D, F> super::SwitchIntEdgeEffects<D> for SwitchIntEdgeEffectApplier<'_, D, F>
+impl<D, F> super::SwitchIntEdgeEffects<D> for ForwardSwitchIntEdgeEffectsApplier<'_, D, F>
 where
     D: Clone,
     F: FnMut(BasicBlock, &D),
@@ -552,7 +563,7 @@ where
 //
 // FIXME: Figure out how to express this using `Option::clone_from`, or maybe lift it into the
 // standard library?
-fn opt_clone_from_or_clone<T: Clone>(opt: &'a mut Option<T>, val: &T) -> &'a mut T {
+fn opt_clone_from_or_clone<'a, T: Clone>(opt: &'a mut Option<T>, val: &T) -> &'a mut T {
     if opt.is_some() {
         let ret = opt.as_mut().unwrap();
         ret.clone_from(val);

@@ -1,14 +1,20 @@
 //! Error Reporting for Anonymous Region Lifetime Errors
 //! where one region is named and the other is anonymous.
-use crate::infer::error_reporting::nice_region_error::find_anon_type::find_anon_type;
 use crate::infer::error_reporting::nice_region_error::NiceRegionError;
-use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder};
+use crate::{
+    errors::ExplicitLifetimeRequired,
+    infer::error_reporting::nice_region_error::find_anon_type::find_anon_type,
+};
+use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed};
 use rustc_middle::ty;
+use rustc_span::symbol::kw;
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// When given a `ConcreteFailure` for a function with parameters containing a named region and
     /// an anonymous region, emit an descriptive diagnostic error.
-    pub(super) fn try_report_named_anon_conflict(&self) -> Option<DiagnosticBuilder<'tcx>> {
+    pub(super) fn try_report_named_anon_conflict(
+        &self,
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         let (span, sub, sup) = self.regions()?;
 
         debug!(
@@ -23,32 +29,22 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // version new_ty of its type where the anonymous region is replaced
         // with the named one.
         let (named, anon, anon_param_info, region_info) = if sub.has_name()
-            && self.tcx().is_suitable_region(sup).is_some()
-            && self.find_param_with_region(sup, sub).is_some()
+            && let Some(region_info) = self.tcx().is_suitable_region(sup)
+            && let Some(anon_param_info) = self.find_param_with_region(sup, sub)
         {
-            (
-                sub,
-                sup,
-                self.find_param_with_region(sup, sub).unwrap(),
-                self.tcx().is_suitable_region(sup).unwrap(),
-            )
+            (sub, sup, anon_param_info, region_info)
         } else if sup.has_name()
-            && self.tcx().is_suitable_region(sub).is_some()
-            && self.find_param_with_region(sub, sup).is_some()
+            && let Some(region_info) = self.tcx().is_suitable_region(sub)
+            && let Some(anon_param_info) = self.find_param_with_region(sub, sup)
         {
-            (
-                sup,
-                sub,
-                self.find_param_with_region(sub, sup).unwrap(),
-                self.tcx().is_suitable_region(sub).unwrap(),
-            )
+            (sup, sub, anon_param_info, region_info)
         } else {
             return None; // inapplicable
         };
 
         // Suggesting to add a `'static` lifetime to a parameter is nearly always incorrect,
         // and can steer users down the wrong path.
-        if *named == ty::ReStatic {
+        if named.is_static() {
             return None;
         }
 
@@ -65,7 +61,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         let is_impl_item = region_info.is_impl_item;
 
         match br {
-            ty::BrAnon(_) => {}
+            ty::BrNamed(_, kw::UnderscoreLifetime) | ty::BrAnon => {}
             _ => {
                 /* not an anonymous region */
                 debug!("try_report_named_anon_conflict: not an anonymous region");
@@ -83,31 +79,17 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         {
             return None;
         }
-
-        let (error_var, span_label_var) = match param.pat.simple_ident() {
-            Some(simple_ident) => (
-                format!("the type of `{}`", simple_ident),
-                format!("the type of `{}`", simple_ident),
-            ),
-            None => ("parameter type".to_owned(), "type".to_owned()),
+        let named = named.to_string();
+        let err = match param.pat.simple_ident() {
+            Some(simple_ident) => ExplicitLifetimeRequired::WithIdent {
+                span,
+                simple_ident,
+                named,
+                new_ty_span,
+                new_ty,
+            },
+            None => ExplicitLifetimeRequired::WithParamType { span, named, new_ty_span, new_ty },
         };
-
-        let mut diag = struct_span_err!(
-            self.tcx().sess,
-            span,
-            E0621,
-            "explicit lifetime required in {}",
-            error_var
-        );
-
-        diag.span_label(span, format!("lifetime `{}` required", named));
-        diag.span_suggestion(
-            new_ty_span,
-            &format!("add explicit lifetime `{}` to {}", named, span_label_var),
-            new_ty.to_string(),
-            Applicability::Unspecified,
-        );
-
-        Some(diag)
+        Some(self.tcx().sess.parse_sess.create_err(err))
     }
 }

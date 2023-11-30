@@ -2,14 +2,11 @@ use super::WHILE_IMMUTABLE_CONDITION;
 use clippy_utils::consts::constant;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::usage::mutated_variables;
-use if_chain::if_chain;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
-use rustc_hir::intravisit::{walk_expr, NestedVisitorMap, Visitor};
-use rustc_hir::HirIdSet;
-use rustc_hir::{Expr, ExprKind, QPath};
+use rustc_hir::intravisit::{walk_expr, Visitor};
+use rustc_hir::{Expr, ExprKind, HirIdSet, QPath};
 use rustc_lint::LateContext;
-use rustc_middle::hir::map::Map;
 
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, cond: &'tcx Expr<'_>, expr: &'tcx Expr<'_>) {
     if constant(cx, cx.typeck_results(), cond).is_some() {
@@ -36,7 +33,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, cond: &'tcx Expr<'_>, expr: &'
         } else {
             return;
         };
-    let mutable_static_in_cond = var_visitor.def_ids.iter().any(|(_, v)| *v);
+    let mutable_static_in_cond = var_visitor.def_ids.items().any(|(_, v)| *v);
 
     let mut has_break_or_return_visitor = HasBreakOrReturnVisitor {
         has_break_or_return: false,
@@ -67,8 +64,6 @@ struct HasBreakOrReturnVisitor {
 }
 
 impl<'tcx> Visitor<'tcx> for HasBreakOrReturnVisitor {
-    type Map = Map<'tcx>;
-
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
         if self.has_break_or_return {
             return;
@@ -83,10 +78,6 @@ impl<'tcx> Visitor<'tcx> for HasBreakOrReturnVisitor {
         }
 
         walk_expr(self, expr);
-    }
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
     }
 }
 
@@ -103,28 +94,24 @@ struct VarCollectorVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> VarCollectorVisitor<'a, 'tcx> {
     fn insert_def_id(&mut self, ex: &'tcx Expr<'_>) {
-        if_chain! {
-            if let ExprKind::Path(ref qpath) = ex.kind;
-            if let QPath::Resolved(None, _) = *qpath;
-            then {
-                match self.cx.qpath_res(qpath, ex.hir_id) {
-                    Res::Local(hir_id) => {
-                        self.ids.insert(hir_id);
-                    },
-                    Res::Def(DefKind::Static, def_id) => {
-                        let mutable = self.cx.tcx.is_mutable_static(def_id);
-                        self.def_ids.insert(def_id, mutable);
-                    },
-                    _ => {},
-                }
+        if let ExprKind::Path(ref qpath) = ex.kind
+            && let QPath::Resolved(None, _) = *qpath
+        {
+            match self.cx.qpath_res(qpath, ex.hir_id) {
+                Res::Local(hir_id) => {
+                    self.ids.insert(hir_id);
+                },
+                Res::Def(DefKind::Static(_), def_id) => {
+                    let mutable = self.cx.tcx.is_mutable_static(def_id);
+                    self.def_ids.insert(def_id, mutable);
+                },
+                _ => {},
             }
         }
     }
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for VarCollectorVisitor<'a, 'tcx> {
-    type Map = Map<'tcx>;
-
     fn visit_expr(&mut self, ex: &'tcx Expr<'_>) {
         match ex.kind {
             ExprKind::Path(_) => self.insert_def_id(ex),
@@ -133,9 +120,5 @@ impl<'a, 'tcx> Visitor<'tcx> for VarCollectorVisitor<'a, 'tcx> {
 
             _ => walk_expr(self, ex),
         }
-    }
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
     }
 }

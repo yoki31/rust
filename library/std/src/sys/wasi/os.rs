@@ -1,14 +1,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::any::Any;
 use crate::error::Error as StdError;
-use crate::ffi::{CStr, CString, OsStr, OsString};
+use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::io;
 use crate::marker::PhantomData;
+use crate::ops::Drop;
 use crate::os::wasi::prelude::*;
 use crate::path::{self, PathBuf};
 use crate::str;
+use crate::sys::common::small_c_string::{run_path_with_cstr, run_with_cstr};
 use crate::sys::memchr;
 use crate::sys::unsupported;
 use crate::vec;
@@ -20,13 +21,30 @@ mod libc {
     extern "C" {
         pub fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char;
         pub fn chdir(dir: *const c_char) -> c_int;
+        pub fn __wasilibc_get_environ() -> *mut *mut c_char;
     }
 }
 
-#[cfg(not(target_feature = "atomics"))]
-pub unsafe fn env_lock() -> impl Any {
-    // No need for a lock if we're single-threaded, but this function will need
-    // to get implemented for multi-threaded scenarios
+cfg_if::cfg_if! {
+    if #[cfg(target_feature = "atomics")] {
+        // Access to the environment must be protected by a lock in multi-threaded scenarios.
+        use crate::sync::{PoisonError, RwLock};
+        static ENV_LOCK: RwLock<()> = RwLock::new(());
+        pub fn env_read_lock() -> impl Drop {
+            ENV_LOCK.read().unwrap_or_else(PoisonError::into_inner)
+        }
+        pub fn env_write_lock() -> impl Drop {
+            ENV_LOCK.write().unwrap_or_else(PoisonError::into_inner)
+        }
+    } else {
+        // No need for a lock if we are single-threaded.
+        pub fn env_read_lock() -> impl Drop {
+            Box::new(())
+        }
+        pub fn env_write_lock() -> impl Drop {
+            Box::new(())
+        }
+    }
 }
 
 pub fn errno() -> i32 {
@@ -77,13 +95,10 @@ pub fn getcwd() -> io::Result<PathBuf> {
 }
 
 pub fn chdir(p: &path::Path) -> io::Result<()> {
-    let p: &OsStr = p.as_ref();
-    let p = CString::new(p.as_bytes())?;
-    unsafe {
-        match libc::chdir(p.as_ptr()) == (0 as libc::c_int) {
-            true => Ok(()),
-            false => Err(io::Error::last_os_error()),
-        }
+    let result = run_path_with_cstr(p, |p| unsafe { Ok(libc::chdir(p.as_ptr())) })?;
+    match result == (0 as libc::c_int) {
+        true => Ok(()),
+        false => Err(io::Error::last_os_error()),
     }
 }
 
@@ -127,8 +142,37 @@ impl StdError for JoinPathsError {
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()
 }
+
 pub struct Env {
     iter: vec::IntoIter<(OsString, OsString)>,
+}
+
+// FIXME(https://github.com/rust-lang/rust/issues/114583): Remove this when <OsStr as Debug>::fmt matches <str as Debug>::fmt.
+pub struct EnvStrDebug<'a> {
+    slice: &'a [(OsString, OsString)],
+}
+
+impl fmt::Debug for EnvStrDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { slice } = self;
+        f.debug_list()
+            .entries(slice.iter().map(|(a, b)| (a.to_str().unwrap(), b.to_str().unwrap())))
+            .finish()
+    }
+}
+
+impl Env {
+    pub fn str_debug(&self) -> impl fmt::Debug + '_ {
+        let Self { iter } = self;
+        EnvStrDebug { slice: iter.as_slice() }
+    }
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { iter } = self;
+        f.debug_list().entries(iter.as_slice()).finish()
+    }
 }
 
 impl !Send for Env {}
@@ -146,8 +190,13 @@ impl Iterator for Env {
 
 pub fn env() -> Env {
     unsafe {
-        let _guard = env_lock();
-        let mut environ = libc::environ;
+        let _guard = env_read_lock();
+
+        // Use `__wasilibc_get_environ` instead of `environ` here so that we
+        // don't require wasi-libc to eagerly initialize the environment
+        // variables.
+        let mut environ = libc::__wasilibc_get_environ();
+
         let mut result = Vec::new();
         if !environ.is_null() {
             while !(*environ).is_null() {
@@ -176,35 +225,44 @@ pub fn env() -> Env {
 }
 
 pub fn getenv(k: &OsStr) -> Option<OsString> {
-    let k = CString::new(k.as_bytes()).ok()?;
-    unsafe {
-        let _guard = env_lock();
-        let s = libc::getenv(k.as_ptr()) as *const libc::c_char;
-        if s.is_null() {
-            None
+    // environment variables with a nul byte can't be set, so their value is
+    // always None as well
+    run_with_cstr(k.as_bytes(), |k| {
+        let _guard = env_read_lock();
+        let v = unsafe { libc::getenv(k.as_ptr()) } as *const libc::c_char;
+
+        if v.is_null() {
+            Ok(None)
         } else {
-            Some(OsStringExt::from_vec(CStr::from_ptr(s).to_bytes().to_vec()))
+            // SAFETY: `v` cannot be mutated while executing this line since we've a read lock
+            let bytes = unsafe { CStr::from_ptr(v) }.to_bytes().to_vec();
+
+            Ok(Some(OsStringExt::from_vec(bytes)))
         }
-    }
+    })
+    .ok()
+    .flatten()
 }
 
 pub fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
-    let k = CString::new(k.as_bytes())?;
-    let v = CString::new(v.as_bytes())?;
-
-    unsafe {
-        let _guard = env_lock();
-        cvt(libc::setenv(k.as_ptr(), v.as_ptr(), 1)).map(drop)
-    }
+    run_with_cstr(k.as_bytes(), |k| {
+        run_with_cstr(v.as_bytes(), |v| unsafe {
+            let _guard = env_write_lock();
+            cvt(libc::setenv(k.as_ptr(), v.as_ptr(), 1)).map(drop)
+        })
+    })
 }
 
 pub fn unsetenv(n: &OsStr) -> io::Result<()> {
-    let nbuf = CString::new(n.as_bytes())?;
-
-    unsafe {
-        let _guard = env_lock();
+    run_with_cstr(n.as_bytes(), |nbuf| unsafe {
+        let _guard = env_write_lock();
         cvt(libc::unsetenv(nbuf.as_ptr())).map(drop)
-    }
+    })
+}
+
+#[allow(dead_code)]
+pub fn page_size() -> usize {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
 pub fn temp_dir() -> PathBuf {

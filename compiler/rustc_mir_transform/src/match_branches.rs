@@ -14,7 +14,7 @@ pub struct MatchBranchSimplification;
 ///
 /// For example:
 ///
-/// ```rust
+/// ```ignore (MIR)
 /// bb0: {
 ///     switchInt(move _3) -> [42_isize: bb1, otherwise: bb2];
 /// }
@@ -32,7 +32,7 @@ pub struct MatchBranchSimplification;
 ///
 /// into:
 ///
-/// ```rust
+/// ```ignore (MIR)
 /// bb0: {
 ///    _2 = Eq(move _3, const 42_isize);
 ///    goto -> bb3;
@@ -40,33 +40,37 @@ pub struct MatchBranchSimplification;
 /// ```
 
 impl<'tcx> MirPass<'tcx> for MatchBranchSimplification {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() >= 1
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if tcx.sess.mir_opt_level() < 3 {
-            return;
-        }
-
         let def_id = body.source.def_id();
-        let param_env = tcx.param_env(def_id);
+        let param_env = tcx.param_env_reveal_all_normalized(def_id);
 
-        let (bbs, local_decls) = body.basic_blocks_and_local_decls_mut();
+        let bbs = body.basic_blocks.as_mut();
         let mut should_cleanup = false;
         'outer: for bb_idx in bbs.indices() {
-            if !tcx.consider_optimizing(|| format!("MatchBranchSimplification {:?} ", def_id)) {
+            if !tcx.consider_optimizing(|| format!("MatchBranchSimplification {def_id:?} ")) {
                 continue;
             }
 
-            let (discr, val, switch_ty, first, second) = match bbs[bb_idx].terminator().kind {
+            let (discr, val, first, second) = match bbs[bb_idx].terminator().kind {
                 TerminatorKind::SwitchInt {
                     discr: ref discr @ (Operand::Copy(_) | Operand::Move(_)),
-                    switch_ty,
                     ref targets,
                     ..
                 } if targets.iter().len() == 1 => {
                     let (value, target) = targets.iter().next().unwrap();
-                    if target == targets.otherwise() {
+                    // We require that this block and the two possible target blocks all be
+                    // distinct.
+                    if target == targets.otherwise()
+                        || bb_idx == target
+                        || bb_idx == targets.otherwise()
+                    {
                         continue;
                     }
-                    (discr, value, switch_ty, target, targets.otherwise())
+                    (discr, value, target, targets.otherwise())
                 }
                 // Only optimize switch int statements
                 _ => continue,
@@ -94,10 +98,10 @@ impl<'tcx> MirPass<'tcx> for MatchBranchSimplification {
                         StatementKind::Assign(box (lhs_f, Rvalue::Use(Operand::Constant(f_c)))),
                         StatementKind::Assign(box (lhs_s, Rvalue::Use(Operand::Constant(s_c)))),
                     ) if lhs_f == lhs_s
-                        && f_c.literal.ty().is_bool()
-                        && s_c.literal.ty().is_bool()
-                        && f_c.literal.try_eval_bool(tcx, param_env).is_some()
-                        && s_c.literal.try_eval_bool(tcx, param_env).is_some() => {}
+                        && f_c.const_.ty().is_bool()
+                        && s_c.const_.ty().is_bool()
+                        && f_c.const_.try_eval_bool(tcx, param_env).is_some()
+                        && s_c.const_.try_eval_bool(tcx, param_env).is_some() => {}
 
                     // Otherwise we cannot optimize. Try another block.
                     _ => continue 'outer,
@@ -105,10 +109,11 @@ impl<'tcx> MirPass<'tcx> for MatchBranchSimplification {
             }
             // Take ownership of items now that we know we can optimize.
             let discr = discr.clone();
+            let discr_ty = discr.ty(&body.local_decls, tcx);
 
             // Introduce a temporary for the discriminant value.
             let source_info = bbs[bb_idx].terminator().source_info;
-            let discr_local = local_decls.push(LocalDecl::new(switch_ty, source_info.span));
+            let discr_local = body.local_decls.push(LocalDecl::new(discr_ty, source_info.span));
 
             // We already checked that first and second are different blocks,
             // and bb_idx has a different terminator from both of them.
@@ -123,17 +128,17 @@ impl<'tcx> MirPass<'tcx> for MatchBranchSimplification {
                         StatementKind::Assign(box (_, Rvalue::Use(Operand::Constant(s_c)))),
                     ) => {
                         // From earlier loop we know that we are dealing with bool constants only:
-                        let f_b = f_c.literal.try_eval_bool(tcx, param_env).unwrap();
-                        let s_b = s_c.literal.try_eval_bool(tcx, param_env).unwrap();
+                        let f_b = f_c.const_.try_eval_bool(tcx, param_env).unwrap();
+                        let s_b = s_c.const_.try_eval_bool(tcx, param_env).unwrap();
                         if f_b == s_b {
                             // Same value in both blocks. Use statement as is.
                             (*f).clone()
                         } else {
                             // Different value between blocks. Make value conditional on switch condition.
-                            let size = tcx.layout_of(param_env.and(switch_ty)).unwrap().size;
+                            let size = tcx.layout_of(param_env.and(discr_ty)).unwrap().size;
                             let const_cmp = Operand::const_from_scalar(
                                 tcx,
-                                switch_ty,
+                                discr_ty,
                                 rustc_const_eval::interpret::Scalar::from_uint(val, size),
                                 rustc_span::DUMMY_SP,
                             );

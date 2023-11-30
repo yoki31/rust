@@ -4,16 +4,23 @@ mod double_ended;
 mod exact_size;
 mod iterator;
 mod marker;
+mod unchecked_iterator;
 
-pub use self::accum::{Product, Sum};
-pub use self::collect::{Extend, FromIterator, IntoIterator};
-pub use self::double_ended::DoubleEndedIterator;
-pub use self::exact_size::ExactSizeIterator;
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use self::iterator::Iterator;
+pub use self::{
+    accum::{Product, Sum},
+    collect::{Extend, FromIterator, IntoIterator},
+    double_ended::DoubleEndedIterator,
+    exact_size::ExactSizeIterator,
+    iterator::Iterator,
+    marker::{FusedIterator, TrustedLen},
+};
+
 #[unstable(issue = "none", feature = "inplace_iteration")]
 pub use self::marker::InPlaceIterable;
+#[unstable(issue = "none", feature = "trusted_fused")]
+pub use self::marker::TrustedFused;
 #[unstable(feature = "trusted_step", issue = "85731")]
 pub use self::marker::TrustedStep;
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::marker::{FusedIterator, TrustedLen};
+
+pub(crate) use self::unchecked_iterator::UncheckedIterator;

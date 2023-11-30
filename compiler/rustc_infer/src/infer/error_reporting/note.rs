@@ -1,106 +1,76 @@
-use crate::infer::error_reporting::{note_and_explain_region, ObligationCauseExt};
-use crate::infer::{self, InferCtxt, SubregionOrigin};
-use rustc_errors::{struct_span_err, DiagnosticBuilder};
+use crate::errors::{
+    note_and_explain, FulfillReqLifetime, LfBoundNotSatisfied, OutlivesBound, OutlivesContent,
+    RefLongerThanData, RegionOriginNote, WhereClauseSuggestions,
+};
+use crate::fluent_generated as fluent;
+use crate::infer::error_reporting::{note_and_explain_region, TypeErrCtxt};
+use crate::infer::{self, SubregionOrigin};
+use rustc_errors::{
+    AddToDiagnostic, Diagnostic, DiagnosticBuilder, ErrorGuaranteed, IntoDiagnostic,
+};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, Region};
+use rustc_middle::ty::{self, IsSuggestable, Region, Ty};
+use rustc_span::symbol::kw;
 
-impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
-    pub(super) fn note_region_origin(
-        &self,
-        err: &mut DiagnosticBuilder<'_>,
-        origin: &SubregionOrigin<'tcx>,
-    ) {
-        let mut label_or_note = |span, msg| {
-            let sub_count = err.children.iter().filter(|d| d.span.is_dummy()).count();
-            let expanded_sub_count = err.children.iter().filter(|d| !d.span.is_dummy()).count();
-            let span_is_primary = err.span.primary_spans().iter().all(|&sp| sp == span);
-            if span_is_primary && sub_count == 0 && expanded_sub_count == 0 {
-                err.span_label(span, msg);
-            } else if span_is_primary && expanded_sub_count == 0 {
-                err.note(msg);
-            } else {
-                err.span_note(span, msg);
-            }
-        };
+use super::ObligationCauseAsDiagArg;
+
+impl<'tcx> TypeErrCtxt<'_, 'tcx> {
+    pub(super) fn note_region_origin(&self, err: &mut Diagnostic, origin: &SubregionOrigin<'tcx>) {
         match *origin {
-            infer::Subtype(ref trace) => {
-                if let Some((expected, found)) = self.values_str(trace.values) {
-                    label_or_note(
-                        trace.cause.span,
-                        &format!("...so that the {}", trace.cause.as_requirement_str()),
-                    );
-
-                    err.note_expected_found(&"", expected, &"", found);
-                } else {
-                    // FIXME: this really should be handled at some earlier stage. Our
-                    // handling of region checking when type errors are present is
-                    // *terrible*.
-
-                    label_or_note(
-                        trace.cause.span,
-                        &format!("...so that {}", trace.cause.as_requirement_str()),
-                    );
-                }
+            infer::Subtype(ref trace) => RegionOriginNote::WithRequirement {
+                span: trace.cause.span,
+                requirement: ObligationCauseAsDiagArg(trace.cause.clone()),
+                expected_found: self.values_str(trace.values).map(|(e, f, _, _)| (e, f)),
             }
+            .add_to_diagnostic(err),
             infer::Reborrow(span) => {
-                label_or_note(span, "...so that reference does not outlive borrowed content");
-            }
-            infer::ReborrowUpvar(span, ref upvar_id) => {
-                let var_name = self.tcx.hir().name(upvar_id.var_path.hir_id);
-                label_or_note(span, &format!("...so that closure can access `{}`", var_name));
+                RegionOriginNote::Plain { span, msg: fluent::infer_reborrow }.add_to_diagnostic(err)
             }
             infer::RelateObjectBound(span) => {
-                label_or_note(span, "...so that it can be closed over into an object");
-            }
-            infer::DataBorrowed(ty, span) => {
-                label_or_note(
-                    span,
-                    &format!(
-                        "...so that the type `{}` is not borrowed for too long",
-                        self.ty_to_string(ty)
-                    ),
-                );
+                RegionOriginNote::Plain { span, msg: fluent::infer_relate_object_bound }
+                    .add_to_diagnostic(err);
             }
             infer::ReferenceOutlivesReferent(ty, span) => {
-                label_or_note(
+                RegionOriginNote::WithName {
                     span,
-                    &format!(
-                        "...so that the reference type `{}` does not outlive the data it points at",
-                        self.ty_to_string(ty)
-                    ),
-                );
+                    msg: fluent::infer_reference_outlives_referent,
+                    name: &self.ty_to_string(ty),
+                    continues: false,
+                }
+                .add_to_diagnostic(err);
             }
-            infer::RelateParamBound(span, t, opt_span) => {
-                label_or_note(
+            infer::RelateParamBound(span, ty, opt_span) => {
+                RegionOriginNote::WithName {
                     span,
-                    &format!(
-                        "...so that the type `{}` will meet its required lifetime bounds{}",
-                        self.ty_to_string(t),
-                        if opt_span.is_some() { "..." } else { "" },
-                    ),
-                );
+                    msg: fluent::infer_relate_param_bound,
+                    name: &self.ty_to_string(ty),
+                    continues: opt_span.is_some(),
+                }
+                .add_to_diagnostic(err);
                 if let Some(span) = opt_span {
-                    err.span_note(span, "...that is required by this bound");
+                    RegionOriginNote::Plain { span, msg: fluent::infer_relate_param_bound_2 }
+                        .add_to_diagnostic(err);
                 }
             }
             infer::RelateRegionParamBound(span) => {
-                label_or_note(
-                    span,
-                    "...so that the declared lifetime parameter bounds are satisfied",
-                );
+                RegionOriginNote::Plain { span, msg: fluent::infer_relate_region_param_bound }
+                    .add_to_diagnostic(err);
             }
-            infer::CompareImplMethodObligation { span, .. } => {
-                label_or_note(
-                    span,
-                    "...so that the definition in impl matches the definition from the trait",
-                );
+            infer::CompareImplItemObligation { span, .. } => {
+                RegionOriginNote::Plain { span, msg: fluent::infer_compare_impl_item_obligation }
+                    .add_to_diagnostic(err);
             }
-            infer::CompareImplTypeObligation { span, .. } => {
-                label_or_note(
+            infer::CheckAssociatedTypeBounds { ref parent, .. } => {
+                self.note_region_origin(err, parent);
+            }
+            infer::AscribeUserTypeProvePredicate(span) => {
+                RegionOriginNote::Plain {
                     span,
-                    "...so that the definition in impl matches the definition from the trait",
-                );
+                    msg: fluent::infer_ascribe_user_type_prove_predicate,
+                }
+                .add_to_diagnostic(err);
             }
         }
     }
@@ -110,12 +80,12 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> DiagnosticBuilder<'tcx> {
-        match origin {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+        let mut err = match origin {
             infer::Subtype(box trace) => {
                 let terr = TypeError::RegionsDoesNotOutlive(sup, sub);
-                let mut err = self.report_and_explain_type_error(trace, &terr);
-                match (sub, sup) {
+                let mut err = self.report_and_explain_type_error(trace, terr);
+                match (*sub, *sup) {
                     (ty::RePlaceholder(_), ty::RePlaceholder(_)) => {}
                     (ty::RePlaceholder(_), _) => {
                         note_and_explain_region(
@@ -152,200 +122,231 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                 err
             }
             infer::Reborrow(span) => {
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
-                    span,
-                    E0312,
-                    "lifetime of reference outlives lifetime of borrowed content..."
-                );
-                note_and_explain_region(
+                let reference_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
-                    &mut err,
-                    "...the reference is valid for ",
                     sub,
-                    "...",
                     None,
+                    note_and_explain::PrefixKind::RefValidFor,
+                    note_and_explain::SuffixKind::Continues,
                 );
-                note_and_explain_region(
+                let content_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
-                    &mut err,
-                    "...but the borrowed content is only valid for ",
                     sup,
-                    "",
                     None,
+                    note_and_explain::PrefixKind::ContentValidFor,
+                    note_and_explain::SuffixKind::Empty,
                 );
-                err
-            }
-            infer::ReborrowUpvar(span, ref upvar_id) => {
-                let var_name = self.tcx.hir().name(upvar_id.var_path.hir_id);
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
+                OutlivesContent {
                     span,
-                    E0313,
-                    "lifetime of borrowed pointer outlives lifetime of captured variable `{}`...",
-                    var_name
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "...the borrowed pointer is valid for ",
-                    sub,
-                    "...",
-                    None,
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    &format!("...but `{}` is only valid for ", var_name),
-                    sup,
-                    "",
-                    None,
-                );
-                err
+                    notes: reference_valid.into_iter().chain(content_valid).collect(),
+                }
+                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
             }
             infer::RelateObjectBound(span) => {
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
-                    span,
-                    E0476,
-                    "lifetime of the source pointer does not outlive lifetime bound of the \
-                     object type"
-                );
-                note_and_explain_region(
+                let object_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
-                    &mut err,
-                    "object type is valid for ",
                     sub,
-                    "",
                     None,
+                    note_and_explain::PrefixKind::TypeObjValidFor,
+                    note_and_explain::SuffixKind::Empty,
                 );
-                note_and_explain_region(
+                let pointer_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
-                    &mut err,
-                    "source pointer is only valid for ",
                     sup,
-                    "",
                     None,
+                    note_and_explain::PrefixKind::SourcePointerValidFor,
+                    note_and_explain::SuffixKind::Empty,
                 );
-                err
+                OutlivesBound {
+                    span,
+                    notes: object_valid.into_iter().chain(pointer_valid).collect(),
+                }
+                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
             }
             infer::RelateParamBound(span, ty, opt_span) => {
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
-                    span,
-                    E0477,
-                    "the type `{}` does not fulfill the required lifetime",
-                    self.ty_to_string(ty)
+                let prefix = match *sub {
+                    ty::ReStatic => note_and_explain::PrefixKind::TypeSatisfy,
+                    _ => note_and_explain::PrefixKind::TypeOutlive,
+                };
+                let suffix = if opt_span.is_some() {
+                    note_and_explain::SuffixKind::ReqByBinding
+                } else {
+                    note_and_explain::SuffixKind::Empty
+                };
+                let note = note_and_explain::RegionExplanation::new(
+                    self.tcx, sub, opt_span, prefix, suffix,
                 );
-                match *sub {
-                    ty::ReStatic => note_and_explain_region(
-                        self.tcx,
+                FulfillReqLifetime { span, ty: self.resolve_vars_if_possible(ty), note }
+                    .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+            }
+            infer::RelateRegionParamBound(span) => {
+                let param_instantiated = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sup,
+                    None,
+                    note_and_explain::PrefixKind::LfParamInstantiatedWith,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                let param_must_outlive = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sub,
+                    None,
+                    note_and_explain::PrefixKind::LfParamMustOutlive,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                LfBoundNotSatisfied {
+                    span,
+                    notes: param_instantiated.into_iter().chain(param_must_outlive).collect(),
+                }
+                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+            }
+            infer::ReferenceOutlivesReferent(ty, span) => {
+                let pointer_valid = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sub,
+                    None,
+                    note_and_explain::PrefixKind::PointerValidFor,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                let data_valid = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sup,
+                    None,
+                    note_and_explain::PrefixKind::DataValidFor,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                RefLongerThanData {
+                    span,
+                    ty: self.resolve_vars_if_possible(ty),
+                    notes: pointer_valid.into_iter().chain(data_valid).collect(),
+                }
+                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+            }
+            infer::CompareImplItemObligation { span, impl_item_def_id, trait_item_def_id } => {
+                let mut err = self.report_extra_impl_obligation(
+                    span,
+                    impl_item_def_id,
+                    trait_item_def_id,
+                    &format!("`{sup}: {sub}`"),
+                );
+                // We should only suggest rewriting the `where` clause if the predicate is within that `where` clause
+                if let Some(generics) = self.tcx.hir().get_generics(impl_item_def_id)
+                    && generics.where_clause_span.contains(span)
+                {
+                    self.suggest_copy_trait_method_bounds(
+                        trait_item_def_id,
+                        impl_item_def_id,
                         &mut err,
-                        "type must satisfy ",
-                        sub,
-                        if opt_span.is_some() { " as required by this binding" } else { "" },
-                        opt_span,
-                    ),
-                    _ => note_and_explain_region(
-                        self.tcx,
-                        &mut err,
-                        "type must outlive ",
-                        sub,
-                        if opt_span.is_some() { " as required by this binding" } else { "" },
-                        opt_span,
-                    ),
+                    );
                 }
                 err
             }
-            infer::RelateRegionParamBound(span) => {
-                let mut err =
-                    struct_span_err!(self.tcx.sess, span, E0478, "lifetime bound not satisfied");
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "lifetime parameter instantiated with ",
-                    sup,
-                    "",
-                    None,
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "but lifetime parameter must outlive ",
-                    sub,
-                    "",
-                    None,
-                );
-                err
-            }
-            infer::DataBorrowed(ty, span) => {
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
-                    span,
-                    E0490,
-                    "a value of type `{}` is borrowed for too long",
-                    self.ty_to_string(ty)
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "the type is valid for ",
-                    sub,
-                    "",
-                    None,
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "but the borrow lasts for ",
-                    sup,
-                    "",
-                    None,
-                );
-                err
-            }
-            infer::ReferenceOutlivesReferent(ty, span) => {
-                let mut err = struct_span_err!(
-                    self.tcx.sess,
-                    span,
-                    E0491,
-                    "in type `{}`, reference has a longer lifetime than the data it references",
-                    self.ty_to_string(ty)
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "the pointer is valid for ",
-                    sub,
-                    "",
-                    None,
-                );
-                note_and_explain_region(
-                    self.tcx,
-                    &mut err,
-                    "but the referenced data is only valid for ",
-                    sup,
-                    "",
-                    None,
-                );
-                err
-            }
-            infer::CompareImplMethodObligation { span, impl_item_def_id, trait_item_def_id } => {
-                self.report_extra_impl_obligation(
-                    span,
-                    impl_item_def_id,
+            infer::CheckAssociatedTypeBounds { impl_item_def_id, trait_item_def_id, parent } => {
+                let mut err = self.report_concrete_failure(*parent, sub, sup);
+
+                // Don't mention the item name if it's an RPITIT, since that'll just confuse
+                // folks.
+                if !self.tcx.is_impl_trait_in_trait(impl_item_def_id.to_def_id()) {
+                    let trait_item_span = self.tcx.def_span(trait_item_def_id);
+                    let item_name = self.tcx.item_name(impl_item_def_id.to_def_id());
+                    err.span_label(
+                        trait_item_span,
+                        format!("definition of `{item_name}` from trait"),
+                    );
+                }
+
+                self.suggest_copy_trait_method_bounds(
                     trait_item_def_id,
-                    &format!("`{}: {}`", sup, sub),
-                )
-            }
-            infer::CompareImplTypeObligation { span, impl_item_def_id, trait_item_def_id } => self
-                .report_extra_impl_obligation(
-                    span,
                     impl_item_def_id,
-                    trait_item_def_id,
-                    &format!("`{}: {}`", sup, sub),
-                ),
+                    &mut err,
+                );
+                err
+            }
+            infer::AscribeUserTypeProvePredicate(span) => {
+                let instantiated = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sup,
+                    None,
+                    note_and_explain::PrefixKind::LfInstantiatedWith,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                let must_outlive = note_and_explain::RegionExplanation::new(
+                    self.tcx,
+                    sub,
+                    None,
+                    note_and_explain::PrefixKind::LfMustOutlive,
+                    note_and_explain::SuffixKind::Empty,
+                );
+                LfBoundNotSatisfied {
+                    span,
+                    notes: instantiated.into_iter().chain(must_outlive).collect(),
+                }
+                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+            }
+        };
+        if sub.is_error() || sup.is_error() {
+            err.delay_as_bug();
         }
+        err
+    }
+
+    pub fn suggest_copy_trait_method_bounds(
+        &self,
+        trait_item_def_id: DefId,
+        impl_item_def_id: LocalDefId,
+        err: &mut Diagnostic,
+    ) {
+        // FIXME(compiler-errors): Right now this is only being used for region
+        // predicate mismatches. Ideally, we'd use it for *all* predicate mismatches,
+        // but right now it's not really very smart when it comes to implicit `Sized`
+        // predicates and bounds on the trait itself.
+
+        let Some(impl_def_id) = self.tcx.associated_item(impl_item_def_id).impl_container(self.tcx)
+        else {
+            return;
+        };
+        let Some(trait_ref) = self.tcx.impl_trait_ref(impl_def_id) else {
+            return;
+        };
+        let trait_args = trait_ref
+            .instantiate_identity()
+            // Replace the explicit self type with `Self` for better suggestion rendering
+            .with_self_ty(self.tcx, Ty::new_param(self.tcx, 0, kw::SelfUpper))
+            .args;
+        let trait_item_args = ty::GenericArgs::identity_for_item(self.tcx, impl_item_def_id)
+            .rebase_onto(self.tcx, impl_def_id, trait_args);
+
+        let Ok(trait_predicates) =
+            self.tcx
+                .explicit_predicates_of(trait_item_def_id)
+                .instantiate_own(self.tcx, trait_item_args)
+                .map(|(pred, _)| {
+                    if pred.is_suggestable(self.tcx, false) {
+                        Ok(pred.to_string())
+                    } else {
+                        Err(())
+                    }
+                })
+                .collect::<Result<Vec<_>, ()>>()
+        else {
+            return;
+        };
+
+        let Some(generics) = self.tcx.hir().get_generics(impl_item_def_id) else {
+            return;
+        };
+
+        let suggestion = if trait_predicates.is_empty() {
+            WhereClauseSuggestions::Remove { span: generics.where_clause_span }
+        } else {
+            let space = if generics.where_clause_span.is_empty() { " " } else { "" };
+            WhereClauseSuggestions::CopyPredicates {
+                span: generics.where_clause_span,
+                space,
+                trait_predicates: trait_predicates.join(", "),
+            }
+        };
+        err.subdiagnostic(suggestion);
     }
 
     pub(super) fn report_placeholder_failure(
@@ -353,19 +354,21 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         placeholder_origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> DiagnosticBuilder<'tcx> {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         // I can't think how to do better than this right now. -nikomatsakis
         debug!(?placeholder_origin, ?sub, ?sup, "report_placeholder_failure");
         match placeholder_origin {
             infer::Subtype(box ref trace)
                 if matches!(
-                    &trace.cause.code.peel_derives(),
+                    &trace.cause.code().peel_derives(),
                     ObligationCauseCode::BindingObligation(..)
+                        | ObligationCauseCode::ExprBindingObligation(..)
                 ) =>
             {
                 // Hack to get around the borrow checker because trace.cause has an `Rc`.
-                if let ObligationCauseCode::BindingObligation(_, span) =
-                    &trace.cause.code.peel_derives()
+                if let ObligationCauseCode::BindingObligation(_, span)
+                | ObligationCauseCode::ExprBindingObligation(_, span, ..) =
+                    &trace.cause.code().peel_derives()
                 {
                     let span = *span;
                     let mut err = self.report_concrete_failure(placeholder_origin, sub, sup);
@@ -377,7 +380,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             }
             infer::Subtype(box trace) => {
                 let terr = TypeError::RegionsPlaceholderMismatch;
-                return self.report_and_explain_type_error(trace, &terr);
+                return self.report_and_explain_type_error(trace, terr);
             }
             _ => return self.report_concrete_failure(placeholder_origin, sub, sup),
         }

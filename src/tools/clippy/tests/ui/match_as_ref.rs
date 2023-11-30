@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![allow(unused)]
 #![warn(clippy::match_as_ref)]
 
@@ -18,7 +16,9 @@ fn match_as_ref() {
 }
 
 mod issue4437 {
-    use std::{error::Error, fmt, num::ParseIntError};
+    use std::error::Error;
+    use std::fmt;
+    use std::num::ParseIntError;
 
     #[derive(Debug)]
     struct E {
@@ -41,4 +41,12 @@ mod issue4437 {
     }
 }
 
-fn main() {}
+fn main() {
+    // Don't lint
+    let _ = match Some(0) {
+        #[cfg(feature = "foo")]
+        Some(ref x) if *x > 50 => None,
+        Some(ref x) => Some(x),
+        None => None,
+    };
+}

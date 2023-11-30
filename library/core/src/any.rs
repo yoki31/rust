@@ -1,5 +1,6 @@
-//! This module implements the `Any` trait, which enables dynamic typing
-//! of any `'static` type through runtime reflection.
+//! Utilities for dynamic typing or type reflection.
+//!
+//! # `Any` and `TypeId`
 //!
 //! `Any` itself can be used to get a `TypeId`, and has more features when used
 //! as a trait object. As `&dyn Any` (a borrowed trait object), it has the `is`
@@ -37,7 +38,7 @@
 //! assert_eq!(boxed_id, TypeId::of::<Box<dyn Any>>());
 //! ```
 //!
-//! # Examples
+//! ## Examples
 //!
 //! Consider a situation where we want to log out a value passed to a function.
 //! We know the value we're working on implements Debug, but we don't know its
@@ -55,14 +56,14 @@
 //!     let value_any = value as &dyn Any;
 //!
 //!     // Try to convert our value to a `String`. If successful, we want to
-//!     // output the String`'s length as well as its value. If not, it's a
+//!     // output the `String`'s length as well as its value. If not, it's a
 //!     // different type: just print it out unadorned.
 //!     match value_any.downcast_ref::<String>() {
 //!         Some(as_string) => {
 //!             println!("String ({}): {}", as_string.len(), as_string);
 //!         }
 //!         None => {
-//!             println!("{:?}", value);
+//!             println!("{value:?}");
 //!         }
 //!     }
 //! }
@@ -81,10 +82,12 @@
 //!     do_work(&my_i8);
 //! }
 //! ```
+//!
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::fmt;
+use crate::hash;
 use crate::intrinsics;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -111,6 +114,11 @@ use crate::intrinsics;
 #[cfg_attr(not(test), rustc_diagnostic_item = "Any")]
 pub trait Any: 'static {
     /// Gets the `TypeId` of `self`.
+    ///
+    /// If called on a `dyn Any` trait object
+    /// (or a trait object of a subtrait of `Any`),
+    /// this returns the `TypeId` of the underlying
+    /// concrete type, not that of `dyn Any` itself.
     ///
     /// # Examples
     ///
@@ -164,7 +172,7 @@ impl fmt::Debug for dyn Any + Send + Sync {
 }
 
 impl dyn Any {
-    /// Returns `true` if the boxed type is the same as `T`.
+    /// Returns `true` if the inner type is the same as `T`.
     ///
     /// # Examples
     ///
@@ -195,7 +203,7 @@ impl dyn Any {
         t == concrete
     }
 
-    /// Returns some reference to the boxed value if it is of type `T`, or
+    /// Returns some reference to the inner value if it is of type `T`, or
     /// `None` if it isn't.
     ///
     /// # Examples
@@ -221,13 +229,13 @@ impl dyn Any {
             // SAFETY: just checked whether we are pointing to the correct type, and we can rely on
             // that check for memory safety because we have implemented Any for all types; no other
             // impls can exist as they would conflict with our impl.
-            unsafe { Some(&*(self as *const dyn Any as *const T)) }
+            unsafe { Some(self.downcast_ref_unchecked()) }
         } else {
             None
         }
     }
 
-    /// Returns some mutable reference to the boxed value if it is of type `T`, or
+    /// Returns some mutable reference to the inner value if it is of type `T`, or
     /// `None` if it isn't.
     ///
     /// # Examples
@@ -257,15 +265,73 @@ impl dyn Any {
             // SAFETY: just checked whether we are pointing to the correct type, and we can rely on
             // that check for memory safety because we have implemented Any for all types; no other
             // impls can exist as they would conflict with our impl.
-            unsafe { Some(&mut *(self as *mut dyn Any as *mut T)) }
+            unsafe { Some(self.downcast_mut_unchecked()) }
         } else {
             None
         }
     }
+
+    /// Returns a reference to the inner value as type `dyn T`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     assert_eq!(*x.downcast_ref_unchecked::<usize>(), 1);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
+        debug_assert!(self.is::<T>());
+        // SAFETY: caller guarantees that T is the correct type
+        unsafe { &*(self as *const dyn Any as *const T) }
+    }
+
+    /// Returns a mutable reference to the inner value as type `dyn T`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let mut x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     *x.downcast_mut_unchecked::<usize>() += 1;
+    /// }
+    ///
+    /// assert_eq!(*x.downcast_ref::<usize>().unwrap(), 2);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The contained value must be of type `T`. Calling this method
+    /// with the incorrect type is *undefined behavior*.
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
+        debug_assert!(self.is::<T>());
+        // SAFETY: caller guarantees that T is the correct type
+        unsafe { &mut *(self as *mut dyn Any as *mut T) }
+    }
 }
 
 impl dyn Any + Send {
-    /// Forwards to the method defined on the type `Any`.
+    /// Forwards to the method defined on the type `dyn Any`.
     ///
     /// # Examples
     ///
@@ -289,7 +355,7 @@ impl dyn Any + Send {
         <dyn Any>::is::<T>(self)
     }
 
-    /// Forwards to the method defined on the type `Any`.
+    /// Forwards to the method defined on the type `dyn Any`.
     ///
     /// # Examples
     ///
@@ -313,7 +379,7 @@ impl dyn Any + Send {
         <dyn Any>::downcast_ref::<T>(self)
     }
 
-    /// Forwards to the method defined on the type `Any`.
+    /// Forwards to the method defined on the type `dyn Any`.
     ///
     /// # Examples
     ///
@@ -339,6 +405,60 @@ impl dyn Any + Send {
     #[inline]
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
         <dyn Any>::downcast_mut::<T>(self)
+    }
+
+    /// Forwards to the method defined on the type `dyn Any`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     assert_eq!(*x.downcast_ref_unchecked::<usize>(), 1);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Same as the method on the type `dyn Any`.
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
+        // SAFETY: guaranteed by caller
+        unsafe { <dyn Any>::downcast_ref_unchecked::<T>(self) }
+    }
+
+    /// Forwards to the method defined on the type `dyn Any`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let mut x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     *x.downcast_mut_unchecked::<usize>() += 1;
+    /// }
+    ///
+    /// assert_eq!(*x.downcast_ref::<usize>().unwrap(), 2);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Same as the method on the type `dyn Any`.
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
+        // SAFETY: guaranteed by caller
+        unsafe { <dyn Any>::downcast_mut_unchecked::<T>(self) }
     }
 }
 
@@ -418,6 +538,52 @@ impl dyn Any + Send + Sync {
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
         <dyn Any>::downcast_mut::<T>(self)
     }
+
+    /// Forwards to the method defined on the type `Any`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     assert_eq!(*x.downcast_ref_unchecked::<usize>(), 1);
+    /// }
+    /// ```
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
+        // SAFETY: guaranteed by caller
+        unsafe { <dyn Any>::downcast_ref_unchecked::<T>(self) }
+    }
+
+    /// Forwards to the method defined on the type `Any`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(downcast_unchecked)]
+    ///
+    /// use std::any::Any;
+    ///
+    /// let mut x: Box<dyn Any> = Box::new(1_usize);
+    ///
+    /// unsafe {
+    ///     *x.downcast_mut_unchecked::<usize>() += 1;
+    /// }
+    ///
+    /// assert_eq!(*x.downcast_ref::<usize>().unwrap(), 2);
+    /// ```
+    #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[inline]
+    pub unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
+        // SAFETY: guaranteed by caller
+        unsafe { <dyn Any>::downcast_mut_unchecked::<T>(self) }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -436,10 +602,18 @@ impl dyn Any + Send + Sync {
 /// While `TypeId` implements `Hash`, `PartialOrd`, and `Ord`, it is worth
 /// noting that the hashes and ordering will vary between Rust releases. Beware
 /// of relying on them inside of your code!
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct TypeId {
-    t: u64,
+    t: u128,
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl PartialEq for TypeId {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.t == other.t
+    }
 }
 
 impl TypeId {
@@ -462,7 +636,28 @@ impl TypeId {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_type_id", issue = "77125")]
     pub const fn of<T: ?Sized + 'static>() -> TypeId {
-        TypeId { t: intrinsics::type_id::<T>() }
+        let t: u128 = intrinsics::type_id::<T>();
+        TypeId { t }
+    }
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl hash::Hash for TypeId {
+    #[inline]
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        // We only hash the lower 64 bits of our (128 bit) internal numeric ID,
+        // because:
+        // - The hashing algorithm which backs `TypeId` is expected to be
+        //   unbiased and high quality, meaning further mixing would be somewhat
+        //   redundant compared to choosing (the lower) 64 bits arbitrarily.
+        // - `Hasher::finish` returns a u64 anyway, so the extra entropy we'd
+        //   get from hashing the full value would probably not be useful
+        //   (especially given the previous point about the lower 64 bits being
+        //   high quality on their own).
+        // - It is correct to do so -- only hashing a subset of `self` is still
+        //   with an `Eq` implementation that considers the entire value, as
+        //   ours does.
+        (self.t as u64).hash(state);
     }
 }
 

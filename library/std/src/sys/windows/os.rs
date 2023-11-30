@@ -17,18 +17,14 @@ use crate::ptr;
 use crate::slice;
 use crate::sys::{c, cvt};
 
-use super::to_u16s;
+use super::{api, to_u16s};
 
 pub fn errno() -> i32 {
-    unsafe { c::GetLastError() as i32 }
+    api::get_last_error().code as i32
 }
 
 /// Gets a detailed string description for the given error number.
 pub fn error_string(mut errnum: i32) -> String {
-    // This value is calculated from the macro
-    // MAKELANGID(LANG_SYSTEM_DEFAULT, SUBLANG_SYS_DEFAULT)
-    let langId = 0x0800 as c::DWORD;
-
     let mut buf = [0 as c::WCHAR; 2048];
 
     unsafe {
@@ -56,15 +52,15 @@ pub fn error_string(mut errnum: i32) -> String {
             flags | c::FORMAT_MESSAGE_FROM_SYSTEM | c::FORMAT_MESSAGE_IGNORE_INSERTS,
             module,
             errnum as c::DWORD,
-            langId,
+            0,
             buf.as_mut_ptr(),
             buf.len() as c::DWORD,
             ptr::null(),
         ) as usize;
         if res == 0 {
-            // Sometimes FormatMessageW can fail e.g., system doesn't like langId,
+            // Sometimes FormatMessageW can fail e.g., system doesn't like 0 as langId,
             let fm_err = errno();
-            return format!("OS Error {} (FormatMessageW() returned error {})", errnum, fm_err);
+            return format!("OS Error {errnum} (FormatMessageW() returned error {fm_err})");
         }
 
         match String::from_utf16(&buf[..res]) {
@@ -85,25 +81,69 @@ pub fn error_string(mut errnum: i32) -> String {
 
 pub struct Env {
     base: c::LPWCH,
-    cur: c::LPWCH,
+    iter: EnvIterator,
+}
+
+// FIXME(https://github.com/rust-lang/rust/issues/114583): Remove this when <OsStr as Debug>::fmt matches <str as Debug>::fmt.
+pub struct EnvStrDebug<'a> {
+    iter: &'a EnvIterator,
+}
+
+impl fmt::Debug for EnvStrDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { iter } = self;
+        let iter: EnvIterator = (*iter).clone();
+        let mut list = f.debug_list();
+        for (a, b) in iter {
+            list.entry(&(a.to_str().unwrap(), b.to_str().unwrap()));
+        }
+        list.finish()
+    }
+}
+
+impl Env {
+    pub fn str_debug(&self) -> impl fmt::Debug + '_ {
+        let Self { base: _, iter } = self;
+        EnvStrDebug { iter }
+    }
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { base: _, iter } = self;
+        f.debug_list().entries(iter.clone()).finish()
+    }
 }
 
 impl Iterator for Env {
     type Item = (OsString, OsString);
 
     fn next(&mut self) -> Option<(OsString, OsString)> {
+        let Self { base: _, iter } = self;
+        iter.next()
+    }
+}
+
+#[derive(Clone)]
+struct EnvIterator(c::LPWCH);
+
+impl Iterator for EnvIterator {
+    type Item = (OsString, OsString);
+
+    fn next(&mut self) -> Option<(OsString, OsString)> {
+        let Self(cur) = self;
         loop {
             unsafe {
-                if *self.cur == 0 {
+                if **cur == 0 {
                     return None;
                 }
-                let p = self.cur as *const u16;
+                let p = *cur as *const u16;
                 let mut len = 0;
-                while *p.offset(len) != 0 {
+                while *p.add(len) != 0 {
                     len += 1;
                 }
-                let s = slice::from_raw_parts(p, len as usize);
-                self.cur = self.cur.offset(len + 1);
+                let s = slice::from_raw_parts(p, len);
+                *cur = cur.add(len + 1);
 
                 // Windows allows environment variables to start with an equals
                 // symbol (in any other position, this is the separator between
@@ -134,10 +174,10 @@ impl Drop for Env {
 pub fn env() -> Env {
     unsafe {
         let ch = c::GetEnvironmentStringsW();
-        if ch as usize == 0 {
+        if ch.is_null() {
             panic!("failure getting env string from OS: {}", io::Error::last_os_error());
         }
-        Env { base: ch, cur: ch }
+        Env { base: ch, iter: EnvIterator(ch) }
     }
 }
 
@@ -157,7 +197,7 @@ impl<'a> Iterator for SplitPaths<'a> {
         // Double quotes are used as a way of introducing literal semicolons
         // (since c:\some;dir is a valid Windows path). Double quotes are not
         // themselves permitted in path names, so there is no way to escape a
-        // double quote.  Quoted regions can appear in arbitrary locations, so
+        // double quote. Quoted regions can appear in arbitrary locations, so
         //
         //   c:\foo;c:\som"e;di"r;c:\bar
         //
@@ -257,7 +297,7 @@ pub fn getenv(k: &OsStr) -> Option<OsString> {
     let k = to_u16s(k).ok()?;
     super::fill_utf16_buf(
         |buf, sz| unsafe { c::GetEnvironmentVariableW(k.as_ptr(), buf, sz) },
-        |buf| OsStringExt::from_wide(buf),
+        OsStringExt::from_wide,
     )
     .ok()
 }
@@ -275,7 +315,7 @@ pub fn unsetenv(n: &OsStr) -> io::Result<()> {
 }
 
 pub fn temp_dir() -> PathBuf {
-    super::fill_utf16_buf(|buf, sz| unsafe { c::GetTempPathW(sz, buf) }, super::os2path).unwrap()
+    super::fill_utf16_buf(|buf, sz| unsafe { c::GetTempPath2W(sz, buf) }, super::os2path).unwrap()
 }
 
 #[cfg(not(target_vendor = "uwp"))]
@@ -296,7 +336,7 @@ fn home_dir_crt() -> Option<PathBuf> {
         super::fill_utf16_buf(
             |buf, mut sz| {
                 match c::GetUserProfileDirectoryW(token, buf, &mut sz) {
-                    0 if c::GetLastError() != c::ERROR_INSUFFICIENT_BUFFER => 0,
+                    0 if api::get_last_error().code != c::ERROR_INSUFFICIENT_BUFFER => 0,
                     0 => sz,
                     _ => sz - 1, // sz includes the null terminator
                 }
@@ -316,7 +356,7 @@ pub fn home_dir() -> Option<PathBuf> {
     crate::env::var_os("HOME")
         .or_else(|| crate::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .or_else(|| home_dir_crt())
+        .or_else(home_dir_crt)
 }
 
 pub fn exit(code: i32) -> ! {
@@ -324,5 +364,5 @@ pub fn exit(code: i32) -> ! {
 }
 
 pub fn getpid() -> u32 {
-    unsafe { c::GetCurrentProcessId() as u32 }
+    unsafe { c::GetCurrentProcessId() }
 }

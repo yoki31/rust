@@ -1,10 +1,9 @@
 //! A pass that eliminates branches on uninhabited enum variants.
 
 use crate::MirPass;
-use rustc_data_structures::stable_set::FxHashSet;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, Local, Operand, Rvalue, StatementKind, SwitchTargets,
-    TerminatorKind,
+    BasicBlockData, Body, Local, Operand, Rvalue, StatementKind, Terminator, TerminatorKind,
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{Ty, TyCtxt};
@@ -30,18 +29,16 @@ fn get_switched_on_type<'tcx>(
     let terminator = block_data.terminator();
 
     // Only bother checking blocks which terminate by switching on a local.
-    if let Some(local) = get_discriminant_local(&terminator.kind) {
-        let stmt_before_term = (!block_data.statements.is_empty())
-            .then(|| &block_data.statements[block_data.statements.len() - 1].kind);
+    let local = get_discriminant_local(&terminator.kind)?;
 
-        if let Some(StatementKind::Assign(box (l, Rvalue::Discriminant(place)))) = stmt_before_term
-        {
-            if l.as_local() == Some(local) {
-                let ty = place.ty(body, tcx).ty;
-                if ty.is_enum() {
-                    return Some(ty);
-                }
-            }
+    let stmt_before_term = block_data.statements.last()?;
+
+    if let StatementKind::Assign(box (l, Rvalue::Discriminant(place))) = stmt_before_term.kind
+        && l.as_local() == Some(local)
+    {
+        let ty = place.ty(body, tcx).ty;
+        if ty.is_enum() {
+            return Some(ty);
         }
     }
 
@@ -56,7 +53,10 @@ fn variant_discriminants<'tcx>(
     match &layout.variants {
         Variants::Single { index } => {
             let mut res = FxHashSet::default();
-            res.insert(index.as_u32() as u128);
+            res.insert(
+                ty.discriminant_for_variant(tcx, *index)
+                    .map_or(index.as_u32() as u128, |discr| discr.val),
+            );
             res
         }
         Variants::Multiple { variants, .. } => variants
@@ -70,24 +70,27 @@ fn variant_discriminants<'tcx>(
 }
 
 impl<'tcx> MirPass<'tcx> for UninhabitedEnumBranching {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if body.source.promoted.is_some() {
-            return;
-        }
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() > 0
+    }
 
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         trace!("UninhabitedEnumBranching starting for {:?}", body.source);
 
-        let basic_block_count = body.basic_blocks().len();
+        let mut removable_switchs = Vec::new();
 
-        for bb in 0..basic_block_count {
-            let bb = BasicBlock::from_usize(bb);
+        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
             trace!("processing block {:?}", bb);
 
-            let Some(discriminant_ty) = get_switched_on_type(&body.basic_blocks()[bb], tcx, body) else {
+            if bb_data.is_cleanup {
                 continue;
-            };
+            }
 
-            let layout = tcx.layout_of(tcx.param_env(body.source.def_id()).and(discriminant_ty));
+            let Some(discriminant_ty) = get_switched_on_type(bb_data, tcx, body) else { continue };
+
+            let layout = tcx.layout_of(
+                tcx.param_env_reveal_all_normalized(body.source.def_id()).and(discriminant_ty),
+            );
 
             let allowed_variants = if let Ok(layout) = layout {
                 variant_discriminants(&layout, discriminant_ty, tcx)
@@ -97,18 +100,38 @@ impl<'tcx> MirPass<'tcx> for UninhabitedEnumBranching {
 
             trace!("allowed_variants = {:?}", allowed_variants);
 
-            if let TerminatorKind::SwitchInt { targets, .. } =
-                &mut body.basic_blocks_mut()[bb].terminator_mut().kind
-            {
-                let new_targets = SwitchTargets::new(
-                    targets.iter().filter(|(val, _)| allowed_variants.contains(val)),
-                    targets.otherwise(),
-                );
+            let terminator = bb_data.terminator();
+            let TerminatorKind::SwitchInt { targets, .. } = &terminator.kind else { bug!() };
 
-                *targets = new_targets;
-            } else {
-                unreachable!()
+            let mut reachable_count = 0;
+            for (index, (val, _)) in targets.iter().enumerate() {
+                if allowed_variants.contains(&val) {
+                    reachable_count += 1;
+                } else {
+                    removable_switchs.push((bb, index));
+                }
             }
+
+            if reachable_count == allowed_variants.len() {
+                removable_switchs.push((bb, targets.iter().count()));
+            }
+        }
+
+        if removable_switchs.is_empty() {
+            return;
+        }
+
+        let new_block = BasicBlockData::new(Some(Terminator {
+            source_info: body.basic_blocks[removable_switchs[0].0].terminator().source_info,
+            kind: TerminatorKind::Unreachable,
+        }));
+        let unreachable_block = body.basic_blocks.as_mut().push(new_block);
+
+        for (bb, index) in removable_switchs {
+            let bb = &mut body.basic_blocks.as_mut()[bb];
+            let terminator = bb.terminator_mut();
+            let TerminatorKind::SwitchInt { targets, .. } = &mut terminator.kind else { bug!() };
+            targets.all_targets_mut()[index] = unreachable_block;
         }
     }
 }

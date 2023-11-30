@@ -3,14 +3,14 @@ use crate::context::TypeLowering;
 use crate::type_::Type;
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::bug;
-use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
-use rustc_middle::ty::{self, Ty, TypeFoldable};
-use rustc_target::abi::{Abi, AddressSpace, Align, FieldsShape};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
+use rustc_target::abi::HasDataLayout;
+use rustc_target::abi::{Abi, Align, FieldsShape};
 use rustc_target::abi::{Int, Pointer, F32, F64};
-use rustc_target::abi::{PointeeInfo, Scalar, Size, TyAbiInterface, Variants};
+use rustc_target::abi::{Scalar, Size, Variants};
 use smallvec::{smallvec, SmallVec};
-use tracing::debug;
 
 use std::fmt::Write;
 
@@ -23,7 +23,7 @@ fn uncached_llvm_type<'a, 'tcx>(
     match layout.abi {
         Abi::Scalar(_) => bug!("handled elsewhere"),
         Abi::Vector { element, count } => {
-            let element = layout.scalar_llvm_type_at(cx, element, Size::ZERO);
+            let element = layout.scalar_llvm_type_at(cx, element);
             return cx.type_vector(element, count);
         }
         Abi::ScalarPair(..) => {
@@ -42,20 +42,22 @@ fn uncached_llvm_type<'a, 'tcx>(
         // FIXME(eddyb) producing readable type names for trait objects can result
         // in problematically distinct types due to HRTB and subtyping (see #47638).
         // ty::Dynamic(..) |
-        ty::Adt(..) | ty::Closure(..) | ty::Foreign(..) | ty::Generator(..) | ty::Str => {
-            let mut name =
-                with_no_visible_paths(|| with_no_trimmed_paths(|| layout.ty.to_string()));
+        ty::Adt(..) | ty::Closure(..) | ty::Foreign(..) | ty::Coroutine(..) | ty::Str
+            // For performance reasons we use names only when emitting LLVM IR.
+            if !cx.sess().fewer_names() =>
+        {
+            let mut name = with_no_visible_paths!(with_no_trimmed_paths!(layout.ty.to_string()));
             if let (&ty::Adt(def, _), &Variants::Single { index }) =
                 (layout.ty.kind(), &layout.variants)
             {
-                if def.is_enum() && !def.variants.is_empty() {
-                    write!(&mut name, "::{}", def.variants[index].ident).unwrap();
+                if def.is_enum() && !def.variants().is_empty() {
+                    write!(&mut name, "::{}", def.variant(index).name).unwrap();
                 }
             }
-            if let (&ty::Generator(_, _, _), &Variants::Single { index }) =
+            if let (&ty::Coroutine(_, _, _), &Variants::Single { index }) =
                 (layout.ty.kind(), &layout.variants)
             {
-                write!(&mut name, "::{}", ty::GeneratorSubsts::variant_name(index)).unwrap();
+                write!(&mut name, "::{}", ty::CoroutineArgs::variant_name(index)).unwrap();
             }
             Some(name)
         }
@@ -133,7 +135,7 @@ fn struct_llfields<'a, 'tcx>(
         prev_effective_align = effective_field_align;
     }
     let padding_used = result.len() > field_count;
-    if !layout.is_unsized() && field_count > 0 {
+    if layout.is_sized() && field_count > 0 {
         if offset > layout.size {
             bug!("layout: {:#?} stride: {:?} offset: {:?}", layout, layout.size, offset);
         }
@@ -150,7 +152,7 @@ fn struct_llfields<'a, 'tcx>(
     } else {
         debug!("struct_llfields: offset: {:?} stride: {:?}", offset, layout.size);
     }
-    let field_remapping = if padding_used { Some(field_remapping) } else { None };
+    let field_remapping = padding_used.then_some(field_remapping);
     (result, packed, field_remapping)
 }
 
@@ -174,12 +176,7 @@ pub trait LayoutLlvmExt<'tcx> {
     fn is_llvm_scalar_pair(&self) -> bool;
     fn llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type;
     fn immediate_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type;
-    fn scalar_llvm_type_at<'a>(
-        &self,
-        cx: &CodegenCx<'a, 'tcx>,
-        scalar: Scalar,
-        offset: Size,
-    ) -> &'a Type;
+    fn scalar_llvm_type_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, scalar: Scalar) -> &'a Type;
     fn scalar_pair_element_llvm_type<'a>(
         &self,
         cx: &CodegenCx<'a, 'tcx>,
@@ -187,15 +184,14 @@ pub trait LayoutLlvmExt<'tcx> {
         immediate: bool,
     ) -> &'a Type;
     fn llvm_field_index<'a>(&self, cx: &CodegenCx<'a, 'tcx>, index: usize) -> u64;
-    fn pointee_info_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, offset: Size) -> Option<PointeeInfo>;
+    fn scalar_copy_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> Option<&'a Type>;
 }
 
 impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     fn is_llvm_immediate(&self) -> bool {
         match self.abi {
             Abi::Scalar(_) | Abi::Vector { .. } => true,
-            Abi::ScalarPair(..) => false,
-            Abi::Uninhabited | Abi::Aggregate { .. } => self.is_zst(),
+            Abi::ScalarPair(..) | Abi::Uninhabited | Abi::Aggregate { .. } => false,
         }
     }
 
@@ -218,24 +214,16 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     /// of that field's type - this is useful for taking the address of
     /// that field and ensuring the struct has the right alignment.
     fn llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type {
+        // This must produce the same result for `repr(transparent)` wrappers as for the inner type!
+        // In other words, this should generally not look at the type at all, but only at the
+        // layout.
         if let Abi::Scalar(scalar) = self.abi {
             // Use a different cache for scalars because pointers to DSTs
             // can be either fat or thin (data pointers of fat pointers).
             if let Some(&llty) = cx.scalar_lltypes.borrow().get(&self.ty) {
                 return llty;
             }
-            let llty = match *self.ty.kind() {
-                ty::Ref(_, ty, _) | ty::RawPtr(ty::TypeAndMut { ty, .. }) => {
-                    cx.type_ptr_to(cx.layout_of(ty).llvm_type(cx))
-                }
-                ty::Adt(def, _) if def.is_box() => {
-                    cx.type_ptr_to(cx.layout_of(self.ty.boxed_ty()).llvm_type(cx))
-                }
-                ty::FnPtr(sig) => {
-                    cx.fn_ptr_backend_type(cx.fn_abi_of_fn_ptr(sig, ty::List::empty()))
-                }
-                _ => self.scalar_llvm_type_at(cx, scalar, Size::ZERO),
-            };
+            let llty = self.scalar_llvm_type_at(cx, scalar);
             cx.scalar_lltypes.borrow_mut().insert(self.ty, llty);
             return llty;
         }
@@ -295,26 +283,12 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
         self.llvm_type(cx)
     }
 
-    fn scalar_llvm_type_at<'a>(
-        &self,
-        cx: &CodegenCx<'a, 'tcx>,
-        scalar: Scalar,
-        offset: Size,
-    ) -> &'a Type {
-        match scalar.value {
+    fn scalar_llvm_type_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, scalar: Scalar) -> &'a Type {
+        match scalar.primitive() {
             Int(i, _) => cx.type_from_integer(i),
             F32 => cx.type_f32(),
             F64 => cx.type_f64(),
-            Pointer => {
-                // If we know the alignment, pick something better than i8.
-                let (pointee, address_space) =
-                    if let Some(pointee) = self.pointee_info_at(cx, offset) {
-                        (cx.type_pointee_for_align(pointee.align), pointee.address_space)
-                    } else {
-                        (cx.type_i8(), AddressSpace::DATA)
-                    };
-                cx.type_ptr_to_ext(pointee, address_space)
-            }
+            Pointer(address_space) => cx.type_ptr_ext(address_space),
         }
     }
 
@@ -324,38 +298,25 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
         index: usize,
         immediate: bool,
     ) -> &'a Type {
-        // HACK(eddyb) special-case fat pointers until LLVM removes
-        // pointee types, to avoid bitcasting every `OperandRef::deref`.
-        match self.ty.kind() {
-            ty::Ref(..) | ty::RawPtr(_) => {
-                return self.field(cx, index).llvm_type(cx);
-            }
-            ty::Adt(def, _) if def.is_box() => {
-                let ptr_ty = cx.tcx.mk_mut_ptr(self.ty.boxed_ty());
-                return cx.layout_of(ptr_ty).scalar_pair_element_llvm_type(cx, index, immediate);
-            }
-            _ => {}
-        }
-
-        let (a, b) = match self.abi {
-            Abi::ScalarPair(a, b) => (a, b),
-            _ => bug!("TyAndLayout::scalar_pair_element_llty({:?}): not applicable", self),
+        // This must produce the same result for `repr(transparent)` wrappers as for the inner type!
+        // In other words, this should generally not look at the type at all, but only at the
+        // layout.
+        let Abi::ScalarPair(a, b) = self.abi else {
+            bug!("TyAndLayout::scalar_pair_element_llty({:?}): not applicable", self);
         };
         let scalar = [a, b][index];
 
         // Make sure to return the same type `immediate_llvm_type` would when
-        // dealing with an immediate pair.  This means that `(bool, bool)` is
+        // dealing with an immediate pair. This means that `(bool, bool)` is
         // effectively represented as `{i8, i8}` in memory and two `i1`s as an
         // immediate, just like `bool` is typically `i8` in memory and only `i1`
-        // when immediate.  We need to load/store `bool` as `i8` to avoid
+        // when immediate. We need to load/store `bool` as `i8` to avoid
         // crippling LLVM optimizations or triggering other LLVM bugs with `i1`.
         if immediate && scalar.is_bool() {
             return cx.type_i1();
         }
 
-        let offset =
-            if index == 0 { Size::ZERO } else { a.value.size(cx).align_to(b.value.align(cx).abi) };
-        self.scalar_llvm_type_at(cx, scalar, offset)
+        self.scalar_llvm_type_at(cx, scalar)
     }
 
     fn llvm_field_index<'a>(&self, cx: &CodegenCx<'a, 'tcx>, index: usize) -> u64 {
@@ -394,17 +355,43 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
         }
     }
 
-    // FIXME(eddyb) this having the same name as `TyAndLayout::pointee_info_at`
-    // (the inherent method, which is lacking this caching logic) can result in
-    // the uncached version being called - not wrong, but potentially inefficient.
-    fn pointee_info_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, offset: Size) -> Option<PointeeInfo> {
-        if let Some(&pointee) = cx.pointee_infos.borrow().get(&(self.ty, offset)) {
-            return pointee;
+    fn scalar_copy_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> Option<&'a Type> {
+        debug_assert!(self.is_sized());
+
+        // FIXME: this is a fairly arbitrary choice, but 128 bits on WASM
+        // (matching the 128-bit SIMD types proposal) and 256 bits on x64
+        // (like AVX2 registers) seems at least like a tolerable starting point.
+        let threshold = cx.data_layout().pointer_size * 4;
+        if self.layout.size() > threshold {
+            return None;
         }
 
-        let result = Ty::ty_and_layout_pointee_info_at(*self, cx, offset);
+        // Vectors, even for non-power-of-two sizes, have the same layout as
+        // arrays but don't count as aggregate types
+        // While LLVM theoretically supports non-power-of-two sizes, and they
+        // often work fine, sometimes x86-isel deals with them horribly
+        // (see #115212) so for now only use power-of-two ones.
+        if let FieldsShape::Array { count, .. } = self.layout.fields()
+            && count.is_power_of_two()
+            && let element = self.field(cx, 0)
+            && element.ty.is_integral()
+        {
+            // `cx.type_ix(bits)` is tempting here, but while that works great
+            // for things that *stay* as memory-to-memory copies, it also ends
+            // up suppressing vectorization as it introduces shifts when it
+            // extracts all the individual values.
 
-        cx.pointee_infos.borrow_mut().insert((self.ty, offset), result);
-        result
+            let ety = element.llvm_type(cx);
+            if *count == 1 {
+                // Emitting `<1 x T>` would be silly; just use the scalar.
+                return Some(ety);
+            } else {
+                return Some(cx.type_vector(ety, *count));
+            }
+        }
+
+        // FIXME: The above only handled integer arrays; surely more things
+        // would also be possible. Be careful about provenance, though!
+        None
     }
 }

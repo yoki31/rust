@@ -7,7 +7,7 @@ use core::option::*;
 #[test]
 fn test_get_ptr() {
     unsafe {
-        let x: Box<_> = box 0;
+        let x: Box<_> = Box::new(0);
         let addr_x: *const isize = mem::transmute(&*x);
         let opt = Some(x);
         let y = opt.unwrap();
@@ -57,6 +57,7 @@ fn test_get_resource() {
 }
 
 #[test]
+#[allow(for_loops_over_fallibles)]
 fn test_option_dance() {
     let x = Some(());
     let mut y = Some(5);
@@ -86,17 +87,53 @@ fn test_and() {
     let x: Option<isize> = None;
     assert_eq!(x.and(Some(2)), None);
     assert_eq!(x.and(None::<isize>), None);
+
+    /* FIXME(#110395)
+    const FOO: Option<isize> = Some(1);
+    const A: Option<isize> = FOO.and(Some(2));
+    const B: Option<isize> = FOO.and(None);
+    assert_eq!(A, Some(2));
+    assert_eq!(B, None);
+
+    const BAR: Option<isize> = None;
+    const C: Option<isize> = BAR.and(Some(2));
+    const D: Option<isize> = BAR.and(None);
+    assert_eq!(C, None);
+    assert_eq!(D, None);
+    */
 }
 
 #[test]
 fn test_and_then() {
+    const fn plus_one(x: isize) -> Option<isize> {
+        Some(x + 1)
+    }
+
+    const fn none(_: isize) -> Option<isize> {
+        None
+    }
+
     let x: Option<isize> = Some(1);
-    assert_eq!(x.and_then(|x| Some(x + 1)), Some(2));
-    assert_eq!(x.and_then(|_| None::<isize>), None);
+    assert_eq!(x.and_then(plus_one), Some(2));
+    assert_eq!(x.and_then(none), None);
 
     let x: Option<isize> = None;
-    assert_eq!(x.and_then(|x| Some(x + 1)), None);
-    assert_eq!(x.and_then(|_| None::<isize>), None);
+    assert_eq!(x.and_then(plus_one), None);
+    assert_eq!(x.and_then(none), None);
+
+    /* FIXME(#110395)
+    const FOO: Option<isize> = Some(1);
+    const A: Option<isize> = FOO.and_then(plus_one);
+    const B: Option<isize> = FOO.and_then(none);
+    assert_eq!(A, Some(2));
+    assert_eq!(B, None);
+
+    const BAR: Option<isize> = None;
+    const C: Option<isize> = BAR.and_then(plus_one);
+    const D: Option<isize> = BAR.and_then(none);
+    assert_eq!(C, None);
+    assert_eq!(D, None);
+    */
 }
 
 #[test]
@@ -108,17 +145,53 @@ fn test_or() {
     let x: Option<isize> = None;
     assert_eq!(x.or(Some(2)), Some(2));
     assert_eq!(x.or(None), None);
+
+    /* FIXME(#110395)
+    const FOO: Option<isize> = Some(1);
+    const A: Option<isize> = FOO.or(Some(2));
+    const B: Option<isize> = FOO.or(None);
+    assert_eq!(A, Some(1));
+    assert_eq!(B, Some(1));
+
+    const BAR: Option<isize> = None;
+    const C: Option<isize> = BAR.or(Some(2));
+    const D: Option<isize> = BAR.or(None);
+    assert_eq!(C, Some(2));
+    assert_eq!(D, None);
+    */
 }
 
 #[test]
 fn test_or_else() {
+    const fn two() -> Option<isize> {
+        Some(2)
+    }
+
+    const fn none() -> Option<isize> {
+        None
+    }
+
     let x: Option<isize> = Some(1);
-    assert_eq!(x.or_else(|| Some(2)), Some(1));
-    assert_eq!(x.or_else(|| None), Some(1));
+    assert_eq!(x.or_else(two), Some(1));
+    assert_eq!(x.or_else(none), Some(1));
 
     let x: Option<isize> = None;
-    assert_eq!(x.or_else(|| Some(2)), Some(2));
-    assert_eq!(x.or_else(|| None), None);
+    assert_eq!(x.or_else(two), Some(2));
+    assert_eq!(x.or_else(none), None);
+
+/* FIXME(#110395)
+    const FOO: Option<isize> = Some(1);
+    const A: Option<isize> = FOO.or_else(two);
+    const B: Option<isize> = FOO.or_else(none);
+    assert_eq!(A, Some(1));
+    assert_eq!(B, Some(1));
+
+    const BAR: Option<isize> = None;
+    const C: Option<isize> = BAR.or_else(two);
+    const D: Option<isize> = BAR.or_else(none);
+    assert_eq!(C, Some(2));
+    assert_eq!(D, None);
+*/
 }
 
 #[test]
@@ -149,15 +222,33 @@ fn test_unwrap_or() {
 
     let x: Option<isize> = None;
     assert_eq!(x.unwrap_or(2), 2);
+
+    /* FIXME(#110395)
+    const A: isize = Some(1).unwrap_or(2);
+    const B: isize = None.unwrap_or(2);
+    assert_eq!(A, 1);
+    assert_eq!(B, 2);
+    */
 }
 
 #[test]
 fn test_unwrap_or_else() {
+    const fn two() -> isize {
+        2
+    }
+
     let x: Option<isize> = Some(1);
-    assert_eq!(x.unwrap_or_else(|| 2), 1);
+    assert_eq!(x.unwrap_or_else(two), 1);
 
     let x: Option<isize> = None;
-    assert_eq!(x.unwrap_or_else(|| 2), 2);
+    assert_eq!(x.unwrap_or_else(two), 2);
+
+    /* FIXME(#110395)
+    const A: isize = Some(1).unwrap_or_else(two);
+    const B: isize = None.unwrap_or_else(two);
+    assert_eq!(A, 1);
+    assert_eq!(B, 2);
+    */
 }
 
 #[test]
@@ -237,7 +328,7 @@ fn test_collect() {
 
     // test that it does not take more elements than it needs
     let mut functions: [Box<dyn Fn() -> Option<()>>; 3] =
-        [box || Some(()), box || None, box || panic!()];
+        [Box::new(|| Some(())), Box::new(|| None), Box::new(|| panic!())];
 
     let v: Option<Vec<()>> = functions.iter_mut().map(|f| (*f)()).collect();
 
@@ -360,14 +451,15 @@ fn option_const() {
     const OPTION: Option<usize> = Some(32);
     assert_eq!(OPTION, Some(32));
 
-    const OPTION_FROM: Option<usize> = Option::from(32);
-    assert_eq!(OPTION_FROM, Some(32));
+    // FIXME(#110395)
+    // const OPTION_FROM: Option<usize> = Option::from(32);
+    // assert_eq!(OPTION_FROM, Some(32));
 
     const REF: Option<&usize> = OPTION.as_ref();
     assert_eq!(REF, Some(&32));
 
-    const REF_FROM: Option<&usize> = Option::from(&OPTION);
-    assert_eq!(REF_FROM, Some(&32));
+    // const REF_FROM: Option<&usize> = Option::from(&OPTION);
+    // assert_eq!(REF_FROM, Some(&32));
 
     const IS_SOME: bool = OPTION.is_some();
     assert!(IS_SOME);
@@ -395,7 +487,7 @@ const fn option_const_mut() {
             None => unreachable!(),
         }
     }
-
+/* FIXME(const-hack)
     {
         let as_mut: Option<&mut usize> = Option::from(&mut option);
         match as_mut {
@@ -403,6 +495,7 @@ const fn option_const_mut() {
             None => unreachable!(),
         }
     }
+*/
 }
 
 #[test]
@@ -474,4 +567,12 @@ fn zip_unzip_roundtrip() {
 
     let a = z.unzip();
     assert_eq!(a, (x, y));
+}
+
+#[test]
+fn as_slice() {
+    assert_eq!(Some(42).as_slice(), &[42]);
+    assert_eq!(Some(43).as_mut_slice(), &[43]);
+    assert_eq!(None::<i32>.as_slice(), &[]);
+    assert_eq!(None::<i32>.as_mut_slice(), &[]);
 }

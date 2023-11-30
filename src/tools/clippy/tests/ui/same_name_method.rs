@@ -1,3 +1,4 @@
+#![feature(lint_reasons)]
 #![warn(clippy::same_name_method)]
 #![allow(dead_code, non_camel_case_types)]
 
@@ -18,6 +19,7 @@ mod should_lint {
 
         impl S {
             fn foo() {}
+            //~^ ERROR: method's name is the same as an existing method in a trait
         }
 
         impl T1 for S {
@@ -32,6 +34,7 @@ mod should_lint {
 
         impl S {
             fn clone() {}
+            //~^ ERROR: method's name is the same as an existing method in a trait
         }
     }
 
@@ -42,6 +45,7 @@ mod should_lint {
 
         impl<U> S<U> {
             fn foo() {}
+            //~^ ERROR: method's name is the same as an existing method in a trait
         }
 
         impl<U: Copy> T1 for S<U> {
@@ -56,18 +60,20 @@ mod should_lint {
 
         impl S {
             fn foo() {}
+            //~^ ERROR: method's name is the same as an existing method in a trait
         }
 
         impl T1 for S {}
     }
 
-    mod mulitply_conflicit_trait {
+    mod multiple_conflicting_traits {
         use crate::{T1, T2};
 
         struct S;
 
         impl S {
             fn foo() {}
+            //~^ ERROR: method's name is the same as an existing method in a trait
         }
 
         impl T1 for S {}
@@ -105,6 +111,21 @@ mod should_not_lint {
         impl T3 for S {
             type foo = usize;
         }
+    }
+}
+
+mod check_expect_suppression {
+    use crate::T1;
+
+    struct S;
+
+    impl S {
+        #[expect(clippy::same_name_method)]
+        fn foo() {}
+    }
+
+    impl T1 for S {
+        fn foo() {}
     }
 }
 

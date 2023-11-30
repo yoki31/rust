@@ -1,5 +1,8 @@
 use super::{find_testable_code, plain_text_summary, short_markdown_summary};
-use super::{ErrorCodes, HeadingOffset, IdMap, Ignore, LangString, Markdown, MarkdownHtml};
+use super::{
+    ErrorCodes, HeadingOffset, IdMap, Ignore, LangString, LangStringToken, Markdown,
+    MarkdownItemInfo, TagIterator,
+};
 use rustc_span::edition::{Edition, DEFAULT_EDITION};
 
 #[test]
@@ -12,7 +15,7 @@ fn test_unique_id() {
         "examples",
         "method.into_iter",
         "foo",
-        "main",
+        "main-content",
         "search",
         "methods",
         "examples",
@@ -28,7 +31,7 @@ fn test_unique_id() {
         "examples-2",
         "method.into_iter-1",
         "foo-1",
-        "main-1",
+        "main-content-1",
         "search-1",
         "methods",
         "examples-3",
@@ -38,7 +41,7 @@ fn test_unique_id() {
     ];
 
     let mut map = IdMap::new();
-    let actual: Vec<String> = input.iter().map(|s| map.derive(s.to_string())).collect();
+    let actual: Vec<String> = input.iter().map(|s| map.derive(s)).collect();
     assert_eq!(&actual[..], expected);
 }
 
@@ -46,15 +49,37 @@ fn test_unique_id() {
 fn test_lang_string_parse() {
     fn t(lg: LangString) {
         let s = &lg.original;
-        assert_eq!(LangString::parse(s, ErrorCodes::Yes, true, None), lg)
+        assert_eq!(LangString::parse(s, ErrorCodes::Yes, true, None, true), lg)
     }
 
     t(Default::default());
     t(LangString { original: "rust".into(), ..Default::default() });
-    t(LangString { original: ".rust".into(), ..Default::default() });
-    t(LangString { original: "{rust}".into(), ..Default::default() });
-    t(LangString { original: "{.rust}".into(), ..Default::default() });
-    t(LangString { original: "sh".into(), rust: false, ..Default::default() });
+    t(LangString {
+        original: "rusta".into(),
+        rust: false,
+        unknown: vec!["rusta".into()],
+        ..Default::default()
+    });
+    // error
+    t(LangString { original: "{rust}".into(), rust: true, ..Default::default() });
+    t(LangString {
+        original: "{.rust}".into(),
+        rust: true,
+        added_classes: vec!["rust".into()],
+        ..Default::default()
+    });
+    t(LangString {
+        original: "custom,{.rust}".into(),
+        rust: false,
+        added_classes: vec!["rust".into()],
+        ..Default::default()
+    });
+    t(LangString {
+        original: "sh".into(),
+        rust: false,
+        unknown: vec!["sh".into()],
+        ..Default::default()
+    });
     t(LangString { original: "ignore".into(), ignore: Ignore::All, ..Default::default() });
     t(LangString {
         original: "ignore-foo".into(),
@@ -70,42 +95,56 @@ fn test_lang_string_parse() {
         compile_fail: true,
         ..Default::default()
     });
-    t(LangString { original: "allow_fail".into(), allow_fail: true, ..Default::default() });
-    t(LangString { original: "no_run,example".into(), no_run: true, ..Default::default() });
+    t(LangString {
+        original: "no_run,example".into(),
+        no_run: true,
+        unknown: vec!["example".into()],
+        ..Default::default()
+    });
     t(LangString {
         original: "sh,should_panic".into(),
         should_panic: true,
         rust: false,
+        unknown: vec!["sh".into()],
         ..Default::default()
     });
-    t(LangString { original: "example,rust".into(), ..Default::default() });
     t(LangString {
-        original: "test_harness,.rust".into(),
+        original: "example,rust".into(),
+        unknown: vec!["example".into()],
+        ..Default::default()
+    });
+    t(LangString {
+        original: "test_harness,rusta".into(),
         test_harness: true,
+        unknown: vec!["rusta".into()],
         ..Default::default()
     });
     t(LangString {
         original: "text, no_run".into(),
         no_run: true,
         rust: false,
+        unknown: vec!["text".into()],
         ..Default::default()
     });
     t(LangString {
         original: "text,no_run".into(),
         no_run: true,
         rust: false,
+        unknown: vec!["text".into()],
         ..Default::default()
     });
     t(LangString {
         original: "text,no_run, ".into(),
         no_run: true,
         rust: false,
+        unknown: vec!["text".into()],
         ..Default::default()
     });
     t(LangString {
         original: "text,no_run,".into(),
         no_run: true,
         rust: false,
+        unknown: vec!["text".into()],
         ..Default::default()
     });
     t(LangString {
@@ -118,29 +157,140 @@ fn test_lang_string_parse() {
         edition: Some(Edition::Edition2018),
         ..Default::default()
     });
+    t(LangString {
+        original: "{class=test}".into(),
+        added_classes: vec!["test".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "custom,{class=test}".into(),
+        added_classes: vec!["test".into()],
+        rust: false,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "{.test}".into(),
+        added_classes: vec!["test".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "custom,{.test}".into(),
+        added_classes: vec!["test".into()],
+        rust: false,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "rust,{class=test,.test2}".into(),
+        added_classes: vec!["test".into(), "test2".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "{class=test:with:colon .test1}".into(),
+        added_classes: vec!["test:with:colon".into(), "test1".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "custom,{class=test:with:colon .test1}".into(),
+        added_classes: vec!["test:with:colon".into(), "test1".into()],
+        rust: false,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "{class=first,class=second}".into(),
+        added_classes: vec!["first".into(), "second".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "custom,{class=first,class=second}".into(),
+        added_classes: vec!["first".into(), "second".into()],
+        rust: false,
+        ..Default::default()
+    });
+    t(LangString {
+        original: "{class=first,.second},unknown".into(),
+        added_classes: vec!["first".into(), "second".into()],
+        rust: false,
+        unknown: vec!["unknown".into()],
+        ..Default::default()
+    });
+    t(LangString {
+        original: "{class=first .second} unknown".into(),
+        added_classes: vec!["first".into(), "second".into()],
+        rust: false,
+        unknown: vec!["unknown".into()],
+        ..Default::default()
+    });
+    // error
+    t(LangString {
+        original: "{.first.second}".into(),
+        rust: true,
+        added_classes: vec!["first.second".into()],
+        ..Default::default()
+    });
+    // error
+    t(LangString { original: "{class=first=second}".into(), rust: true, ..Default::default() });
+    // error
+    t(LangString {
+        original: "{class=first.second}".into(),
+        rust: true,
+        added_classes: vec!["first.second".into()],
+        ..Default::default()
+    });
+    // error
+    t(LangString {
+        original: "{class=.first}".into(),
+        added_classes: vec![".first".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: r#"{class="first"}"#.into(),
+        added_classes: vec!["first".into()],
+        rust: true,
+        ..Default::default()
+    });
+    t(LangString {
+        original: r#"custom,{class="first"}"#.into(),
+        added_classes: vec!["first".into()],
+        rust: false,
+        ..Default::default()
+    });
+    // error
+    t(LangString { original: r#"{class=f"irst"}"#.into(), rust: true, ..Default::default() });
 }
 
 #[test]
 fn test_lang_string_tokenizer() {
-    fn case(lang_string: &str, want: &[&str]) {
-        let have = LangString::tokens(lang_string).collect::<Vec<&str>>();
+    fn case(lang_string: &str, want: &[LangStringToken<'_>]) {
+        let have = TagIterator::new(lang_string, None).collect::<Vec<_>>();
         assert_eq!(have, want, "Unexpected lang string split for `{}`", lang_string);
     }
 
     case("", &[]);
-    case("foo", &["foo"]);
-    case("foo,bar", &["foo", "bar"]);
-    case(".foo,.bar", &["foo", "bar"]);
-    case("{.foo,.bar}", &["foo", "bar"]);
-    case("  {.foo,.bar}  ", &["foo", "bar"]);
-    case("foo bar", &["foo", "bar"]);
-    case("foo\tbar", &["foo", "bar"]);
-    case("foo\t, bar", &["foo", "bar"]);
-    case(" foo , bar ", &["foo", "bar"]);
-    case(",,foo,,bar,,", &["foo", "bar"]);
-    case("foo=bar", &["foo=bar"]);
-    case("a-b-c", &["a-b-c"]);
-    case("a_b_c", &["a_b_c"]);
+    case("foo", &[LangStringToken::LangToken("foo")]);
+    case("foo,bar", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case(".foo,.bar", &[]);
+    case(
+        "{.foo,.bar}",
+        &[LangStringToken::ClassAttribute("foo"), LangStringToken::ClassAttribute("bar")],
+    );
+    case(
+        "  {.foo,.bar}  ",
+        &[LangStringToken::ClassAttribute("foo"), LangStringToken::ClassAttribute("bar")],
+    );
+    case("foo bar", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case("foo\tbar", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case("foo\t, bar", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case(" foo , bar ", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case(",,foo,,bar,,", &[LangStringToken::LangToken("foo"), LangStringToken::LangToken("bar")]);
+    case("foo=bar", &[]);
+    case("a-b-c", &[LangStringToken::LangToken("a-b-c")]);
+    case("a_b_c", &[LangStringToken::LangToken("a_b_c")]);
 }
 
 #[test]
@@ -155,30 +305,28 @@ fn test_header() {
             edition: DEFAULT_EDITION,
             playground: &None,
             heading_offset: HeadingOffset::H2,
+            custom_code_classes_in_docs: true,
         }
         .into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
-    t(
-        "# Foo bar",
-        "<h2 id=\"foo-bar\" class=\"section-header\"><a href=\"#foo-bar\">Foo bar</a></h2>",
-    );
+    t("# Foo bar", "<h2 id=\"foo-bar\"><a href=\"#foo-bar\">Foo bar</a></h2>");
     t(
         "## Foo-bar_baz qux",
-        "<h3 id=\"foo-bar_baz-qux\" class=\"section-header\">\
+        "<h3 id=\"foo-bar_baz-qux\">\
          <a href=\"#foo-bar_baz-qux\">Foo-bar_baz qux</a></h3>",
     );
     t(
         "### **Foo** *bar* baz!?!& -_qux_-%",
-        "<h4 id=\"foo-bar-baz--qux-\" class=\"section-header\">\
+        "<h4 id=\"foo-bar-baz--qux-\">\
             <a href=\"#foo-bar-baz--qux-\"><strong>Foo</strong> \
             <em>bar</em> baz!?!&amp; -<em>qux</em>-%</a>\
          </h4>",
     );
     t(
         "#### **Foo?** & \\*bar?!*  _`baz`_ ❤ #qux",
-        "<h5 id=\"foo--bar--baz--qux\" class=\"section-header\">\
+        "<h5 id=\"foo--bar--baz--qux\">\
              <a href=\"#foo--bar--baz--qux\"><strong>Foo?</strong> &amp; *bar?!*  \
              <em><code>baz</code></em> ❤ #qux</a>\
          </h5>",
@@ -197,41 +345,18 @@ fn test_header_ids_multiple_blocks() {
             edition: DEFAULT_EDITION,
             playground: &None,
             heading_offset: HeadingOffset::H2,
+            custom_code_classes_in_docs: true,
         }
         .into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
-    t(
-        &mut map,
-        "# Example",
-        "<h2 id=\"example\" class=\"section-header\"><a href=\"#example\">Example</a></h2>",
-    );
-    t(
-        &mut map,
-        "# Panics",
-        "<h2 id=\"panics\" class=\"section-header\"><a href=\"#panics\">Panics</a></h2>",
-    );
-    t(
-        &mut map,
-        "# Example",
-        "<h2 id=\"example-1\" class=\"section-header\"><a href=\"#example-1\">Example</a></h2>",
-    );
-    t(
-        &mut map,
-        "# Main",
-        "<h2 id=\"main-1\" class=\"section-header\"><a href=\"#main-1\">Main</a></h2>",
-    );
-    t(
-        &mut map,
-        "# Example",
-        "<h2 id=\"example-2\" class=\"section-header\"><a href=\"#example-2\">Example</a></h2>",
-    );
-    t(
-        &mut map,
-        "# Panics",
-        "<h2 id=\"panics-1\" class=\"section-header\"><a href=\"#panics-1\">Panics</a></h2>",
-    );
+    t(&mut map, "# Example", "<h2 id=\"example\"><a href=\"#example\">Example</a></h2>");
+    t(&mut map, "# Panics", "<h2 id=\"panics\"><a href=\"#panics\">Panics</a></h2>");
+    t(&mut map, "# Example", "<h2 id=\"example-1\"><a href=\"#example-1\">Example</a></h2>");
+    t(&mut map, "# Search", "<h2 id=\"search-1\"><a href=\"#search-1\">Search</a></h2>");
+    t(&mut map, "# Example", "<h2 id=\"example-2\"><a href=\"#example-2\">Example</a></h2>");
+    t(&mut map, "# Panics", "<h2 id=\"panics-1\"><a href=\"#panics-1\">Panics</a></h2>");
 }
 
 #[test]
@@ -277,7 +402,7 @@ fn test_short_markdown_summary() {
 #[test]
 fn test_plain_text_summary() {
     fn t(input: &str, expect: &str) {
-        let output = plain_text_summary(input);
+        let output = plain_text_summary(input, &[]);
         assert_eq!(output, expect, "original: {}", input);
     }
 
@@ -307,14 +432,13 @@ fn test_plain_text_summary() {
 fn test_markdown_html_escape() {
     fn t(input: &str, expect: &str) {
         let mut idmap = IdMap::new();
-        let output =
-            MarkdownHtml(input, &mut idmap, ErrorCodes::Yes, DEFAULT_EDITION, &None).into_string();
+        let output = MarkdownItemInfo(input, &mut idmap).into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
-    t("`Struct<'a, T>`", "<p><code>Struct&lt;'a, T&gt;</code></p>\n");
-    t("Struct<'a, T>", "<p>Struct&lt;’a, T&gt;</p>\n");
-    t("Struct<br>", "<p>Struct&lt;br&gt;</p>\n");
+    t("`Struct<'a, T>`", "<code>Struct&lt;'a, T&gt;</code>");
+    t("Struct<'a, T>", "Struct&lt;’a, T&gt;");
+    t("Struct<br>", "Struct&lt;br&gt;");
 }
 
 #[test]
@@ -326,7 +450,7 @@ fn test_find_testable_code_line() {
             }
         }
         let mut lines = Vec::<usize>::new();
-        find_testable_code(input, &mut lines, ErrorCodes::No, false, None);
+        find_testable_code(input, &mut lines, ErrorCodes::No, false, None, true);
         assert_eq!(lines, expect);
     }
 
@@ -337,4 +461,50 @@ fn test_find_testable_code_line() {
     t("\n ```rust\n```", &[2]);
     t("```rust\n```\n```rust\n```", &[1, 3]);
     t("```rust\n```\n ```rust\n```", &[1, 3]);
+}
+
+#[test]
+fn test_ascii_with_prepending_hashtag() {
+    fn t(input: &str, expect: &str) {
+        let mut map = IdMap::new();
+        let output = Markdown {
+            content: input,
+            links: &[],
+            ids: &mut map,
+            error_codes: ErrorCodes::Yes,
+            edition: DEFAULT_EDITION,
+            playground: &None,
+            heading_offset: HeadingOffset::H2,
+            custom_code_classes_in_docs: true,
+        }
+        .into_string();
+        assert_eq!(output, expect, "original: {}", input);
+    }
+
+    t(
+        r#"```ascii
+#..#.####.#....#.....##..
+#..#.#....#....#....#..#.
+####.###..#....#....#..#.
+#..#.#....#....#....#..#.
+#..#.#....#....#....#..#.
+#..#.####.####.####..##..
+```"#,
+        "<div class=\"example-wrap\"><pre class=\"language-ascii\"><code>\
+#..#.####.#....#.....##..
+#..#.#....#....#....#..#.
+####.###..#....#....#..#.
+#..#.#....#....#....#..#.
+#..#.#....#....#....#..#.
+#..#.####.####.####..##..
+</code></pre></div>",
+    );
+    t(
+        r#"```markdown
+# hello
+```"#,
+        "<div class=\"example-wrap\"><pre class=\"language-markdown\"><code>\
+# hello
+</code></pre></div>",
+    );
 }

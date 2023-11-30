@@ -96,28 +96,30 @@ macro_rules! compress {
 unsafe fn copy_nonoverlapping_small(src: *const u8, dst: *mut u8, count: usize) {
     debug_assert!(count <= 8);
 
-    if count == 8 {
-        ptr::copy_nonoverlapping(src, dst, 8);
-        return;
-    }
+    unsafe {
+        if count == 8 {
+            ptr::copy_nonoverlapping(src, dst, 8);
+            return;
+        }
 
-    let mut i = 0;
-    if i + 3 < count {
-        ptr::copy_nonoverlapping(src.add(i), dst.add(i), 4);
-        i += 4;
-    }
+        let mut i = 0;
+        if i + 3 < count {
+            ptr::copy_nonoverlapping(src.add(i), dst.add(i), 4);
+            i += 4;
+        }
 
-    if i + 1 < count {
-        ptr::copy_nonoverlapping(src.add(i), dst.add(i), 2);
-        i += 2
-    }
+        if i + 1 < count {
+            ptr::copy_nonoverlapping(src.add(i), dst.add(i), 2);
+            i += 2
+        }
 
-    if i < count {
-        *dst.add(i) = *src.add(i);
-        i += 1;
-    }
+        if i < count {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
 
-    debug_assert_eq!(i, count);
+        debug_assert_eq!(i, count);
+    }
 }
 
 // # Implementation
@@ -202,28 +204,26 @@ impl SipHasher128 {
         hasher
     }
 
-    // A specialized write function for values with size <= 8.
     #[inline]
-    fn short_write<T>(&mut self, x: T) {
-        let size = mem::size_of::<T>();
+    pub fn short_write<const LEN: usize>(&mut self, bytes: [u8; LEN]) {
         let nbuf = self.nbuf;
-        debug_assert!(size <= 8);
+        debug_assert!(LEN <= 8);
         debug_assert!(nbuf < BUFFER_SIZE);
-        debug_assert!(nbuf + size < BUFFER_WITH_SPILL_SIZE);
+        debug_assert!(nbuf + LEN < BUFFER_WITH_SPILL_SIZE);
 
-        if nbuf + size < BUFFER_SIZE {
+        if nbuf + LEN < BUFFER_SIZE {
             unsafe {
                 // The memcpy call is optimized away because the size is known.
                 let dst = (self.buf.as_mut_ptr() as *mut u8).add(nbuf);
-                ptr::copy_nonoverlapping(&x as *const _ as *const u8, dst, size);
+                ptr::copy_nonoverlapping(bytes.as_ptr(), dst, LEN);
             }
 
-            self.nbuf = nbuf + size;
+            self.nbuf = nbuf + LEN;
 
             return;
         }
 
-        unsafe { self.short_write_process_buffer(x) }
+        unsafe { self.short_write_process_buffer(bytes) }
     }
 
     // A specialized write function for values with size <= 8 that should only
@@ -233,39 +233,41 @@ impl SipHasher128 {
     // `self.nbuf` must cause `self.buf` to become fully initialized (and not
     // overflow) if it wasn't already.
     #[inline(never)]
-    unsafe fn short_write_process_buffer<T>(&mut self, x: T) {
-        let size = mem::size_of::<T>();
-        let nbuf = self.nbuf;
-        debug_assert!(size <= 8);
-        debug_assert!(nbuf < BUFFER_SIZE);
-        debug_assert!(nbuf + size >= BUFFER_SIZE);
-        debug_assert!(nbuf + size < BUFFER_WITH_SPILL_SIZE);
+    unsafe fn short_write_process_buffer<const LEN: usize>(&mut self, bytes: [u8; LEN]) {
+        unsafe {
+            let nbuf = self.nbuf;
+            debug_assert!(LEN <= 8);
+            debug_assert!(nbuf < BUFFER_SIZE);
+            debug_assert!(nbuf + LEN >= BUFFER_SIZE);
+            debug_assert!(nbuf + LEN < BUFFER_WITH_SPILL_SIZE);
 
-        // Copy first part of input into end of buffer, possibly into spill
-        // element. The memcpy call is optimized away because the size is known.
-        let dst = (self.buf.as_mut_ptr() as *mut u8).add(nbuf);
-        ptr::copy_nonoverlapping(&x as *const _ as *const u8, dst, size);
+            // Copy first part of input into end of buffer, possibly into spill
+            // element. The memcpy call is optimized away because the size is known.
+            let dst = (self.buf.as_mut_ptr() as *mut u8).add(nbuf);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dst, LEN);
 
-        // Process buffer.
-        for i in 0..BUFFER_CAPACITY {
-            let elem = self.buf.get_unchecked(i).assume_init().to_le();
-            self.state.v3 ^= elem;
-            Sip24Rounds::c_rounds(&mut self.state);
-            self.state.v0 ^= elem;
+            // Process buffer.
+            for i in 0..BUFFER_CAPACITY {
+                let elem = self.buf.get_unchecked(i).assume_init().to_le();
+                self.state.v3 ^= elem;
+                Sip13Rounds::c_rounds(&mut self.state);
+                self.state.v0 ^= elem;
+            }
+
+            // Copy remaining input into start of buffer by copying LEN - 1
+            // elements from spill (at most LEN - 1 bytes could have overflowed
+            // into the spill). The memcpy call is optimized away because the size
+            // is known. And the whole copy is optimized away for LEN == 1.
+            let dst = self.buf.as_mut_ptr() as *mut u8;
+            let src = self.buf.get_unchecked(BUFFER_SPILL_INDEX) as *const _ as *const u8;
+            ptr::copy_nonoverlapping(src, dst, LEN - 1);
+
+            // This function should only be called when the write fills the buffer.
+            // Therefore, when LEN == 1, the new `self.nbuf` must be zero.
+            // LEN is statically known, so the branch is optimized away.
+            self.nbuf = if LEN == 1 { 0 } else { nbuf + LEN - BUFFER_SIZE };
+            self.processed += BUFFER_SIZE;
         }
-
-        // Copy remaining input into start of buffer by copying size - 1
-        // elements from spill (at most size - 1 bytes could have overflowed
-        // into the spill). The memcpy call is optimized away because the size
-        // is known. And the whole copy is optimized away for size == 1.
-        let src = self.buf.get_unchecked(BUFFER_SPILL_INDEX) as *const _ as *const u8;
-        ptr::copy_nonoverlapping(src, self.buf.as_mut_ptr() as *mut u8, size - 1);
-
-        // This function should only be called when the write fills the buffer.
-        // Therefore, when size == 1, the new `self.nbuf` must be zero. The size
-        // is statically known, so the branch is optimized away.
-        self.nbuf = if size == 1 { 0 } else { nbuf + size - BUFFER_SIZE };
-        self.processed += BUFFER_SIZE;
     }
 
     // A write function for byte slices.
@@ -303,57 +305,59 @@ impl SipHasher128 {
     // containing the byte offset `self.nbuf`.
     #[inline(never)]
     unsafe fn slice_write_process_buffer(&mut self, msg: &[u8]) {
-        let length = msg.len();
-        let nbuf = self.nbuf;
-        debug_assert!(nbuf < BUFFER_SIZE);
-        debug_assert!(nbuf + length >= BUFFER_SIZE);
+        unsafe {
+            let length = msg.len();
+            let nbuf = self.nbuf;
+            debug_assert!(nbuf < BUFFER_SIZE);
+            debug_assert!(nbuf + length >= BUFFER_SIZE);
 
-        // Always copy first part of input into current element of buffer.
-        // This function should only be called when the write fills the buffer,
-        // so we know that there is enough input to fill the current element.
-        let valid_in_elem = nbuf % ELEM_SIZE;
-        let needed_in_elem = ELEM_SIZE - valid_in_elem;
+            // Always copy first part of input into current element of buffer.
+            // This function should only be called when the write fills the buffer,
+            // so we know that there is enough input to fill the current element.
+            let valid_in_elem = nbuf % ELEM_SIZE;
+            let needed_in_elem = ELEM_SIZE - valid_in_elem;
 
-        let src = msg.as_ptr();
-        let dst = (self.buf.as_mut_ptr() as *mut u8).add(nbuf);
-        copy_nonoverlapping_small(src, dst, needed_in_elem);
+            let src = msg.as_ptr();
+            let dst = (self.buf.as_mut_ptr() as *mut u8).add(nbuf);
+            copy_nonoverlapping_small(src, dst, needed_in_elem);
 
-        // Process buffer.
+            // Process buffer.
 
-        // Using `nbuf / ELEM_SIZE + 1` rather than `(nbuf + needed_in_elem) /
-        // ELEM_SIZE` to show the compiler that this loop's upper bound is > 0.
-        // We know that is true, because last step ensured we have a full
-        // element in the buffer.
-        let last = nbuf / ELEM_SIZE + 1;
+            // Using `nbuf / ELEM_SIZE + 1` rather than `(nbuf + needed_in_elem) /
+            // ELEM_SIZE` to show the compiler that this loop's upper bound is > 0.
+            // We know that is true, because last step ensured we have a full
+            // element in the buffer.
+            let last = nbuf / ELEM_SIZE + 1;
 
-        for i in 0..last {
-            let elem = self.buf.get_unchecked(i).assume_init().to_le();
-            self.state.v3 ^= elem;
-            Sip24Rounds::c_rounds(&mut self.state);
-            self.state.v0 ^= elem;
+            for i in 0..last {
+                let elem = self.buf.get_unchecked(i).assume_init().to_le();
+                self.state.v3 ^= elem;
+                Sip13Rounds::c_rounds(&mut self.state);
+                self.state.v0 ^= elem;
+            }
+
+            // Process the remaining element-sized chunks of input.
+            let mut processed = needed_in_elem;
+            let input_left = length - processed;
+            let elems_left = input_left / ELEM_SIZE;
+            let extra_bytes_left = input_left % ELEM_SIZE;
+
+            for _ in 0..elems_left {
+                let elem = (msg.as_ptr().add(processed) as *const u64).read_unaligned().to_le();
+                self.state.v3 ^= elem;
+                Sip13Rounds::c_rounds(&mut self.state);
+                self.state.v0 ^= elem;
+                processed += ELEM_SIZE;
+            }
+
+            // Copy remaining input into start of buffer.
+            let src = msg.as_ptr().add(processed);
+            let dst = self.buf.as_mut_ptr() as *mut u8;
+            copy_nonoverlapping_small(src, dst, extra_bytes_left);
+
+            self.nbuf = extra_bytes_left;
+            self.processed += nbuf + processed;
         }
-
-        // Process the remaining element-sized chunks of input.
-        let mut processed = needed_in_elem;
-        let input_left = length - processed;
-        let elems_left = input_left / ELEM_SIZE;
-        let extra_bytes_left = input_left % ELEM_SIZE;
-
-        for _ in 0..elems_left {
-            let elem = (msg.as_ptr().add(processed) as *const u64).read_unaligned().to_le();
-            self.state.v3 ^= elem;
-            Sip24Rounds::c_rounds(&mut self.state);
-            self.state.v0 ^= elem;
-            processed += ELEM_SIZE;
-        }
-
-        // Copy remaining input into start of buffer.
-        let src = msg.as_ptr().add(processed);
-        let dst = self.buf.as_mut_ptr() as *mut u8;
-        copy_nonoverlapping_small(src, dst, extra_bytes_left);
-
-        self.nbuf = extra_bytes_left;
-        self.processed += nbuf + processed;
     }
 
     #[inline]
@@ -370,7 +374,7 @@ impl SipHasher128 {
         for i in 0..last {
             let elem = unsafe { self.buf.get_unchecked(i).assume_init().to_le() };
             state.v3 ^= elem;
-            Sip24Rounds::c_rounds(&mut state);
+            Sip13Rounds::c_rounds(&mut state);
             state.v0 ^= elem;
         }
 
@@ -394,15 +398,15 @@ impl SipHasher128 {
         let b: u64 = ((length as u64 & 0xff) << 56) | elem;
 
         state.v3 ^= b;
-        Sip24Rounds::c_rounds(&mut state);
+        Sip13Rounds::c_rounds(&mut state);
         state.v0 ^= b;
 
         state.v2 ^= 0xee;
-        Sip24Rounds::d_rounds(&mut state);
+        Sip13Rounds::d_rounds(&mut state);
         let _0 = state.v0 ^ state.v1 ^ state.v2 ^ state.v3;
 
         state.v1 ^= 0xdd;
-        Sip24Rounds::d_rounds(&mut state);
+        Sip13Rounds::d_rounds(&mut state);
         let _1 = state.v0 ^ state.v1 ^ state.v2 ^ state.v3;
 
         (_0, _1)
@@ -412,57 +416,65 @@ impl SipHasher128 {
 impl Hasher for SipHasher128 {
     #[inline]
     fn write_u8(&mut self, i: u8) {
-        self.short_write(i);
+        self.short_write(i.to_ne_bytes());
     }
 
     #[inline]
     fn write_u16(&mut self, i: u16) {
-        self.short_write(i);
+        self.short_write(i.to_ne_bytes());
     }
 
     #[inline]
     fn write_u32(&mut self, i: u32) {
-        self.short_write(i);
+        self.short_write(i.to_ne_bytes());
     }
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.short_write(i);
+        self.short_write(i.to_ne_bytes());
     }
 
     #[inline]
     fn write_usize(&mut self, i: usize) {
-        self.short_write(i);
+        self.short_write(i.to_ne_bytes());
     }
 
     #[inline]
     fn write_i8(&mut self, i: i8) {
-        self.short_write(i as u8);
+        self.short_write((i as u8).to_ne_bytes());
     }
 
     #[inline]
     fn write_i16(&mut self, i: i16) {
-        self.short_write(i as u16);
+        self.short_write((i as u16).to_ne_bytes());
     }
 
     #[inline]
     fn write_i32(&mut self, i: i32) {
-        self.short_write(i as u32);
+        self.short_write((i as u32).to_ne_bytes());
     }
 
     #[inline]
     fn write_i64(&mut self, i: i64) {
-        self.short_write(i as u64);
+        self.short_write((i as u64).to_ne_bytes());
     }
 
     #[inline]
     fn write_isize(&mut self, i: isize) {
-        self.short_write(i as usize);
+        self.short_write((i as usize).to_ne_bytes());
     }
 
     #[inline]
     fn write(&mut self, msg: &[u8]) {
         self.slice_write(msg);
+    }
+
+    #[inline]
+    fn write_str(&mut self, s: &str) {
+        // This hasher works byte-wise, and `0xFF` cannot show up in a `str`,
+        // so just hashing the one extra byte is enough to be prefix-free.
+        self.write(s.as_bytes());
+        self.write_u8(0xFF);
     }
 
     fn finish(&self) -> u64 {
@@ -471,18 +483,16 @@ impl Hasher for SipHasher128 {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Sip24Rounds;
+struct Sip13Rounds;
 
-impl Sip24Rounds {
+impl Sip13Rounds {
     #[inline]
     fn c_rounds(state: &mut State) {
-        compress!(state);
         compress!(state);
     }
 
     #[inline]
     fn d_rounds(state: &mut State) {
-        compress!(state);
         compress!(state);
         compress!(state);
         compress!(state);

@@ -3,8 +3,7 @@ use rustc_ast::ast;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::source_map::{BytePos, Span};
-use std::convert::TryFrom;
+use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -17,7 +16,7 @@ declare_clippy_lint! {
     /// display settings of the author and reader differ.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// ///
     /// /// Struct to hold two strings:
     /// /// 	- first		one
@@ -35,7 +34,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Will be converted to:
-    /// ```rust
+    /// ```no_run
     /// ///
     /// /// Struct to hold two strings:
     /// ///     - first        one
@@ -51,6 +50,7 @@ declare_clippy_lint! {
     ///    second_string: String,
     ///}
     /// ```
+    #[clippy::version = "1.41.0"]
     pub TABS_IN_DOC_COMMENTS,
     style,
     "using tabs in doc comments is not recommended"
@@ -63,7 +63,7 @@ impl TabsInDocComments {
         if let ast::AttrKind::DocComment(_, comment) = attr.kind {
             let comment = comment.as_str();
 
-            for (lo, hi) in get_chunks_of_tabs(&comment) {
+            for (lo, hi) in get_chunks_of_tabs(comment) {
                 // +3 skips the opening delimiter
                 let new_span = Span::new(
                     attr.span.lo() + BytePos(3 + lo),

@@ -5,6 +5,7 @@ LL |     let _ = format!("error: something failed at {}", Location::caller().to_
    |                                                                        ^^^^^^^^^^^^ help: remove this
    |
    = note: `-D clippy::to-string-in-format-args` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::to_string_in_format_args)]`
 
 error: `to_string` applied to a type that implements `Display` in `write!` args
   --> $DIR/format_args.rs:80:27
@@ -126,5 +127,29 @@ error: `to_string` applied to a type that implements `Display` in `println!` arg
 LL |     println!("{foo}{bar}", bar = "bar", foo = "foo".to_string());
    |                                                    ^^^^^^^^^^^^ help: remove this
 
-error: aborting due to 21 previous errors
+error: `to_string` applied to a type that implements `Display` in `print!` args
+  --> $DIR/format_args.rs:117:37
+   |
+LL |     print!("{}", (Location::caller().to_string()));
+   |                                     ^^^^^^^^^^^^ help: remove this
+
+error: `to_string` applied to a type that implements `Display` in `print!` args
+  --> $DIR/format_args.rs:118:39
+   |
+LL |     print!("{}", ((Location::caller()).to_string()));
+   |                                       ^^^^^^^^^^^^ help: remove this
+
+error: `to_string` applied to a type that implements `Display` in `format!` args
+  --> $DIR/format_args.rs:146:38
+   |
+LL |         let x = format!("{} {}", a, b.to_string());
+   |                                      ^^^^^^^^^^^^ help: remove this
+
+error: `to_string` applied to a type that implements `Display` in `println!` args
+  --> $DIR/format_args.rs:160:24
+   |
+LL |         println!("{}", original[..10].to_string());
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use this: `&original[..10]`
+
+error: aborting due to 25 previous errors
 

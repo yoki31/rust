@@ -1,14 +1,20 @@
 use crate::io::prelude::*;
 
-use crate::fs::{self, File, OpenOptions};
-use crate::io::{ErrorKind, SeekFrom};
+use crate::env;
+use crate::fs::{self, File, FileTimes, OpenOptions};
+use crate::io::{BorrowedBuf, ErrorKind, SeekFrom};
+use crate::mem::MaybeUninit;
 use crate::path::Path;
 use crate::str;
+use crate::sync::Arc;
 use crate::sys_common::io::test::{tmpdir, TempDir};
 use crate::thread;
+use crate::time::{Duration, Instant, SystemTime};
 
-use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rand::RngCore;
 
+#[cfg(target_os = "macos")]
+use crate::ffi::{c_char, c_int};
 #[cfg(unix)]
 use crate::os::unix::fs::symlink as symlink_dir;
 #[cfg(unix)]
@@ -21,14 +27,12 @@ use crate::os::windows::fs::{symlink_dir, symlink_file};
 use crate::sys::fs::symlink_junction;
 #[cfg(target_os = "macos")]
 use crate::sys::weak::weak;
-#[cfg(target_os = "macos")]
-use libc::{c_char, c_int};
 
 macro_rules! check {
     ($e:expr) => {
         match $e {
             Ok(t) => t,
-            Err(e) => panic!("{} failed with: {}", stringify!($e), e),
+            Err(e) => panic!("{} failed with: {e}", stringify!($e)),
         }
     };
 }
@@ -38,10 +42,9 @@ macro_rules! error {
     ($e:expr, $s:expr) => {
         match $e {
             Ok(_) => panic!("Unexpected success. Should've been: {:?}", $s),
-            Err(ref err) => assert!(
-                err.raw_os_error() == Some($s),
-                format!("`{}` did not have a code of `{}`", err, $s)
-            ),
+            Err(ref err) => {
+                assert!(err.raw_os_error() == Some($s), "`{}` did not have a code of `{}`", err, $s)
+            }
         }
     };
 }
@@ -58,7 +61,7 @@ macro_rules! error_contains {
         match $e {
             Ok(_) => panic!("Unexpected success. Should've been: {:?}", $s),
             Err(ref err) => {
-                assert!(err.to_string().contains($s), format!("`{}` did not contain `{}`", err, $s))
+                assert!(err.to_string().contains($s), "`{}` did not contain `{}`", err, $s)
             }
         }
     };
@@ -400,6 +403,23 @@ fn file_test_io_seek_read_write() {
 }
 
 #[test]
+fn file_test_read_buf() {
+    let tmpdir = tmpdir();
+    let filename = &tmpdir.join("test");
+    check!(fs::write(filename, &[1, 2, 3, 4]));
+
+    let mut buf: [MaybeUninit<u8>; 128] = MaybeUninit::uninit_array();
+    let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+    let mut file = check!(File::open(filename));
+    check!(file.read_buf(buf.unfilled()));
+    assert_eq!(buf.filled(), &[1, 2, 3, 4]);
+    // File::read_buf should omit buffer initialization.
+    assert_eq!(buf.init_len(), 4);
+
+    check!(fs::remove_file(filename));
+}
+
+#[test]
 fn file_test_stat_is_correct_on_is_file() {
     let tmpdir = tmpdir();
     let filename = &tmpdir.join("file_stat_correct_on_is_file.txt");
@@ -469,7 +489,7 @@ fn file_test_directoryinfo_readdir() {
     check!(fs::create_dir(dir));
     let prefix = "foo";
     for n in 0..3 {
-        let f = dir.join(&format!("{}.txt", n));
+        let f = dir.join(&format!("{n}.txt"));
         let mut w = check!(File::create(&f));
         let msg_str = format!("{}{}", prefix, n.to_string());
         let msg = msg_str.as_bytes();
@@ -603,6 +623,21 @@ fn recursive_rmdir_of_symlink() {
 }
 
 #[test]
+fn recursive_rmdir_of_file_fails() {
+    // test we do not delete a directly specified file.
+    let tmpdir = tmpdir();
+    let canary = tmpdir.join("do_not_delete");
+    check!(check!(File::create(&canary)).write(b"foo"));
+    let result = fs::remove_dir_all(&canary);
+    #[cfg(unix)]
+    error!(result, "Not a directory");
+    #[cfg(windows)]
+    error!(result, 267); // ERROR_DIRECTORY - The directory name is invalid.
+    assert!(result.is_err());
+    assert!(canary.exists());
+}
+
+#[test]
 // only Windows makes a distinction between file and directory symlinks.
 #[cfg(windows)]
 fn recursive_rmdir_of_file_symlink() {
@@ -618,6 +653,59 @@ fn recursive_rmdir_of_file_symlink() {
     match fs::remove_dir_all(&f2) {
         Ok(..) => panic!("wanted a failure"),
         Err(..) => {}
+    }
+}
+
+#[test]
+#[ignore] // takes too much time
+fn recursive_rmdir_toctou() {
+    // Test for time-of-check to time-of-use issues.
+    //
+    // Scenario:
+    // The attacker wants to get directory contents deleted, to which they do not have access.
+    // They have a way to get a privileged Rust binary call `std::fs::remove_dir_all()` on a
+    // directory they control, e.g. in their home directory.
+    //
+    // The POC sets up the `attack_dest/attack_file` which the attacker wants to have deleted.
+    // The attacker repeatedly creates a directory and replaces it with a symlink from
+    // `victim_del` to `attack_dest` while the victim code calls `std::fs::remove_dir_all()`
+    // on `victim_del`. After a few seconds the attack has succeeded and
+    // `attack_dest/attack_file` is deleted.
+    let tmpdir = tmpdir();
+    let victim_del_path = tmpdir.join("victim_del");
+    let victim_del_path_clone = victim_del_path.clone();
+
+    // setup dest
+    let attack_dest_dir = tmpdir.join("attack_dest");
+    let attack_dest_dir = attack_dest_dir.as_path();
+    fs::create_dir(attack_dest_dir).unwrap();
+    let attack_dest_file = tmpdir.join("attack_dest/attack_file");
+    File::create(&attack_dest_file).unwrap();
+
+    let drop_canary_arc = Arc::new(());
+    let drop_canary_weak = Arc::downgrade(&drop_canary_arc);
+
+    eprintln!("x: {:?}", &victim_del_path);
+
+    // victim just continuously removes `victim_del`
+    thread::spawn(move || {
+        while drop_canary_weak.upgrade().is_some() {
+            let _ = fs::remove_dir_all(&victim_del_path_clone);
+        }
+    });
+
+    // attacker (could of course be in a separate process)
+    let start_time = Instant::now();
+    while Instant::now().duration_since(start_time) < Duration::from_secs(1000) {
+        if !attack_dest_file.exists() {
+            panic!(
+                "Victim deleted symlinked file outside of victim_del. Attack succeeded in {:?}.",
+                Instant::now().duration_since(start_time)
+            );
+        }
+        let _ = fs::create_dir(&victim_del_path);
+        let _ = fs::remove_dir(&victim_del_path);
+        let _ = symlink_dir(attack_dest_dir, &victim_del_path);
     }
 }
 
@@ -831,15 +919,26 @@ fn symlink_noexist() {
 
 #[test]
 fn read_link() {
+    let tmpdir = tmpdir();
     if cfg!(windows) {
         // directory symlink
         assert_eq!(check!(fs::read_link(r"C:\Users\All Users")), Path::new(r"C:\ProgramData"));
         // junction
         assert_eq!(check!(fs::read_link(r"C:\Users\Default User")), Path::new(r"C:\Users\Default"));
         // junction with special permissions
-        assert_eq!(check!(fs::read_link(r"C:\Documents and Settings\")), Path::new(r"C:\Users"));
+        // Since not all localized windows versions contain the folder "Documents and Settings" in english,
+        // we will briefly check, if it exists and otherwise skip the test. Except during CI we will always execute the test.
+        if Path::new(r"C:\Documents and Settings\").exists() || env::var_os("CI").is_some() {
+            assert_eq!(
+                check!(fs::read_link(r"C:\Documents and Settings\")),
+                Path::new(r"C:\Users")
+            );
+        }
+        // Check that readlink works with non-drive paths on Windows.
+        let link = tmpdir.join("link_unc");
+        check!(symlink_dir(r"\\localhost\c$\", &link));
+        assert_eq!(check!(fs::read_link(&link)), Path::new(r"\\localhost\c$\"));
     }
-    let tmpdir = tmpdir();
     let link = tmpdir.join("link");
     if !got_symlink_permission(&tmpdir) {
         return;
@@ -858,6 +957,7 @@ fn readlink_not_symlink() {
 }
 
 #[test]
+#[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating hardlinks
 fn links_work() {
     let tmpdir = tmpdir();
     let input = tmpdir.join("in.txt");
@@ -1104,7 +1204,7 @@ fn _assert_send_sync() {
 #[test]
 fn binary_file() {
     let mut bytes = [0; 1024];
-    StdRng::from_entropy().fill_bytes(&mut bytes);
+    crate::test_helpers::test_rng().fill_bytes(&mut bytes);
 
     let tmpdir = tmpdir();
 
@@ -1117,7 +1217,7 @@ fn binary_file() {
 #[test]
 fn write_then_read() {
     let mut bytes = [0; 1024];
-    StdRng::from_entropy().fill_bytes(&mut bytes);
+    crate::test_helpers::test_rng().fill_bytes(&mut bytes);
 
     let tmpdir = tmpdir();
 
@@ -1260,7 +1360,7 @@ fn dir_entry_methods() {
                 assert!(file.file_type().unwrap().is_file());
                 assert!(file.metadata().unwrap().is_file());
             }
-            f => panic!("unknown file name: {:?}", f),
+            f => panic!("unknown file name: {f:?}"),
         }
     }
 }
@@ -1271,7 +1371,7 @@ fn dir_entry_debug() {
     File::create(&tmpdir.join("b")).unwrap();
     let mut read_dir = tmpdir.path().read_dir().unwrap();
     let dir_entry = read_dir.next().unwrap().unwrap();
-    let actual = format!("{:?}", dir_entry);
+    let actual = format!("{dir_entry:?}");
     let expected = format!("DirEntry({:?})", dir_entry.0.path());
     assert_eq!(actual, expected);
 }
@@ -1279,6 +1379,12 @@ fn dir_entry_debug() {
 #[test]
 fn read_dir_not_found() {
     let res = fs::read_dir("/path/that/does/not/exist");
+    assert_eq!(res.err().unwrap().kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn file_open_not_found() {
+    let res = File::open("/path/that/does/not/exist");
     assert_eq!(res.err().unwrap().kind(), ErrorKind::NotFound);
 }
 
@@ -1340,7 +1446,7 @@ fn metadata_access_times() {
                     || e1.kind() == ErrorKind::Unsupported
                         && e2.kind() == ErrorKind::Unsupported => {}
             (a, b) => {
-                panic!("creation time must be always supported or not supported: {:?} {:?}", a, b,)
+                panic!("creation time must be always supported or not supported: {a:?} {b:?}")
             }
         }
     }
@@ -1348,6 +1454,7 @@ fn metadata_access_times() {
 
 /// Test creating hard links to symlinks.
 #[test]
+#[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating hardlinks
 fn symlink_hard_link() {
     let tmpdir = tmpdir();
     if !got_symlink_permission(&tmpdir) {
@@ -1369,7 +1476,7 @@ fn symlink_hard_link() {
     // "hard_link" should appear as a symlink.
     assert!(check!(fs::symlink_metadata(tmpdir.join("hard_link"))).file_type().is_symlink());
 
-    // We sould be able to open "file" via any of the above names.
+    // We should be able to open "file" via any of the above names.
     let _ = check!(fs::File::open(tmpdir.join("file")));
     assert!(fs::File::open(tmpdir.join("file.renamed")).is_err());
     let _ = check!(fs::File::open(tmpdir.join("symlink")));
@@ -1434,4 +1541,255 @@ fn create_dir_long_paths() {
     // #90940: Ensure an empty path returns the "Not Found" error.
     let path = Path::new("");
     assert_eq!(path.canonicalize().unwrap_err().kind(), crate::io::ErrorKind::NotFound);
+}
+
+/// Ensure ReadDir works on large directories.
+/// Regression test for https://github.com/rust-lang/rust/issues/93384.
+#[test]
+fn read_large_dir() {
+    let tmpdir = tmpdir();
+
+    let count = 32 * 1024;
+    for i in 0..count {
+        check!(fs::File::create(tmpdir.join(&i.to_string())));
+    }
+
+    for entry in fs::read_dir(tmpdir.path()).unwrap() {
+        entry.unwrap();
+    }
+}
+
+/// Test the fallback for getting the metadata of files like hiberfil.sys that
+/// Windows holds a special lock on, preventing normal means of querying
+/// metadata. See #96980.
+///
+/// Note this fails in CI because `hiberfil.sys` does not actually exist there.
+/// Therefore it's marked as ignored.
+#[test]
+#[ignore]
+#[cfg(windows)]
+fn hiberfil_sys() {
+    let hiberfil = Path::new(r"C:\hiberfil.sys");
+    assert_eq!(true, hiberfil.try_exists().unwrap());
+    fs::symlink_metadata(hiberfil).unwrap();
+    fs::metadata(hiberfil).unwrap();
+    assert_eq!(true, hiberfil.exists());
+}
+
+/// Test that two different ways of obtaining the FileType give the same result.
+/// Cf. https://github.com/rust-lang/rust/issues/104900
+#[test]
+fn test_eq_direntry_metadata() {
+    let tmpdir = tmpdir();
+    let file_path = tmpdir.join("file");
+    File::create(file_path).unwrap();
+    for e in fs::read_dir(tmpdir.path()).unwrap() {
+        let e = e.unwrap();
+        let p = e.path();
+        let ft1 = e.file_type().unwrap();
+        let ft2 = p.metadata().unwrap().file_type();
+        assert_eq!(ft1, ft2);
+    }
+}
+
+/// Regression test for https://github.com/rust-lang/rust/issues/50619.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_read_dir_infinite_loop() {
+    use crate::io::ErrorKind;
+    use crate::process::Command;
+
+    // Create a zombie child process
+    let Ok(mut child) = Command::new("echo").spawn() else { return };
+
+    // Make sure the process is (un)dead
+    match child.kill() {
+        // InvalidInput means the child already exited
+        Err(e) if e.kind() != ErrorKind::InvalidInput => return,
+        _ => {}
+    }
+
+    // open() on this path will succeed, but readdir() will fail
+    let id = child.id();
+    let path = format!("/proc/{id}/net");
+
+    // Skip the test if we can't open the directory in the first place
+    let Ok(dir) = fs::read_dir(path) else { return };
+
+    // Check for duplicate errors
+    assert!(dir.filter(|e| e.is_err()).take(2).count() < 2);
+}
+
+#[test]
+fn rename_directory() {
+    let tmpdir = tmpdir();
+    let old_path = tmpdir.join("foo/bar/baz");
+    fs::create_dir_all(&old_path).unwrap();
+    let test_file = &old_path.join("temp.txt");
+
+    File::create(test_file).unwrap();
+
+    let new_path = tmpdir.join("quux/blat");
+    fs::create_dir_all(&new_path).unwrap();
+    fs::rename(&old_path, &new_path.join("newdir")).unwrap();
+    assert!(new_path.join("newdir").is_dir());
+    assert!(new_path.join("newdir/temp.txt").exists());
+}
+
+#[test]
+fn test_file_times() {
+    #[cfg(target_os = "ios")]
+    use crate::os::ios::fs::FileTimesExt;
+    #[cfg(target_os = "macos")]
+    use crate::os::macos::fs::FileTimesExt;
+    #[cfg(target_os = "tvos")]
+    use crate::os::tvos::fs::FileTimesExt;
+    #[cfg(target_os = "tvos")]
+    use crate::os::tvos::fs::FileTimesExt;
+    #[cfg(target_os = "watchos")]
+    use crate::os::watchos::fs::FileTimesExt;
+    #[cfg(windows)]
+    use crate::os::windows::fs::FileTimesExt;
+
+    let tmp = tmpdir();
+    let file = File::create(tmp.join("foo")).unwrap();
+    let mut times = FileTimes::new();
+    let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(12345);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(54321);
+    times = times.set_accessed(accessed).set_modified(modified);
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "watchos",
+        target_os = "tvos",
+    ))]
+    let created = SystemTime::UNIX_EPOCH + Duration::from_secs(32123);
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "watchos",
+        target_os = "tvos",
+    ))]
+    {
+        times = times.set_created(created);
+    }
+    match file.set_times(times) {
+        // Allow unsupported errors on platforms which don't support setting times.
+        #[cfg(not(any(
+            windows,
+            all(
+                unix,
+                not(any(
+                    target_os = "android",
+                    target_os = "redox",
+                    target_os = "espidf",
+                    target_os = "horizon"
+                ))
+            )
+        )))]
+        Err(e) if e.kind() == ErrorKind::Unsupported => return,
+        Err(e) => panic!("error setting file times: {e:?}"),
+        Ok(_) => {}
+    }
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.accessed().unwrap(), accessed);
+    assert_eq!(metadata.modified().unwrap(), modified);
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "watchos",
+        target_os = "tvos",
+    ))]
+    {
+        assert_eq!(metadata.created().unwrap(), created);
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+fn test_file_times_pre_epoch_with_nanos() {
+    #[cfg(target_os = "ios")]
+    use crate::os::ios::fs::FileTimesExt;
+    #[cfg(target_os = "macos")]
+    use crate::os::macos::fs::FileTimesExt;
+    #[cfg(target_os = "tvos")]
+    use crate::os::tvos::fs::FileTimesExt;
+    #[cfg(target_os = "watchos")]
+    use crate::os::watchos::fs::FileTimesExt;
+
+    let tmp = tmpdir();
+    let file = File::create(tmp.join("foo")).unwrap();
+
+    for (accessed, modified, created) in [
+        // The first round is to set filetimes to something we know works, but this time
+        // it's validated with nanoseconds as well which probe the numeric boundary.
+        (
+            SystemTime::UNIX_EPOCH + Duration::new(12345, 1),
+            SystemTime::UNIX_EPOCH + Duration::new(54321, 100_000_000),
+            SystemTime::UNIX_EPOCH + Duration::new(32123, 999_999_999),
+        ),
+        // The second rounds uses pre-epoch dates along with nanoseconds that probe
+        // the numeric boundary.
+        (
+            SystemTime::UNIX_EPOCH - Duration::new(1, 1),
+            SystemTime::UNIX_EPOCH - Duration::new(60, 100_000_000),
+            SystemTime::UNIX_EPOCH - Duration::new(3600, 999_999_999),
+        ),
+    ] {
+        let mut times = FileTimes::new();
+        times = times.set_accessed(accessed).set_modified(modified).set_created(created);
+        file.set_times(times).unwrap();
+
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.accessed().unwrap(), accessed);
+        assert_eq!(metadata.modified().unwrap(), modified);
+        assert_eq!(metadata.created().unwrap(), created);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_unix_socket_exists() {
+    use crate::sys::{c, net};
+    use crate::{mem, ptr};
+
+    let tmp = tmpdir();
+    let socket_path = tmp.join("socket");
+
+    // std doesn't currently support Unix sockets on Windows so manually create one here.
+    net::init();
+    unsafe {
+        let socket = c::WSASocketW(
+            c::AF_UNIX as i32,
+            c::SOCK_STREAM,
+            0,
+            ptr::null_mut(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        );
+        // AF_UNIX is not supported on earlier versions of Windows,
+        // so skip this test if it's unsupported and we're not in CI.
+        if socket == c::INVALID_SOCKET {
+            let error = c::WSAGetLastError();
+            if env::var_os("CI").is_none() && error == c::WSAEAFNOSUPPORT {
+                return;
+            } else {
+                panic!("Creating AF_UNIX socket failed (OS error {error})");
+            }
+        }
+        let mut addr = c::SOCKADDR_UN { sun_family: c::AF_UNIX, sun_path: mem::zeroed() };
+        let bytes = socket_path.as_os_str().as_encoded_bytes();
+        addr.sun_path[..bytes.len()].copy_from_slice(bytes);
+        let len = mem::size_of_val(&addr) as i32;
+        let result = c::bind(socket, ptr::addr_of!(addr).cast::<c::SOCKADDR>(), len);
+        c::closesocket(socket);
+        assert_eq!(result, 0);
+    }
+    // Make sure all ways of testing a file exist work for a Unix socket.
+    assert_eq!(socket_path.exists(), true);
+    assert_eq!(socket_path.try_exists().unwrap(), true);
+    assert_eq!(socket_path.metadata().is_ok(), true);
 }

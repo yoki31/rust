@@ -48,6 +48,7 @@ impl<'tcx> Lift for PlaceElem<'tcx> {
         match *self {
             ProjectionElem::Deref => ProjectionElem::Deref,
             ProjectionElem::Field(f, ty) => ProjectionElem::Field(f, ty.lift()),
+            ProjectionElem::OpaqueCast(ty) => ProjectionElem::OpaqueCast(ty.lift()),
             ProjectionElem::Index(ref i) => ProjectionElem::Index(i.lift()),
             ProjectionElem::Subslice { from, to, from_end } => {
                 ProjectionElem::Subslice { from, to, from_end }
@@ -56,6 +57,7 @@ impl<'tcx> Lift for PlaceElem<'tcx> {
                 ProjectionElem::ConstantIndex { offset, min_length, from_end }
             }
             ProjectionElem::Downcast(a, u) => ProjectionElem::Downcast(a, u),
+            ProjectionElem::Subtype(ty) => ProjectionElem::Subtype(ty.lift()),
         }
     }
 }

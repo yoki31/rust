@@ -2,29 +2,31 @@
 //!
 //! See the `Qualif` trait for more info.
 
-use rustc_errors::ErrorReported;
-use rustc_hir as hir;
+use rustc_errors::ErrorGuaranteed;
+use rustc_hir::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::mir;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, subst::SubstsRef, AdtDef, Ty};
-use rustc_span::DUMMY_SP;
+use rustc_middle::traits::BuiltinImplSource;
+use rustc_middle::ty::{self, AdtDef, GenericArgsRef, Ty};
 use rustc_trait_selection::traits::{
-    self, ImplSource, Obligation, ObligationCause, SelectionContext,
+    self, ImplSource, Obligation, ObligationCause, ObligationCtxt, SelectionContext,
 };
 
 use super::ConstCx;
 
-pub fn in_any_value_of_ty(
+pub fn in_any_value_of_ty<'tcx>(
     cx: &ConstCx<'_, 'tcx>,
     ty: Ty<'tcx>,
-    error_occured: Option<ErrorReported>,
+    tainted_by_errors: Option<ErrorGuaranteed>,
 ) -> ConstQualifs {
     ConstQualifs {
         has_mut_interior: HasMutInterior::in_any_value_of_ty(cx, ty),
         needs_drop: NeedsDrop::in_any_value_of_ty(cx, ty),
-        needs_non_const_drop: NeedsNonConstDrop::in_any_value_of_ty(cx, ty),
+        // FIXME(effects)
+        needs_non_const_drop: NeedsDrop::in_any_value_of_ty(cx, ty),
         custom_eq: CustomEq::in_any_value_of_ty(cx, ty),
-        error_occured,
+        tainted_by_errors,
     }
 }
 
@@ -55,11 +57,11 @@ pub trait Qualif {
     /// Returns `true` if *any* value of the given type could possibly have this `Qualif`.
     ///
     /// This function determines `Qualif`s when we cannot do a value-based analysis. Since qualif
-    /// propagation is context-insenstive, this includes function arguments and values returned
+    /// propagation is context-insensitive, this includes function arguments and values returned
     /// from a call to another function.
     ///
     /// It also determines the `Qualif`s for primitive types.
-    fn in_any_value_of_ty(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool;
+    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool;
 
     /// Returns `true` if this `Qualif` is inherent to the given struct or enum.
     ///
@@ -69,10 +71,10 @@ pub trait Qualif {
     /// with a custom `Drop` impl is inherently `NeedsDrop`.
     ///
     /// Returning `true` for `in_adt_inherently` but `false` for `in_any_value_of_ty` is unsound.
-    fn in_adt_inherently(
+    fn in_adt_inherently<'tcx>(
         cx: &ConstCx<'_, 'tcx>,
-        adt: &'tcx AdtDef,
-        substs: SubstsRef<'tcx>,
+        adt: AdtDef<'tcx>,
+        args: GenericArgsRef<'tcx>,
     ) -> bool;
 }
 
@@ -90,14 +92,18 @@ impl Qualif for HasMutInterior {
         qualifs.has_mut_interior
     }
 
-    fn in_any_value_of_ty(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
-        !ty.is_freeze(cx.tcx.at(DUMMY_SP), cx.param_env)
+    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
+        !ty.is_freeze(cx.tcx, cx.param_env)
     }
 
-    fn in_adt_inherently(cx: &ConstCx<'_, 'tcx>, adt: &'tcx AdtDef, _: SubstsRef<'tcx>) -> bool {
+    fn in_adt_inherently<'tcx>(
+        _cx: &ConstCx<'_, 'tcx>,
+        adt: AdtDef<'tcx>,
+        _: GenericArgsRef<'tcx>,
+    ) -> bool {
         // Exactly one type, `UnsafeCell`, has the `HasMutInterior` qualif inherently.
         // It arises structurally for all other types.
-        Some(adt.did) == cx.tcx.lang_items().unsafe_cell_type()
+        adt.is_unsafe_cell()
     }
 }
 
@@ -116,11 +122,15 @@ impl Qualif for NeedsDrop {
         qualifs.needs_drop
     }
 
-    fn in_any_value_of_ty(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
+    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
         ty.needs_drop(cx.tcx, cx.param_env)
     }
 
-    fn in_adt_inherently(cx: &ConstCx<'_, 'tcx>, adt: &'tcx AdtDef, _: SubstsRef<'tcx>) -> bool {
+    fn in_adt_inherently<'tcx>(
+        cx: &ConstCx<'_, 'tcx>,
+        adt: AdtDef<'tcx>,
+        _: GenericArgsRef<'tcx>,
+    ) -> bool {
         adt.has_dtor(cx.tcx)
     }
 }
@@ -138,47 +148,55 @@ impl Qualif for NeedsNonConstDrop {
         qualifs.needs_non_const_drop
     }
 
-    fn in_any_value_of_ty(cx: &ConstCx<'_, 'tcx>, mut ty: Ty<'tcx>) -> bool {
-        // Avoid selecting for simple cases.
-        match ty::util::needs_drop_components(ty, &cx.tcx.data_layout).as_deref() {
-            Ok([]) => return false,
-            Err(ty::util::AlwaysRequiresDrop) => return true,
-            // If we've got a single component, select with that
-            // to increase the chance that we hit the selection cache.
-            Ok([t]) => ty = t,
-            Ok([..]) => {}
+    #[instrument(level = "trace", skip(cx), ret)]
+    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
+        // Avoid selecting for simple cases, such as builtin types.
+        if ty::util::is_trivially_const_drop(ty) {
+            return false;
         }
 
-        let Some(drop_trait) = cx.tcx.lang_items().drop_trait() else {
-            // there is no way to define a type that needs non-const drop
-            // without having the lang item present.
-            return false;
-        };
-        let trait_ref =
-            ty::TraitRef { def_id: drop_trait, substs: cx.tcx.mk_substs_trait(ty, &[]) };
+        // FIXME(effects) constness
         let obligation = Obligation::new(
-            ObligationCause::dummy(),
+            cx.tcx,
+            ObligationCause::dummy_with_span(cx.body.span),
             cx.param_env,
-            ty::Binder::dummy(ty::TraitPredicate {
-                trait_ref,
-                constness: ty::BoundConstness::ConstIfConst,
-                polarity: ty::ImplPolarity::Positive,
-            }),
+            ty::TraitRef::from_lang_item(cx.tcx, LangItem::Destruct, cx.body.span, [ty]),
         );
 
-        let implsrc = cx.tcx.infer_ctxt().enter(|infcx| {
-            let mut selcx = SelectionContext::with_constness(&infcx, hir::Constness::Const);
-            selcx.select(&obligation)
-        });
-        !matches!(
-            implsrc,
-            Ok(Some(
-                ImplSource::ConstDrop(_) | ImplSource::Param(_, ty::BoundConstness::ConstIfConst)
-            ))
-        )
+        let infcx = cx.tcx.infer_ctxt().build();
+        let mut selcx = SelectionContext::new(&infcx);
+        let Some(impl_src) = selcx.select(&obligation).ok().flatten() else {
+            // If we couldn't select a const destruct candidate, then it's bad
+            return true;
+        };
+
+        trace!(?impl_src);
+
+        if !matches!(
+            impl_src,
+            ImplSource::Builtin(BuiltinImplSource::Misc, _) | ImplSource::Param(_)
+        ) {
+            // If our const destruct candidate is not ConstDestruct or implied by the param env,
+            // then it's bad
+            return true;
+        }
+
+        if impl_src.borrow_nested_obligations().is_empty() {
+            return false;
+        }
+
+        // If we had any errors, then it's bad
+        let ocx = ObligationCtxt::new(&infcx);
+        ocx.register_obligations(impl_src.nested_obligations());
+        let errors = ocx.select_all_or_error();
+        !errors.is_empty()
     }
 
-    fn in_adt_inherently(cx: &ConstCx<'_, 'tcx>, adt: &'tcx AdtDef, _: SubstsRef<'tcx>) -> bool {
+    fn in_adt_inherently<'tcx>(
+        cx: &ConstCx<'_, 'tcx>,
+        adt: AdtDef<'tcx>,
+        _: GenericArgsRef<'tcx>,
+    ) -> bool {
         adt.has_non_const_dtor(cx.tcx)
     }
 }
@@ -193,22 +211,21 @@ impl Qualif for CustomEq {
         qualifs.custom_eq
     }
 
-    fn in_any_value_of_ty(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
+    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
         // If *any* component of a composite data type does not implement `Structural{Partial,}Eq`,
         // we know that at least some values of that type are not structural-match. I say "some"
         // because that component may be part of an enum variant (e.g.,
         // `Option::<NonStructuralMatchTy>::Some`), in which case some values of this type may be
         // structural-match (`Option::None`).
-        let id = cx.tcx.hir().local_def_id_to_hir_id(cx.def_id());
-        traits::search_for_structural_match_violation(id, cx.body.span, cx.tcx, ty).is_some()
+        traits::search_for_structural_match_violation(cx.body.span, cx.tcx, ty).is_some()
     }
 
-    fn in_adt_inherently(
+    fn in_adt_inherently<'tcx>(
         cx: &ConstCx<'_, 'tcx>,
-        adt: &'tcx AdtDef,
-        substs: SubstsRef<'tcx>,
+        def: AdtDef<'tcx>,
+        args: GenericArgsRef<'tcx>,
     ) -> bool {
-        let ty = cx.tcx.mk_ty(ty::Adt(adt, substs));
+        let ty = Ty::new_adt(cx.tcx, def, args);
         !ty.is_structural_eq_shallow(cx.tcx)
     }
 }
@@ -216,7 +233,11 @@ impl Qualif for CustomEq {
 // FIXME: Use `mir::visit::Visitor` for the `in_*` functions if/when it supports early return.
 
 /// Returns `true` if this `Rvalue` contains qualif `Q`.
-pub fn in_rvalue<Q, F>(cx: &ConstCx<'_, 'tcx>, in_local: &mut F, rvalue: &Rvalue<'tcx>) -> bool
+pub fn in_rvalue<'tcx, Q, F>(
+    cx: &ConstCx<'_, 'tcx>,
+    in_local: &mut F,
+    rvalue: &Rvalue<'tcx>,
+) -> bool
 where
     Q: Qualif,
     F: FnMut(Local) -> bool,
@@ -229,6 +250,8 @@ where
         Rvalue::Discriminant(place) | Rvalue::Len(place) => {
             in_place::<Q, _>(cx, in_local, place.as_ref())
         }
+
+        Rvalue::CopyForDeref(place) => in_place::<Q, _>(cx, in_local, place.as_ref()),
 
         Rvalue::Use(operand)
         | Rvalue::Repeat(operand, _)
@@ -255,8 +278,9 @@ where
         Rvalue::Aggregate(kind, operands) => {
             // Return early if we know that the struct or enum being constructed is always
             // qualified.
-            if let AggregateKind::Adt(def, _, substs, ..) = **kind {
-                if Q::in_adt_inherently(cx, def, substs) {
+            if let AggregateKind::Adt(adt_did, _, args, ..) = **kind {
+                let def = cx.tcx.adt_def(adt_did);
+                if Q::in_adt_inherently(cx, def, args) {
                     return true;
                 }
                 if def.is_union() && Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx)) {
@@ -271,7 +295,7 @@ where
 }
 
 /// Returns `true` if this `Place` contains qualif `Q`.
-pub fn in_place<Q, F>(cx: &ConstCx<'_, 'tcx>, in_local: &mut F, place: PlaceRef<'tcx>) -> bool
+pub fn in_place<'tcx, Q, F>(cx: &ConstCx<'_, 'tcx>, in_local: &mut F, place: PlaceRef<'tcx>) -> bool
 where
     Q: Qualif,
     F: FnMut(Local) -> bool,
@@ -282,7 +306,9 @@ where
             ProjectionElem::Index(index) if in_local(index) => return true,
 
             ProjectionElem::Deref
+            | ProjectionElem::Subtype(_)
             | ProjectionElem::Field(_, _)
+            | ProjectionElem::OpaqueCast(_)
             | ProjectionElem::ConstantIndex { .. }
             | ProjectionElem::Subslice { .. }
             | ProjectionElem::Downcast(_, _)
@@ -303,7 +329,11 @@ where
 }
 
 /// Returns `true` if this `Operand` contains qualif `Q`.
-pub fn in_operand<Q, F>(cx: &ConstCx<'_, 'tcx>, in_local: &mut F, operand: &Operand<'tcx>) -> bool
+pub fn in_operand<'tcx, Q, F>(
+    cx: &ConstCx<'_, 'tcx>,
+    in_local: &mut F,
+    operand: &Operand<'tcx>,
+) -> bool
 where
     Q: Qualif,
     F: FnMut(Local) -> bool,
@@ -317,30 +347,42 @@ where
     };
 
     // Check the qualifs of the value of `const` items.
-    if let Some(ct) = constant.literal.const_for_ty() {
-        if let ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs_: _, promoted }) = ct.val {
-            // Use qualifs of the type for the promoted. Promoteds in MIR body should be possible
-            // only for `NeedsNonConstDrop` with precise drop checking. This is the only const
-            // check performed after the promotion. Verify that with an assertion.
-            assert!(promoted.is_none() || Q::ALLOW_PROMOTED);
-            // Don't peek inside trait associated constants.
-            if promoted.is_none() && cx.tcx.trait_of_item(def.did).is_none() {
-                let qualifs = if let Some((did, param_did)) = def.as_const_arg() {
-                    cx.tcx.at(constant.span).mir_const_qualif_const_arg((did, param_did))
-                } else {
-                    cx.tcx.at(constant.span).mir_const_qualif(def.did)
-                };
+    let uneval = match constant.const_ {
+        Const::Ty(ct)
+            if matches!(
+                ct.kind(),
+                ty::ConstKind::Param(_) | ty::ConstKind::Error(_) | ty::ConstKind::Value(_)
+            ) =>
+        {
+            None
+        }
+        Const::Ty(c) => {
+            bug!("expected ConstKind::Param or ConstKind::Value here, found {:?}", c)
+        }
+        Const::Unevaluated(uv, _) => Some(uv),
+        Const::Val(..) => None,
+    };
 
-                if !Q::in_qualifs(&qualifs) {
-                    return false;
-                }
+    if let Some(mir::UnevaluatedConst { def, args: _, promoted }) = uneval {
+        // Use qualifs of the type for the promoted. Promoteds in MIR body should be possible
+        // only for `NeedsNonConstDrop` with precise drop checking. This is the only const
+        // check performed after the promotion. Verify that with an assertion.
+        assert!(promoted.is_none() || Q::ALLOW_PROMOTED);
 
-                // Just in case the type is more specific than
-                // the definition, e.g., impl associated const
-                // with type parameters, take it into account.
+        // Don't peek inside trait associated constants.
+        if promoted.is_none() && cx.tcx.trait_of_item(def).is_none() {
+            let qualifs = cx.tcx.at(constant.span).mir_const_qualif(def);
+
+            if !Q::in_qualifs(&qualifs) {
+                return false;
             }
+
+            // Just in case the type is more specific than
+            // the definition, e.g., impl associated const
+            // with type parameters, take it into account.
         }
     }
+
     // Otherwise use the qualifs of the type.
-    Q::in_any_value_of_ty(cx, constant.literal.ty())
+    Q::in_any_value_of_ty(cx, constant.const_.ty())
 }

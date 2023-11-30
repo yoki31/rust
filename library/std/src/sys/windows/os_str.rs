@@ -1,6 +1,7 @@
 /// The underlying OsString/OsStr implementation on Windows is a
 /// wrapper around the "WTF-8" encoding; see the `wtf8` module for more.
 use crate::borrow::Cow;
+use crate::collections::TryReserveError;
 use crate::fmt;
 use crate::mem;
 use crate::rc::Rc;
@@ -26,6 +27,7 @@ impl FromInner<Wtf8Buf> for Buf {
 }
 
 impl AsInner<Wtf8> for Buf {
+    #[inline]
     fn as_inner(&self) -> &Wtf8 {
         &self.inner
     }
@@ -43,6 +45,7 @@ impl fmt::Display for Buf {
     }
 }
 
+#[repr(transparent)]
 pub struct Slice {
     pub inner: Wtf8,
 }
@@ -60,6 +63,16 @@ impl fmt::Display for Slice {
 }
 
 impl Buf {
+    #[inline]
+    pub fn into_encoded_bytes(self) -> Vec<u8> {
+        self.inner.into_bytes()
+    }
+
+    #[inline]
+    pub unsafe fn from_encoded_bytes_unchecked(s: Vec<u8>) -> Self {
+        Self { inner: Wtf8Buf::from_bytes_unchecked(s) }
+    }
+
     pub fn with_capacity(capacity: usize) -> Buf {
         Buf { inner: Wtf8Buf::with_capacity(capacity) }
     }
@@ -104,8 +117,16 @@ impl Buf {
         self.inner.reserve(additional)
     }
 
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.inner.try_reserve(additional)
+    }
+
     pub fn reserve_exact(&mut self, additional: usize) {
         self.inner.reserve_exact(additional)
+    }
+
+    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.inner.try_reserve_exact(additional)
     }
 
     pub fn shrink_to_fit(&mut self) {
@@ -141,11 +162,21 @@ impl Buf {
 
 impl Slice {
     #[inline]
+    pub fn as_encoded_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+
+    #[inline]
+    pub unsafe fn from_encoded_bytes_unchecked(s: &[u8]) -> &Slice {
+        mem::transmute(Wtf8::from_bytes_unchecked(s))
+    }
+
+    #[inline]
     pub fn from_str(s: &str) -> &Slice {
         unsafe { mem::transmute(Wtf8::from_str(s)) }
     }
 
-    pub fn to_str(&self) -> Option<&str> {
+    pub fn to_str(&self) -> Result<&str, crate::str::Utf8Error> {
         self.inner.as_str()
     }
 
@@ -154,9 +185,7 @@ impl Slice {
     }
 
     pub fn to_owned(&self) -> Buf {
-        let mut buf = Wtf8Buf::with_capacity(self.inner.len());
-        buf.push_wtf8(&self.inner);
-        Buf { inner: buf }
+        Buf { inner: self.inner.to_owned() }
     }
 
     pub fn clone_into(&self, buf: &mut Buf) {

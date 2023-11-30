@@ -1,11 +1,13 @@
 use crate::cmp::Ordering;
-use crate::convert::TryInto;
 use crate::fmt;
 use crate::mem;
+use crate::ptr::null;
 use crate::sys::c;
+use crate::sys_common::IntoInner;
 use crate::time::Duration;
 
 use core::hash::{Hash, Hasher};
+use core::ops::Neg;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const INTERVALS_PER_SEC: u64 = NANOS_PER_SEC / 100;
@@ -39,14 +41,6 @@ impl Instant {
         // In order to keep unit conversions out of normal interval math, we
         // measure in QPC units and immediately convert to nanoseconds.
         perf_counter::PerformanceCounterInstant::now().into()
-    }
-
-    pub fn actually_monotonic() -> bool {
-        false
-    }
-
-    pub const fn zero() -> Instant {
-        Instant { t: Duration::from_secs(0) }
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
@@ -145,6 +139,12 @@ impl From<c::FILETIME> for SystemTime {
     }
 }
 
+impl IntoInner<c::FILETIME> for SystemTime {
+    fn into_inner(self) -> c::FILETIME {
+        self.t
+    }
+}
+
 impl Hash for SystemTime {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.intervals().hash(state)
@@ -222,5 +222,41 @@ mod perf_counter {
         let mut qpc_value: c::LARGE_INTEGER = 0;
         cvt(unsafe { c::QueryPerformanceCounter(&mut qpc_value) }).unwrap();
         qpc_value
+    }
+}
+
+/// A timer you can wait on.
+pub(super) struct WaitableTimer {
+    handle: c::HANDLE,
+}
+impl WaitableTimer {
+    /// Create a high-resolution timer. Will fail before Windows 10, version 1803.
+    pub fn high_resolution() -> Result<Self, ()> {
+        let handle = unsafe {
+            c::CreateWaitableTimerExW(
+                null(),
+                null(),
+                c::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                c::TIMER_ALL_ACCESS,
+            )
+        };
+        if !handle.is_null() { Ok(Self { handle }) } else { Err(()) }
+    }
+    pub fn set(&self, duration: Duration) -> Result<(), ()> {
+        // Convert the Duration to a format similar to FILETIME.
+        // Negative values are relative times whereas positive values are absolute.
+        // Therefore we negate the relative duration.
+        let time = checked_dur2intervals(&duration).ok_or(())?.neg();
+        let result = unsafe { c::SetWaitableTimer(self.handle, &time, 0, None, null(), c::FALSE) };
+        if result != 0 { Ok(()) } else { Err(()) }
+    }
+    pub fn wait(&self) -> Result<(), ()> {
+        let result = unsafe { c::WaitForSingleObject(self.handle, c::INFINITE) };
+        if result != c::WAIT_FAILED { Ok(()) } else { Err(()) }
+    }
+}
+impl Drop for WaitableTimer {
+    fn drop(&mut self) {
+        unsafe { c::CloseHandle(self.handle) };
     }
 }

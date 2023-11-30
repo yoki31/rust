@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::needless_bool)]
 #![allow(
     unused,
@@ -7,8 +5,10 @@
     clippy::no_effect,
     clippy::if_same_then_else,
     clippy::equatable_if_let,
+    clippy::needless_if,
     clippy::needless_return,
-    clippy::self_named_constructors
+    clippy::self_named_constructors,
+    clippy::struct_field_names
 )]
 
 use std::cell::Cell;
@@ -53,6 +53,39 @@ fn main() {
     } else {
         true
     };
+    let a = 0;
+    let b = 1;
+
+    if a == b {
+        false
+    } else {
+        true
+    };
+    if a != b {
+        false
+    } else {
+        true
+    };
+    if a < b {
+        false
+    } else {
+        true
+    };
+    if a <= b {
+        false
+    } else {
+        true
+    };
+    if a > b {
+        false
+    } else {
+        true
+    };
+    if a >= b {
+        false
+    } else {
+        true
+    };
     if x {
         x
     } else {
@@ -65,6 +98,14 @@ fn main() {
     needless_bool(x);
     needless_bool2(x);
     needless_bool3(x);
+    needless_bool_condition();
+
+    if a == b {
+        true
+    } else {
+        // Do not lint as this comment might be important
+        false
+    };
 }
 
 fn bool_ret3(x: bool) -> bool {
@@ -129,4 +170,24 @@ fn needless_bool_in_the_suggestion_wraps_the_predicate_of_if_else_statement_in_b
     } else {
         true
     };
+}
+
+unsafe fn no(v: u8) -> u8 {
+    v
+}
+
+#[allow(clippy::unnecessary_operation)]
+fn needless_bool_condition() -> bool {
+    if unsafe { no(4) } & 1 != 0 {
+        true
+    } else {
+        false
+    };
+    let _brackets_unneeded = if unsafe { no(4) } & 1 != 0 { true } else { false };
+    fn foo() -> bool {
+        // parentheses are needed here
+        if unsafe { no(4) } & 1 != 0 { true } else { false }
+    }
+
+    foo()
 }

@@ -3,7 +3,7 @@
 //! This library provides smart pointers and collections for managing
 //! heap-allocated values.
 //!
-//! This library, like libcore, normally doesn’t need to be used directly
+//! This library, like core, normally doesn’t need to be used directly
 //! since its contents are re-exported in the [`std` crate](../std/index.html).
 //! Crates that use the `#![no_std]` attribute however will typically
 //! not depend on `std`, so they’d use this crate instead.
@@ -56,10 +56,11 @@
 //! [`Rc`]: rc
 //! [`RefCell`]: core::cell
 
-// To run liballoc tests without x.py without ending up with two copies of liballoc, Miri needs to be
+// To run alloc tests without x.py without ending up with two copies of alloc, Miri needs to be
 // able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
-// rustc itself never sets the feature, so this line has no affect there.
+// rustc itself never sets the feature, so this line has no effect there.
 #![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
+//
 #![allow(unused_attributes)]
 #![stable(feature = "alloc", since = "1.36.0")]
 #![doc(
@@ -67,93 +68,137 @@
     issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
     test(no_crate_inject, attr(allow(unused_variables), deny(warnings)))
 )]
-#![cfg_attr(
-    not(bootstrap),
-    doc(cfg_hide(
-        not(test),
-        not(any(test, bootstrap)),
-        any(not(feature = "miri-test-libstd"), test, doctest),
-        no_global_oom_handling,
-        not(no_global_oom_handling),
-        target_has_atomic = "ptr"
-    ))
-)]
+#![doc(cfg_hide(
+    not(test),
+    not(any(test, bootstrap)),
+    any(not(feature = "miri-test-libstd"), test, doctest),
+    no_global_oom_handling,
+    not(no_global_oom_handling),
+    not(no_rc),
+    not(no_sync),
+    target_has_atomic = "ptr"
+))]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
 #![no_std]
 #![needs_allocator]
-//
 // Lints:
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(fuzzy_provenance_casts)]
 #![warn(deprecated_in_future)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 #![allow(explicit_outlives_requirements)]
+#![warn(multiple_supertrait_upcastable)]
+#![allow(internal_features)]
+#![allow(rustdoc::redundant_explicit_links)]
 //
 // Library features:
+// tidy-alphabetical-start
+#![cfg_attr(not(no_global_oom_handling), feature(const_alloc_error))]
+#![cfg_attr(not(no_global_oom_handling), feature(const_btree_len))]
+#![cfg_attr(test, feature(is_sorted))]
+#![cfg_attr(test, feature(new_uninit))]
 #![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
 #![feature(array_chunks)]
+#![feature(array_into_iter_constructors)]
 #![feature(array_methods)]
 #![feature(array_windows)]
-#![feature(async_stream)]
+#![feature(ascii_char)]
+#![feature(assert_matches)]
+#![feature(async_iterator)]
 #![feature(coerce_unsized)]
-#![cfg_attr(not(no_global_oom_handling), feature(const_btree_new))]
+#![feature(const_align_of_val)]
+#![feature(const_box)]
 #![feature(const_cow_is_borrowed)]
+#![feature(const_eval_select)]
+#![feature(const_maybe_uninit_as_mut_ptr)]
+#![feature(const_maybe_uninit_write)]
+#![feature(const_pin)]
+#![feature(const_refs_to_cell)]
+#![feature(const_size_of_val)]
+#![feature(const_waker)]
 #![feature(core_intrinsics)]
+#![feature(core_panic)]
+#![feature(deprecated_suggestion)]
 #![feature(dispatch_from_dyn)]
+#![feature(error_generic_member_access)]
+#![feature(error_in_core)]
 #![feature(exact_size_is_empty)]
 #![feature(extend_one)]
 #![feature(fmt_internals)]
 #![feature(fn_traits)]
-#![feature(inherent_ascii_escape)]
-#![cfg_attr(bootstrap, feature(format_args_capture))]
+#![feature(hasher_prefixfree_extras)]
+#![feature(inline_const)]
 #![feature(inplace_iteration)]
 #![feature(iter_advance_by)]
-#![feature(iter_zip)]
+#![feature(iter_next_chunk)]
+#![feature(iter_repeat_n)]
 #![feature(layout_for_ptr)]
-#![feature(maybe_uninit_extra)]
 #![feature(maybe_uninit_slice)]
-#![cfg_attr(test, feature(new_uninit))]
-#![feature(nonnull_slice_from_raw_parts)]
+#![feature(maybe_uninit_uninit_array)]
+#![feature(maybe_uninit_uninit_array_transpose)]
 #![feature(pattern)]
 #![feature(ptr_internals)]
+#![feature(ptr_metadata)]
+#![feature(ptr_sub_ptr)]
 #![feature(receiver_trait)]
 #![feature(set_ptr_value)]
+#![feature(sized_type_properties)]
+#![feature(slice_from_ptr_range)]
 #![feature(slice_group_by)]
 #![feature(slice_ptr_get)]
 #![feature(slice_ptr_len)]
 #![feature(slice_range)]
+#![feature(std_internals)]
 #![feature(str_internals)]
+#![feature(strict_provenance)]
+#![feature(trusted_fused)]
 #![feature(trusted_len)]
 #![feature(trusted_random_access)]
 #![feature(try_trait_v2)]
+#![feature(tuple_trait)]
+#![feature(unchecked_math)]
 #![feature(unicode_internals)]
 #![feature(unsize)]
+#![feature(utf8_chunks)]
+// tidy-alphabetical-end
 //
 // Language features:
+// tidy-alphabetical-start
+#![cfg_attr(not(test), feature(coroutine_trait))]
+#![cfg_attr(test, feature(panic_update_hook))]
+#![cfg_attr(test, feature(test))]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unstable)]
 #![feature(associated_type_bounds)]
-#![feature(box_syntax)]
+#![feature(c_unwind)]
 #![feature(cfg_sanitize)]
-#![feature(cfg_target_has_atomic)]
-#![feature(const_fn_trait_bound)]
+#![feature(const_mut_refs)]
+#![feature(const_precise_live_drops)]
+#![feature(const_ptr_write)]
 #![feature(const_trait_impl)]
-#![feature(destructuring_assignment)]
+#![feature(const_try)]
 #![feature(dropck_eyepatch)]
 #![feature(exclusive_range_pattern)]
 #![feature(fundamental)]
-#![cfg_attr(not(test), feature(generator_trait))]
+#![feature(hashmap_internals)]
 #![feature(lang_items)]
 #![feature(min_specialization)]
+#![feature(multiple_supertrait_upcastable)]
 #![feature(negative_impls)]
 #![feature(never_type)]
-#![feature(nll)] // Not necessary, but here to test the `nll` feature.
+#![feature(pointer_is_aligned)]
 #![feature(rustc_allow_const_fn_unstable)]
 #![feature(rustc_attrs)]
+#![feature(slice_internals)]
 #![feature(staged_api)]
-#![cfg_attr(test, feature(test))]
+#![feature(stmt_expr_attributes)]
 #![feature(unboxed_closures)]
 #![feature(unsized_fn_params)]
+#![feature(with_negative_coherence)]
+// tidy-alphabetical-end
 //
 // Rustdoc features:
 #![feature(doc_cfg)]
@@ -170,6 +215,8 @@
 extern crate std;
 #[cfg(test)]
 extern crate test;
+#[cfg(test)]
+mod testing;
 
 // Module with internal macros used by other modules (needs to be included before other modules).
 #[macro_use]
@@ -194,14 +241,17 @@ mod boxed {
 }
 pub mod borrow;
 pub mod collections;
+#[cfg(all(not(no_rc), not(no_sync), not(no_global_oom_handling)))]
+pub mod ffi;
 pub mod fmt;
+#[cfg(not(no_rc))]
 pub mod rc;
 pub mod slice;
 pub mod str;
 pub mod string;
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(all(not(no_rc), not(no_sync), target_has_atomic = "ptr"))]
 pub mod sync;
-#[cfg(all(not(no_global_oom_handling), target_has_atomic = "ptr"))]
+#[cfg(all(not(no_global_oom_handling), not(no_rc), not(no_sync), target_has_atomic = "ptr"))]
 pub mod task;
 #[cfg(test)]
 mod tests;
@@ -211,4 +261,21 @@ pub mod vec;
 #[unstable(feature = "liballoc_internals", issue = "none", reason = "implementation detail")]
 pub mod __export {
     pub use core::format_args;
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Not used in all configurations
+pub(crate) mod test_helpers {
+    /// Copied from `std::test_helpers::test_rng`, since these tests rely on the
+    /// seed not being the same for every RNG invocation too.
+    pub(crate) fn test_rng() -> rand_xorshift::XorShiftRng {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut hasher = std::hash::RandomState::new().build_hasher();
+        std::panic::Location::caller().hash(&mut hasher);
+        let hc64 = hasher.finish();
+        let seed_vec =
+            hc64.to_le_bytes().into_iter().chain(0u8..8).collect::<crate::vec::Vec<u8>>();
+        let seed: [u8; 16] = seed_vec.as_slice().try_into().unwrap();
+        rand::SeedableRng::from_seed(seed)
+    }
 }

@@ -126,7 +126,7 @@ use std::env;
 
 // Prints each argument on a separate line
 for argument in env::args() {
-    println!("{}", argument);
+    println!("{argument}");
 }
 ```
 
@@ -165,15 +165,15 @@ extensions:
 ### Strikethrough
 
 Text may be rendered with a horizontal line through the center by wrapping the
-text with two tilde characters on each side:
+text with one or two tilde characters on each side:
 
 ```text
-An example of ~~strikethrough text~~.
+An example of ~~strikethrough text~~. You can also use ~single tildes~.
 ```
 
 This example will render as:
 
-> An example of ~~strikethrough text~~.
+> An example of ~~strikethrough text~~. You can also use ~single tildes~.
 
 This follows the [GitHub Strikethrough extension][strikethrough].
 
@@ -253,6 +253,19 @@ characters:
 | `'`            | ‘ or ’, depending on context |
 
 So, no need to manually enter those Unicode characters!
+
+### Adding a warning block
+
+If you want to make a warning or similar note stand out in the documentation,
+you can wrap it like this:
+
+```md
+/// documentation
+///
+/// <div class="warning">A big warning!</div>
+///
+/// more documentation
+```
 
 [`backtrace`]: https://docs.rs/backtrace/0.3.50/backtrace/
 [commonmark markdown specification]: https://commonmark.org/

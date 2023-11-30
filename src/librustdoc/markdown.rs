@@ -1,13 +1,13 @@
+use std::fmt::Write as _;
 use std::fs::{create_dir_all, read_to_string, File};
 use std::io::prelude::*;
 use std::path::Path;
 
 use rustc_span::edition::Edition;
-use rustc_span::source_map::DUMMY_SP;
-use rustc_span::Symbol;
+use rustc_span::DUMMY_SP;
 
 use crate::config::{Options, RenderOptions};
-use crate::doctest::{Collector, TestOptions};
+use crate::doctest::{Collector, GlobalTestOptions};
 use crate::html::escape::Escape;
 use crate::html::markdown;
 use crate::html::markdown::{
@@ -35,13 +35,15 @@ fn extract_leading_metadata(s: &str) -> (Vec<&str>, &str) {
 
 /// Render `input` (e.g., "foo.md") into an HTML file in `output`
 /// (e.g., output = "bar" => "bar/foo.html").
-crate fn render<P: AsRef<Path>>(
+///
+/// Requires session globals to be available, for symbol interning.
+pub(crate) fn render<P: AsRef<Path>>(
     input: P,
     options: RenderOptions,
     edition: Edition,
 ) -> Result<(), String> {
     if let Err(e) = create_dir_all(&options.output) {
-        return Err(format!("{}: {}", options.output.display(), e));
+        return Err(format!("{output}: {e}", output = options.output.display()));
     }
 
     let input = input.as_ref();
@@ -51,15 +53,17 @@ crate fn render<P: AsRef<Path>>(
 
     let mut css = String::new();
     for name in &options.markdown_css {
-        let s = format!("<link rel=\"stylesheet\" type=\"text/css\" href=\"{}\">\n", name);
-        css.push_str(&s)
+        write!(css, r#"<link rel="stylesheet" href="{name}">"#)
+            .expect("Writing to a String can't fail");
     }
 
-    let input_str = read_to_string(input).map_err(|err| format!("{}: {}", input.display(), err))?;
+    let input_str =
+        read_to_string(input).map_err(|err| format!("{input}: {err}", input = input.display()))?;
     let playground_url = options.markdown_playground_url.or(options.playground_url);
     let playground = playground_url.map(|url| markdown::Playground { crate_name: None, url });
 
-    let mut out = File::create(&output).map_err(|e| format!("{}: {}", output.display(), e))?;
+    let mut out =
+        File::create(&output).map_err(|e| format!("{output}: {e}", output = output.display()))?;
 
     let (metadata, text) = extract_leading_metadata(&input_str);
     if metadata.is_empty() {
@@ -70,7 +74,16 @@ crate fn render<P: AsRef<Path>>(
     let mut ids = IdMap::new();
     let error_codes = ErrorCodes::from(options.unstable_features.is_nightly_build());
     let text = if !options.markdown_no_toc {
-        MarkdownWithToc(text, &mut ids, error_codes, edition, &playground).into_string()
+        MarkdownWithToc {
+            content: text,
+            ids: &mut ids,
+            error_codes,
+            edition,
+            playground: &playground,
+            // For markdown files, it'll be disabled until the feature is enabled by default.
+            custom_code_classes_in_docs: false,
+        }
+        .into_string()
     } else {
         Markdown {
             content: text,
@@ -80,6 +93,8 @@ crate fn render<P: AsRef<Path>>(
             edition,
             playground: &playground,
             heading_offset: HeadingOffset::H1,
+            // For markdown files, it'll be disabled until the feature is enabled by default.
+            custom_code_classes_in_docs: false,
         }
         .into_string()
     };
@@ -120,20 +135,19 @@ crate fn render<P: AsRef<Path>>(
     );
 
     match err {
-        Err(e) => Err(format!("cannot write to `{}`: {}", output.display(), e)),
+        Err(e) => Err(format!("cannot write to `{output}`: {e}", output = output.display())),
         Ok(_) => Ok(()),
     }
 }
 
 /// Runs any tests/code examples in the markdown file `input`.
-crate fn test(options: Options) -> Result<(), String> {
+pub(crate) fn test(options: Options) -> Result<(), String> {
     let input_str = read_to_string(&options.input)
-        .map_err(|err| format!("{}: {}", options.input.display(), err))?;
-    let mut opts = TestOptions::default();
+        .map_err(|err| format!("{input}: {err}", input = options.input.display()))?;
+    let mut opts = GlobalTestOptions::default();
     opts.no_crate_inject = true;
-    opts.display_doctest_warnings = options.display_doctest_warnings;
     let mut collector = Collector::new(
-        Symbol::intern(&options.input.display().to_string()),
+        options.input.display().to_string(),
         options.clone(),
         true,
         opts,
@@ -142,15 +156,18 @@ crate fn test(options: Options) -> Result<(), String> {
         options.enable_per_target_ignores,
     );
     collector.set_position(DUMMY_SP);
-    let codes = ErrorCodes::from(options.render_options.unstable_features.is_nightly_build());
+    let codes = ErrorCodes::from(options.unstable_features.is_nightly_build());
 
-    find_testable_code(&input_str, &mut collector, codes, options.enable_per_target_ignores, None);
-
-    crate::doctest::run_tests(
-        options.test_args,
-        options.nocapture,
-        options.display_doctest_warnings,
-        collector.tests,
+    // For markdown files, custom code classes will be disabled until the feature is enabled by default.
+    find_testable_code(
+        &input_str,
+        &mut collector,
+        codes,
+        options.enable_per_target_ignores,
+        None,
+        false,
     );
+
+    crate::doctest::run_tests(options.test_args, options.nocapture, collector.tests);
     Ok(())
 }

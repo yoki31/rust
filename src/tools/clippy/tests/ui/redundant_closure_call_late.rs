@@ -1,6 +1,7 @@
 // non rustfixable, see redundant_closure_call_fixable.rs
 
 #![warn(clippy::redundant_closure_call)]
+#![allow(clippy::needless_late_init)]
 
 fn main() {
     let mut i = 1;
@@ -13,12 +14,16 @@ fn main() {
     // lint here
     let redun_closure = || 1;
     i = redun_closure();
+    //~^ ERROR: closure called just once immediately after it was declared
+    //~| NOTE: `-D clippy::redundant-closure-call` implied by `-D warnings`
 
     // shadowed closures are supported, lint here
     let shadowed_closure = || 1;
     i = shadowed_closure();
+    //~^ ERROR: closure called just once immediately after it was declared
     let shadowed_closure = || 2;
     i = shadowed_closure();
+    //~^ ERROR: closure called just once immediately after it was declared
 
     // don't lint here
     let shadowed_closure = || 2;

@@ -1,24 +1,7 @@
-#[cfg(any(
-    doc,
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "emscripten",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd",
-    target_os = "openbsd",
-))]
+#[cfg(any(doc, target_os = "android", target_os = "linux"))]
 use super::{recv_vectored_with_ancillary_from, send_vectored_with_ancillary_to, SocketAncillary};
 use super::{sockaddr_un, SocketAddr};
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "emscripten",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd",
-    target_os = "openbsd",
-))]
+#[cfg(any(doc, target_os = "android", target_os = "linux"))]
 use crate::io::{IoSlice, IoSliceMut};
 use crate::net::Shutdown;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -36,7 +19,8 @@ use crate::{fmt, io};
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd",
-    target_os = "haiku"
+    target_os = "haiku",
+    target_os = "nto",
 ))]
 use libc::MSG_NOSIGNAL;
 #[cfg(not(any(
@@ -46,7 +30,8 @@ use libc::MSG_NOSIGNAL;
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd",
-    target_os = "haiku"
+    target_os = "haiku",
+    target_os = "nto",
 )))]
 const MSG_NOSIGNAL: libc::c_int = 0x0;
 
@@ -95,7 +80,7 @@ impl UnixDatagram {
     /// let sock = match UnixDatagram::bind("/path/to/the/socket") {
     ///     Ok(sock) => sock,
     ///     Err(e) => {
-    ///         println!("Couldn't bind: {:?}", e);
+    ///         println!("Couldn't bind: {e:?}");
     ///         return
     ///     }
     /// };
@@ -117,7 +102,6 @@ impl UnixDatagram {
     /// # Examples
     ///
     /// ```no_run
-    /// #![feature(unix_socket_abstract)]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -127,14 +111,14 @@ impl UnixDatagram {
     ///     let sock2 = match UnixDatagram::bind_addr(&addr) {
     ///         Ok(sock) => sock,
     ///         Err(err) => {
-    ///             println!("Couldn't bind: {:?}", err);
+    ///             println!("Couldn't bind: {err:?}");
     ///             return Err(err);
     ///         }
     ///     };
     ///     Ok(())
     /// }
     /// ```
-    #[unstable(feature = "unix_socket_abstract", issue = "85410")]
+    #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn bind_addr(socket_addr: &SocketAddr) -> io::Result<UnixDatagram> {
         unsafe {
             let socket = UnixDatagram::unbound()?;
@@ -157,7 +141,7 @@ impl UnixDatagram {
     /// let sock = match UnixDatagram::unbound() {
     ///     Ok(sock) => sock,
     ///     Err(e) => {
-    ///         println!("Couldn't unbound: {:?}", e);
+    ///         println!("Couldn't unbound: {e:?}");
     ///         return
     ///     }
     /// };
@@ -180,7 +164,7 @@ impl UnixDatagram {
     /// let (sock1, sock2) = match UnixDatagram::pair() {
     ///     Ok((sock1, sock2)) => (sock1, sock2),
     ///     Err(e) => {
-    ///         println!("Couldn't unbound: {:?}", e);
+    ///         println!("Couldn't unbound: {e:?}");
     ///         return
     ///     }
     /// };
@@ -210,7 +194,7 @@ impl UnixDatagram {
     ///     match sock.connect("/path/to/the/socket") {
     ///         Ok(sock) => sock,
     ///         Err(e) => {
-    ///             println!("Couldn't connect: {:?}", e);
+    ///             println!("Couldn't connect: {e:?}");
     ///             return Err(e)
     ///         }
     ///     };
@@ -232,7 +216,6 @@ impl UnixDatagram {
     /// # Examples
     ///
     /// ```no_run
-    /// #![feature(unix_socket_abstract)]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -243,14 +226,14 @@ impl UnixDatagram {
     ///     match sock.connect_addr(&addr) {
     ///         Ok(sock) => sock,
     ///         Err(e) => {
-    ///             println!("Couldn't connect: {:?}", e);
+    ///             println!("Couldn't connect: {e:?}");
     ///             return Err(e)
     ///         }
     ///     };
     ///     Ok(())
     /// }
     /// ```
-    #[unstable(feature = "unix_socket_abstract", issue = "85410")]
+    #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn connect_addr(&self, socket_addr: &SocketAddr) -> io::Result<()> {
         unsafe {
             cvt(libc::connect(
@@ -367,7 +350,7 @@ impl UnixDatagram {
     ///     let sock = UnixDatagram::unbound()?;
     ///     let mut buf = vec![0; 10];
     ///     let (size, sender) = sock.recv_from(buf.as_mut_slice())?;
-    ///     println!("received {} bytes from {:?}", size, sender);
+    ///     println!("received {size} bytes from {sender:?}");
     ///     Ok(())
     /// }
     /// ```
@@ -403,7 +386,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -422,26 +406,18 @@ impl UnixDatagram {
     ///     let mut ancillary_buffer = [0; 128];
     ///     let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
     ///     let (size, _truncated, sender) = sock.recv_vectored_with_ancillary_from(bufs, &mut ancillary)?;
-    ///     println!("received {}", size);
+    ///     println!("received {size}");
     ///     for ancillary_result in ancillary.messages() {
     ///         if let AncillaryData::ScmRights(scm_rights) = ancillary_result.unwrap() {
     ///             for fd in scm_rights {
-    ///                 println!("receive file descriptor: {}", fd);
+    ///                 println!("receive file descriptor: {fd}");
     ///             }
     ///         }
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-    ))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary_from(
         &self,
@@ -460,7 +436,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -479,26 +456,18 @@ impl UnixDatagram {
     ///     let mut ancillary_buffer = [0; 128];
     ///     let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
     ///     let (size, _truncated) = sock.recv_vectored_with_ancillary(bufs, &mut ancillary)?;
-    ///     println!("received {}", size);
+    ///     println!("received {size}");
     ///     for ancillary_result in ancillary.messages() {
     ///         if let AncillaryData::ScmRights(scm_rights) = ancillary_result.unwrap() {
     ///             for fd in scm_rights {
-    ///                 println!("receive file descriptor: {}", fd);
+    ///                 println!("receive file descriptor: {fd}");
     ///             }
     ///         }
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-    ))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary(
         &self,
@@ -552,7 +521,6 @@ impl UnixDatagram {
     /// # Examples
     ///
     /// ```no_run
-    /// #![feature(unix_socket_abstract)]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -564,7 +532,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[unstable(feature = "unix_socket_abstract", issue = "85410")]
+    #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn send_to_addr(&self, buf: &[u8], socket_addr: &SocketAddr) -> io::Result<usize> {
         unsafe {
             let count = cvt(libc::sendto(
@@ -609,7 +577,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -633,15 +602,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-    ))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary_to<P: AsRef<Path>>(
         &self,
@@ -658,7 +619,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -682,15 +644,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-    ))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary(
         &self,
@@ -854,8 +808,24 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "freebsd",
+        ),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "freebsd"
+        )),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::UnixDatagram;
     ///
@@ -865,7 +835,13 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux",))]
+    #[cfg(any(
+        doc,
+        target_os = "android",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "freebsd"
+    ))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
         self.0.set_passcred(passcred)
@@ -877,10 +853,41 @@ impl UnixDatagram {
     /// Get the socket option `SO_PASSCRED`.
     ///
     /// [`set_passcred`]: UnixDatagram::set_passcred
-    #[cfg(any(doc, target_os = "android", target_os = "linux",))]
+    #[cfg(any(
+        doc,
+        target_os = "android",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "freebsd"
+    ))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn passcred(&self) -> io::Result<bool> {
         self.0.passcred()
+    }
+
+    /// Set the id of the socket for network filtering purpose
+    ///
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")),
+        doc = "```ignore"
+    )]
+    /// #![feature(unix_set_mark)]
+    /// use std::os::unix::net::UnixDatagram;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let sock = UnixDatagram::unbound()?;
+    ///     sock.set_mark(32)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(any(doc, target_os = "linux", target_os = "freebsd", target_os = "openbsd",))]
+    #[unstable(feature = "unix_set_mark", issue = "96467")]
+    pub fn set_mark(&self, mark: u32) -> io::Result<()> {
+        self.0.set_mark(mark)
     }
 
     /// Returns the value of the `SO_ERROR` option.
@@ -893,7 +900,7 @@ impl UnixDatagram {
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     if let Ok(Some(err)) = sock.take_error() {
-    ///         println!("Got error: {:?}", err);
+    ///         println!("Got error: {err:?}");
     ///     }
     ///     Ok(())
     /// }
@@ -1007,7 +1014,7 @@ impl IntoRawFd for UnixDatagram {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for UnixDatagram {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -1015,7 +1022,7 @@ impl AsFd for UnixDatagram {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<UnixDatagram> for OwnedFd {
     #[inline]
     fn from(unix_datagram: UnixDatagram) -> OwnedFd {
@@ -1023,7 +1030,7 @@ impl From<UnixDatagram> for OwnedFd {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<OwnedFd> for UnixDatagram {
     #[inline]
     fn from(owned: OwnedFd) -> Self {

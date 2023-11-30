@@ -1,8 +1,13 @@
 use crate::io::prelude::*;
 
 use super::{Command, Output, Stdio};
-use crate::io::ErrorKind;
+use crate::io::{BorrowedBuf, ErrorKind};
+use crate::mem::MaybeUninit;
 use crate::str;
+
+fn known_command() -> Command {
+    if cfg!(windows) { Command::new("help") } else { Command::new("echo") }
+}
 
 #[cfg(target_os = "android")]
 fn shell_cmd() -> Command {
@@ -60,7 +65,7 @@ fn signal_reported_right() {
     p.kill().unwrap();
     match p.wait().unwrap().signal() {
         Some(9) => {}
-        result => panic!("not terminated by signal 9 (instead, {:?})", result),
+        result => panic!("not terminated by signal 9 (instead, {result:?})"),
     }
 }
 
@@ -113,6 +118,37 @@ fn stdin_works() {
     p.stdout.as_mut().unwrap().read_to_string(&mut out).unwrap();
     assert!(p.wait().unwrap().success());
     assert_eq!(out, "foobar\n");
+}
+
+#[test]
+#[cfg_attr(any(target_os = "vxworks"), ignore)]
+fn child_stdout_read_buf() {
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg("echo abc");
+        cmd
+    } else {
+        let mut cmd = shell_cmd();
+        cmd.arg("-c").arg("echo abc");
+        cmd
+    };
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    let child = cmd.spawn().unwrap();
+
+    let mut stdout = child.stdout.unwrap();
+    let mut buf: [MaybeUninit<u8>; 128] = MaybeUninit::uninit_array();
+    let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+    stdout.read_buf(buf.unfilled()).unwrap();
+
+    // ChildStdout::read_buf should omit buffer initialization.
+    if cfg!(target_os = "windows") {
+        assert_eq!(buf.filled(), b"abc\r\n");
+        assert_eq!(buf.init_len(), 5);
+    } else {
+        assert_eq!(buf.filled(), b"abc\n");
+        assert_eq!(buf.init_len(), 4);
+    };
 }
 
 #[test]
@@ -248,8 +284,7 @@ fn test_override_env() {
 
     assert!(
         output.contains("RUN_TEST_NEW_ENV=123"),
-        "didn't find RUN_TEST_NEW_ENV inside of:\n\n{}",
-        output
+        "didn't find RUN_TEST_NEW_ENV inside of:\n\n{output}",
     );
 }
 
@@ -261,8 +296,7 @@ fn test_add_to_env() {
 
     assert!(
         output.contains("RUN_TEST_NEW_ENV=123"),
-        "didn't find RUN_TEST_NEW_ENV inside of:\n\n{}",
-        output
+        "didn't find RUN_TEST_NEW_ENV inside of:\n\n{output}"
     );
 }
 
@@ -284,13 +318,11 @@ fn test_capture_env_at_spawn() {
 
     assert!(
         output.contains("RUN_TEST_NEW_ENV1=123"),
-        "didn't find RUN_TEST_NEW_ENV1 inside of:\n\n{}",
-        output
+        "didn't find RUN_TEST_NEW_ENV1 inside of:\n\n{output}"
     );
     assert!(
         output.contains("RUN_TEST_NEW_ENV2=456"),
-        "didn't find RUN_TEST_NEW_ENV2 inside of:\n\n{}",
-        output
+        "didn't find RUN_TEST_NEW_ENV2 inside of:\n\n{output}"
     );
 }
 
@@ -305,7 +337,7 @@ fn test_interior_nul_in_progname_is_error() {
 
 #[test]
 fn test_interior_nul_in_arg_is_error() {
-    match Command::new("rustc").arg("has-some-\0\0s-inside").spawn() {
+    match known_command().arg("has-some-\0\0s-inside").spawn() {
         Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
         Ok(_) => panic!(),
     }
@@ -313,7 +345,7 @@ fn test_interior_nul_in_arg_is_error() {
 
 #[test]
 fn test_interior_nul_in_args_is_error() {
-    match Command::new("rustc").args(&["has-some-\0\0s-inside"]).spawn() {
+    match known_command().args(&["has-some-\0\0s-inside"]).spawn() {
         Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
         Ok(_) => panic!(),
     }
@@ -321,7 +353,7 @@ fn test_interior_nul_in_args_is_error() {
 
 #[test]
 fn test_interior_nul_in_current_dir_is_error() {
-    match Command::new("rustc").current_dir("has-some-\0\0s-inside").spawn() {
+    match known_command().current_dir("has-some-\0\0s-inside").spawn() {
         Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
         Ok(_) => panic!(),
     }
@@ -402,6 +434,91 @@ fn test_creation_flags() {
     assert!(events > 0);
 }
 
+/// Tests proc thread attributes by spawning a process with a custom parent process,
+/// then comparing the parent process ID with the expected parent process ID.
+#[test]
+#[cfg(windows)]
+fn test_proc_thread_attributes() {
+    use crate::mem;
+    use crate::os::windows::io::AsRawHandle;
+    use crate::os::windows::process::CommandExt;
+    use crate::sys::c::{CloseHandle, BOOL, HANDLE};
+    use crate::sys::cvt;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dwflags: u32, th32processid: u32) -> HANDLE;
+        fn Process32First(hsnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+        fn Process32Next(hsnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    }
+
+    const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x00020000;
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+
+    struct ProcessDropGuard(crate::process::Child);
+
+    impl Drop for ProcessDropGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
+    let parent = ProcessDropGuard(Command::new("cmd").spawn().unwrap());
+
+    let mut child_cmd = Command::new("cmd");
+
+    unsafe {
+        child_cmd
+            .raw_attribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, parent.0.as_raw_handle() as isize);
+    }
+
+    let child = ProcessDropGuard(child_cmd.spawn().unwrap());
+
+    let h_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+
+    let mut process_entry = PROCESSENTRY32W {
+        dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+        cntUsage: 0,
+        th32ProcessID: 0,
+        th32DefaultHeapID: 0,
+        th32ModuleID: 0,
+        cntThreads: 0,
+        th32ParentProcessID: 0,
+        pcPriClassBase: 0,
+        dwFlags: 0,
+        szExeFile: [0; 260],
+    };
+
+    unsafe { cvt(Process32First(h_snapshot, &mut process_entry as *mut _)) }.unwrap();
+
+    loop {
+        if child.0.id() == process_entry.th32ProcessID {
+            break;
+        }
+        unsafe { cvt(Process32Next(h_snapshot, &mut process_entry as *mut _)) }.unwrap();
+    }
+
+    unsafe { cvt(CloseHandle(h_snapshot)) }.unwrap();
+
+    assert_eq!(parent.0.id(), process_entry.th32ParentProcessID);
+
+    drop(child)
+}
+
 #[test]
 fn test_command_implements_send_sync() {
     fn take_send_sync_type<T: Send + Sync>(_: T) {}
@@ -415,4 +532,198 @@ fn test_command_implements_send_sync() {
 fn env_empty() {
     let p = Command::new("cmd").args(&["/C", "exit 0"]).env_clear().spawn();
     assert!(p.is_ok());
+}
+
+#[test]
+#[cfg(not(windows))]
+#[cfg_attr(any(target_os = "emscripten", target_env = "sgx"), ignore)]
+fn debug_print() {
+    const PIDFD: &'static str =
+        if cfg!(target_os = "linux") { "    create_pidfd: false,\n" } else { "" };
+
+    let mut command = Command::new("some-boring-name");
+
+    assert_eq!(format!("{command:?}"), format!(r#""some-boring-name""#));
+
+    assert_eq!(
+        format!("{command:#?}"),
+        format!(
+            r#"Command {{
+    program: "some-boring-name",
+    args: [
+        "some-boring-name",
+    ],
+{PIDFD}}}"#
+        )
+    );
+
+    command.args(&["1", "2", "3"]);
+
+    assert_eq!(format!("{command:?}"), format!(r#""some-boring-name" "1" "2" "3""#));
+
+    assert_eq!(
+        format!("{command:#?}"),
+        format!(
+            r#"Command {{
+    program: "some-boring-name",
+    args: [
+        "some-boring-name",
+        "1",
+        "2",
+        "3",
+    ],
+{PIDFD}}}"#
+        )
+    );
+
+    crate::os::unix::process::CommandExt::arg0(&mut command, "exciting-name");
+
+    assert_eq!(
+        format!("{command:?}"),
+        format!(r#"["some-boring-name"] "exciting-name" "1" "2" "3""#)
+    );
+
+    assert_eq!(
+        format!("{command:#?}"),
+        format!(
+            r#"Command {{
+    program: "some-boring-name",
+    args: [
+        "exciting-name",
+        "1",
+        "2",
+        "3",
+    ],
+{PIDFD}}}"#
+        )
+    );
+
+    let mut command_with_env_and_cwd = Command::new("boring-name");
+    command_with_env_and_cwd.current_dir("/some/path").env("FOO", "bar");
+    assert_eq!(
+        format!("{command_with_env_and_cwd:?}"),
+        r#"cd "/some/path" && FOO="bar" "boring-name""#
+    );
+    assert_eq!(
+        format!("{command_with_env_and_cwd:#?}"),
+        format!(
+            r#"Command {{
+    program: "boring-name",
+    args: [
+        "boring-name",
+    ],
+    env: CommandEnv {{
+        clear: false,
+        vars: {{
+            "FOO": Some(
+                "bar",
+            ),
+        }},
+    }},
+    cwd: Some(
+        "/some/path",
+    ),
+{PIDFD}}}"#
+        )
+    );
+
+    let mut command_with_removed_env = Command::new("boring-name");
+    command_with_removed_env.env_remove("FOO").env_remove("BAR");
+    assert_eq!(format!("{command_with_removed_env:?}"), r#"env -u BAR -u FOO "boring-name""#);
+    assert_eq!(
+        format!("{command_with_removed_env:#?}"),
+        format!(
+            r#"Command {{
+    program: "boring-name",
+    args: [
+        "boring-name",
+    ],
+    env: CommandEnv {{
+        clear: false,
+        vars: {{
+            "BAR": None,
+            "FOO": None,
+        }},
+    }},
+{PIDFD}}}"#
+        )
+    );
+
+    let mut command_with_cleared_env = Command::new("boring-name");
+    command_with_cleared_env.env_clear().env("BAR", "val").env_remove("FOO");
+    assert_eq!(format!("{command_with_cleared_env:?}"), r#"env -i BAR="val" "boring-name""#);
+    assert_eq!(
+        format!("{command_with_cleared_env:#?}"),
+        format!(
+            r#"Command {{
+    program: "boring-name",
+    args: [
+        "boring-name",
+    ],
+    env: CommandEnv {{
+        clear: true,
+        vars: {{
+            "BAR": Some(
+                "val",
+            ),
+        }},
+    }},
+{PIDFD}}}"#
+        )
+    );
+}
+
+// See issue #91991
+#[test]
+#[cfg(windows)]
+fn run_bat_script() {
+    let tempdir = crate::sys_common::io::test::tmpdir();
+    let script_path = tempdir.join("hello.cmd");
+
+    crate::fs::write(&script_path, "@echo Hello, %~1!").unwrap();
+    let output = Command::new(&script_path)
+        .arg("fellow Rustaceans")
+        .stdout(crate::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Hello, fellow Rustaceans!");
+}
+
+// See issue #95178
+#[test]
+#[cfg(windows)]
+fn run_canonical_bat_script() {
+    let tempdir = crate::sys_common::io::test::tmpdir();
+    let script_path = tempdir.join("hello.cmd");
+
+    crate::fs::write(&script_path, "@echo Hello, %~1!").unwrap();
+
+    // Try using a canonical path
+    let output = Command::new(&script_path.canonicalize().unwrap())
+        .arg("fellow Rustaceans")
+        .stdout(crate::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Hello, fellow Rustaceans!");
+}
+
+#[test]
+fn terminate_exited_process() {
+    let mut cmd = if cfg!(target_os = "android") {
+        let mut p = shell_cmd();
+        p.args(&["-c", "true"]);
+        p
+    } else {
+        known_command()
+    };
+    let mut p = cmd.stdout(Stdio::null()).spawn().unwrap();
+    p.wait().unwrap();
+    assert!(p.kill().is_ok());
+    assert!(p.kill().is_ok());
 }

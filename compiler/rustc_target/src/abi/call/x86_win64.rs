@@ -6,8 +6,8 @@ use crate::abi::Abi;
 pub fn compute_abi_info<Ty>(fn_abi: &mut FnAbi<'_, Ty>) {
     let fixup = |a: &mut ArgAbi<'_, Ty>| {
         match a.layout.abi {
-            Abi::Uninhabited => {}
-            Abi::ScalarPair(..) | Abi::Aggregate { .. } => match a.layout.size.bits() {
+            Abi::Uninhabited | Abi::Aggregate { sized: false } => {}
+            Abi::ScalarPair(..) | Abi::Aggregate { sized: true } => match a.layout.size.bits() {
                 8 => a.cast_to(Reg::i8()),
                 16 => a.cast_to(Reg::i16()),
                 32 => a.cast_to(Reg::i32()),
@@ -31,7 +31,7 @@ pub fn compute_abi_info<Ty>(fn_abi: &mut FnAbi<'_, Ty>) {
     if !fn_abi.ret.is_ignore() {
         fixup(&mut fn_abi.ret);
     }
-    for arg in &mut fn_abi.args {
+    for arg in fn_abi.args.iter_mut() {
         if arg.is_ignore() {
             continue;
         }

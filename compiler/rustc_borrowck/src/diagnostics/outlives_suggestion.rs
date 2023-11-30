@@ -1,12 +1,11 @@
 //! Contains utilities for generating suggestions for borrowck errors related to unsatisfied
 //! outlives constraints.
 
-use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::DiagnosticBuilder;
+use rustc_data_structures::fx::FxIndexSet;
+use rustc_errors::Diagnostic;
 use rustc_middle::ty::RegionVid;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
-use tracing::debug;
 
 use crate::MirBorrowckCtxt;
 
@@ -51,18 +50,19 @@ impl OutlivesSuggestionBuilder {
     // naming the `'self` lifetime in methods, etc.
     fn region_name_is_suggestable(name: &RegionName) -> bool {
         match name.source {
-            RegionNameSource::NamedEarlyBoundRegion(..)
-            | RegionNameSource::NamedFreeRegion(..)
+            RegionNameSource::NamedEarlyParamRegion(..)
+            | RegionNameSource::NamedLateParamRegion(..)
             | RegionNameSource::Static => true,
 
-            // Don't give suggestions for upvars, closure return types, or other unnamable
+            // Don't give suggestions for upvars, closure return types, or other unnameable
             // regions.
             RegionNameSource::SynthesizedFreeEnvRegion(..)
             | RegionNameSource::AnonRegionFromArgument(..)
             | RegionNameSource::AnonRegionFromUpvar(..)
             | RegionNameSource::AnonRegionFromOutput(..)
             | RegionNameSource::AnonRegionFromYieldTy(..)
-            | RegionNameSource::AnonRegionFromAsyncFn(..) => {
+            | RegionNameSource::AnonRegionFromAsyncFn(..)
+            | RegionNameSource::AnonRegionFromImplSignature(..) => {
                 debug!("Region {:?} is NOT suggestable", name);
                 false
             }
@@ -87,7 +87,7 @@ impl OutlivesSuggestionBuilder {
 
         // Keep track of variables that we have already suggested unifying so that we don't print
         // out silly duplicate messages.
-        let mut unified_already = FxHashSet::default();
+        let mut unified_already = FxIndexSet::default();
 
         for (fr, outlived) in &self.constraints_to_add {
             let Some(fr_name) = self.region_vid_to_name(mbcx, *fr) else {
@@ -125,8 +125,7 @@ impl OutlivesSuggestionBuilder {
                     |(r, _)| {
                         self.constraints_to_add
                             .get(r)
-                            .map(|r_outlived| r_outlived.as_slice().contains(fr))
-                            .unwrap_or(false)
+                            .is_some_and(|r_outlived| r_outlived.as_slice().contains(fr))
                     },
                 );
 
@@ -149,7 +148,7 @@ impl OutlivesSuggestionBuilder {
     }
 
     /// Add the outlives constraint `fr: outlived_fr` to the set of constraints we need to suggest.
-    crate fn collect_constraint(&mut self, fr: RegionVid, outlived_fr: RegionVid) {
+    pub(crate) fn collect_constraint(&mut self, fr: RegionVid, outlived_fr: RegionVid) {
         debug!("Collected {:?}: {:?}", fr, outlived_fr);
 
         // Add to set of constraints for final help note.
@@ -158,29 +157,28 @@ impl OutlivesSuggestionBuilder {
 
     /// Emit an intermediate note on the given `Diagnostic` if the involved regions are
     /// suggestable.
-    crate fn intermediate_suggestion(
+    pub(crate) fn intermediate_suggestion(
         &mut self,
         mbcx: &MirBorrowckCtxt<'_, '_>,
-        errci: &ErrorConstraintInfo,
-        diag: &mut DiagnosticBuilder<'_>,
+        errci: &ErrorConstraintInfo<'_>,
+        diag: &mut Diagnostic,
     ) {
         // Emit an intermediate note.
         let fr_name = self.region_vid_to_name(mbcx, errci.fr);
         let outlived_fr_name = self.region_vid_to_name(mbcx, errci.outlived_fr);
 
-        if let (Some(fr_name), Some(outlived_fr_name)) = (fr_name, outlived_fr_name) {
-            if !matches!(outlived_fr_name.source, RegionNameSource::Static) {
-                diag.help(&format!(
-                    "consider adding the following bound: `{}: {}`",
-                    fr_name, outlived_fr_name
-                ));
-            }
+        if let (Some(fr_name), Some(outlived_fr_name)) = (fr_name, outlived_fr_name)
+            && !matches!(outlived_fr_name.source, RegionNameSource::Static)
+        {
+            diag.help(format!(
+                "consider adding the following bound: `{fr_name}: {outlived_fr_name}`",
+            ));
         }
     }
 
     /// If there is a suggestion to emit, add a diagnostic to the buffer. This is the final
     /// suggestion including all collected constraints.
-    crate fn add_suggestion(&self, mbcx: &mut MirBorrowckCtxt<'_, '_>) {
+    pub(crate) fn add_suggestion(&self, mbcx: &mut MirBorrowckCtxt<'_, '_>) {
         // No constraints to add? Done.
         if self.constraints_to_add.is_empty() {
             debug!("No constraints to suggest.");
@@ -208,16 +206,16 @@ impl OutlivesSuggestionBuilder {
         // If there is exactly one suggestable constraints, then just suggest it. Otherwise, emit a
         // list of diagnostics.
         let mut diag = if suggested.len() == 1 {
-            mbcx.infcx.tcx.sess.diagnostic().struct_help(&match suggested.last().unwrap() {
+            mbcx.infcx.tcx.sess.diagnostic().struct_help(match suggested.last().unwrap() {
                 SuggestedConstraint::Outlives(a, bs) => {
-                    let bs: SmallVec<[String; 2]> = bs.iter().map(|r| format!("{}", r)).collect();
-                    format!("add bound `{}: {}`", a, bs.join(" + "))
+                    let bs: SmallVec<[String; 2]> = bs.iter().map(|r| r.to_string()).collect();
+                    format!("add bound `{a}: {}`", bs.join(" + "))
                 }
 
                 SuggestedConstraint::Equal(a, b) => {
-                    format!("`{}` and `{}` must be the same: replace one with the other", a, b)
+                    format!("`{a}` and `{b}` must be the same: replace one with the other")
                 }
-                SuggestedConstraint::Static(a) => format!("replace `{}` with `'static`", a),
+                SuggestedConstraint::Static(a) => format!("replace `{a}` with `'static`"),
             })
         } else {
             // Create a new diagnostic.
@@ -232,18 +230,16 @@ impl OutlivesSuggestionBuilder {
             for constraint in suggested {
                 match constraint {
                     SuggestedConstraint::Outlives(a, bs) => {
-                        let bs: SmallVec<[String; 2]> =
-                            bs.iter().map(|r| format!("{}", r)).collect();
-                        diag.help(&format!("add bound `{}: {}`", a, bs.join(" + ")));
+                        let bs: SmallVec<[String; 2]> = bs.iter().map(|r| r.to_string()).collect();
+                        diag.help(format!("add bound `{a}: {}`", bs.join(" + ")));
                     }
                     SuggestedConstraint::Equal(a, b) => {
-                        diag.help(&format!(
-                            "`{}` and `{}` must be the same: replace one with the other",
-                            a, b
+                        diag.help(format!(
+                            "`{a}` and `{b}` must be the same: replace one with the other",
                         ));
                     }
                     SuggestedConstraint::Static(a) => {
-                        diag.help(&format!("replace `{}` with `'static`", a));
+                        diag.help(format!("replace `{a}` with `'static`"));
                     }
                 }
             }
@@ -256,6 +252,6 @@ impl OutlivesSuggestionBuilder {
         diag.sort_span = mir_span.shrink_to_hi();
 
         // Buffer the diagnostic
-        diag.buffer(&mut mbcx.errors_buffer);
+        mbcx.buffer_non_error_diag(diag);
     }
 }

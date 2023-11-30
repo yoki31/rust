@@ -4,25 +4,25 @@
 use rustc_middle::{
     mir::{
         visit::{PlaceContext, Visitor},
-        Body, Constant, Local, Location, Operand, Rvalue, StatementKind, VarDebugInfoContents,
+        Body, ConstOperand, Local, Location, Operand, Rvalue, StatementKind, VarDebugInfoContents,
     },
     ty::TyCtxt,
 };
 
 use crate::MirPass;
-use rustc_index::{bit_set::BitSet, vec::IndexVec};
+use rustc_index::{bit_set::BitSet, IndexVec};
 
 pub struct ConstDebugInfo;
 
 impl<'tcx> MirPass<'tcx> for ConstDebugInfo {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if !tcx.sess.opts.debugging_opts.unsound_mir_opts {
-            return;
-        }
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() > 0
+    }
 
+    fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         trace!("running ConstDebugInfo on {:?}", body.source);
 
-        for (local, constant) in find_optimization_oportunities(body) {
+        for (local, constant) in find_optimization_opportunities(body) {
             for debuginfo in &mut body.var_debug_info {
                 if let VarDebugInfoContents::Place(p) = debuginfo.value {
                     if p.local == local && p.projection.is_empty() {
@@ -45,7 +45,7 @@ struct LocalUseVisitor {
     local_assignment_locations: IndexVec<Local, Option<Location>>,
 }
 
-fn find_optimization_oportunities<'tcx>(body: &Body<'tcx>) -> Vec<(Local, Constant<'tcx>)> {
+fn find_optimization_opportunities<'tcx>(body: &Body<'tcx>) -> Vec<(Local, ConstOperand<'tcx>)> {
     let mut visitor = LocalUseVisitor {
         local_mutating_uses: IndexVec::from_elem(0, &body.local_decls),
         local_assignment_locations: IndexVec::from_elem(None, &body.local_decls),
@@ -55,14 +55,14 @@ fn find_optimization_oportunities<'tcx>(body: &Body<'tcx>) -> Vec<(Local, Consta
 
     let mut locals_to_debuginfo = BitSet::new_empty(body.local_decls.len());
     for debuginfo in &body.var_debug_info {
-        if let VarDebugInfoContents::Place(p) = debuginfo.value {
-            if let Some(l) = p.as_local() {
-                locals_to_debuginfo.insert(l);
-            }
+        if let VarDebugInfoContents::Place(p) = debuginfo.value
+            && let Some(l) = p.as_local()
+        {
+            locals_to_debuginfo.insert(l);
         }
     }
 
-    let mut eligable_locals = Vec::new();
+    let mut eligible_locals = Vec::new();
     for (local, mutating_uses) in visitor.local_mutating_uses.drain_enumerated(..) {
         if mutating_uses != 1 || !locals_to_debuginfo.contains(local) {
             continue;
@@ -80,22 +80,22 @@ fn find_optimization_oportunities<'tcx>(body: &Body<'tcx>) -> Vec<(Local, Consta
                 &bb.statements[location.statement_index].kind
             {
                 if let Some(local) = p.as_local() {
-                    eligable_locals.push((local, *c));
+                    eligible_locals.push((local, *c));
                 }
             }
         }
     }
 
-    eligable_locals
+    eligible_locals
 }
 
-impl<'tcx> Visitor<'tcx> for LocalUseVisitor {
-    fn visit_local(&mut self, local: &Local, context: PlaceContext, location: Location) {
+impl Visitor<'_> for LocalUseVisitor {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
         if context.is_mutating_use() {
-            self.local_mutating_uses[*local] = self.local_mutating_uses[*local].saturating_add(1);
+            self.local_mutating_uses[local] = self.local_mutating_uses[local].saturating_add(1);
 
             if context.is_place_assignment() {
-                self.local_assignment_locations[*local] = Some(location);
+                self.local_assignment_locations[local] = Some(location);
             }
         }
     }

@@ -1,4 +1,4 @@
-//! This crates defines the trait resolution method.
+//! This crate defines the trait resolution method.
 //!
 //! - **Traits.** Trait resolution is implemented in the `traits` module.
 //!
@@ -11,17 +11,18 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![allow(internal_features)]
+#![feature(associated_type_bounds)]
 #![feature(box_patterns)]
-#![feature(drain_filter)]
-#![feature(derive_default_enum)]
-#![feature(hash_drain_filter)]
-#![feature(in_band_lifetimes)]
-#![feature(iter_zip)]
-#![feature(let_else)]
-#![feature(never_type)]
-#![feature(crate_visibility_modifier)]
 #![feature(control_flow_enum)]
+#![feature(extract_if)]
+#![feature(let_chains)]
+#![feature(if_let_guard)]
+#![feature(never_type)]
+#![feature(type_alias_impl_trait)]
+#![feature(min_specialization)]
 #![recursion_limit = "512"] // For rustdoc
 
 #[macro_use]
@@ -36,7 +37,9 @@ extern crate rustc_middle;
 #[macro_use]
 extern crate smallvec;
 
-pub mod autoderef;
+pub mod errors;
 pub mod infer;
-pub mod opaque_types;
+pub mod solve;
 pub mod traits;
+
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

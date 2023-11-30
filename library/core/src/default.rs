@@ -1,4 +1,4 @@
-//! The `Default` trait for types which may have meaningful default values.
+//! The `Default` trait for types with a default value.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -51,6 +51,23 @@
 ///
 /// This trait can be used with `#[derive]` if all of the type's fields implement
 /// `Default`. When `derive`d, it will use the default value for each field's type.
+///
+/// ### `enum`s
+///
+/// When using `#[derive(Default)]` on an `enum`, you need to choose which unit variant will be
+/// default. You do this by placing the `#[default]` attribute on the variant.
+///
+/// ```
+/// #[derive(Default)]
+/// enum Kind {
+///     #[default]
+///     A,
+///     B,
+///     C,
+/// }
+/// ```
+///
+/// You cannot use the `#[default]` attribute on non-unit or non-exhaustive variants.
 ///
 /// ## How can I implement `Default`?
 ///
@@ -113,52 +130,8 @@ pub trait Default: Sized {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_diagnostic_item = "default_fn"]
     fn default() -> Self;
-}
-
-/// Return the default value of a type according to the `Default` trait.
-///
-/// The type to return is inferred from context; this is equivalent to
-/// `Default::default()` but shorter to type.
-///
-/// For example:
-/// ```
-/// #![feature(default_free_fn)]
-///
-/// use std::default::default;
-///
-/// #[derive(Default)]
-/// struct AppConfig {
-///     foo: FooConfig,
-///     bar: BarConfig,
-/// }
-///
-/// #[derive(Default)]
-/// struct FooConfig {
-///     foo: i32,
-/// }
-///
-/// #[derive(Default)]
-/// struct BarConfig {
-///     bar: f32,
-///     baz: u8,
-/// }
-///
-/// fn main() {
-///     let options = AppConfig {
-///         foo: default(),
-///         bar: BarConfig {
-///             bar: 10.1,
-///             ..default()
-///         },
-///     };
-/// }
-/// ```
-#[unstable(feature = "default_free_fn", issue = "73014")]
-#[must_use]
-#[inline]
-pub fn default<T: Default>() -> T {
-    Default::default()
 }
 
 /// Derive macro generating an impl of the trait `Default`.
@@ -172,9 +145,8 @@ pub macro Default($item:item) {
 macro_rules! default_impl {
     ($t:ty, $v:expr, $doc:tt) => {
         #[stable(feature = "rust1", since = "1.0.0")]
-        #[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
-        impl const Default for $t {
-            #[inline]
+        impl Default for $t {
+            #[inline(always)]
             #[doc = $doc]
             fn default() -> $t {
                 $v

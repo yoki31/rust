@@ -1,6 +1,8 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  clang-11 \
   g++ \
   make \
   ninja-build \
@@ -14,15 +16,21 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
   gdb \
   libssl-dev \
   pkg-config \
+  bzip2 \
   xz-utils \
   wget \
-  patch
+  patch \
+  ovmf \
+  ovmf-ia32 \
+  qemu-efi-aarch64 \
+  qemu-system-arm \
+  qemu-system-x86 \
+  && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sL https://nodejs.org/dist/v15.14.0/node-v15.14.0-linux-x64.tar.xz | \
+RUN curl -sL https://nodejs.org/dist/v18.12.0/node-v18.12.0-linux-x64.tar.xz | \
   tar -xJ
 
 WORKDIR /build/
-COPY scripts/musl-patch-configure.diff /build/
 COPY scripts/musl-toolchain.sh /build/
 RUN bash musl-toolchain.sh x86_64 && rm -rf build
 WORKDIR /
@@ -32,7 +40,7 @@ RUN sh /scripts/sccache.sh
 
 ENV RUST_CONFIGURE_ARGS \
   --musl-root-x86_64=/usr/local/x86_64-linux-musl \
-  --set build.nodejs=/node-v15.14.0-linux-x64/bin/node \
+  --set build.nodejs=/node-v18.12.0-linux-x64/bin/node \
   --set rust.lld
 
 # Some run-make tests have assertions about code size, and enabling debug
@@ -44,20 +52,33 @@ ENV NO_OVERFLOW_CHECKS=1
 
 ENV WASM_TARGETS=wasm32-unknown-unknown
 ENV WASM_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $WASM_TARGETS \
-  src/test/run-make \
-  src/test/ui \
-  src/test/mir-opt \
-  src/test/codegen-units \
+  tests/run-make \
+  tests/ui \
+  tests/mir-opt \
+  tests/codegen-units \
+  tests/codegen \
+  tests/assembly \
   library/core
 
 ENV NVPTX_TARGETS=nvptx64-nvidia-cuda
 ENV NVPTX_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $NVPTX_TARGETS \
-  src/test/run-make \
-  src/test/assembly
+  tests/run-make \
+  tests/assembly
 
 ENV MUSL_TARGETS=x86_64-unknown-linux-musl \
     CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
     CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++
 ENV MUSL_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $MUSL_TARGETS
 
-ENV SCRIPT $WASM_SCRIPT && $NVPTX_SCRIPT && $MUSL_SCRIPT
+COPY host-x86_64/test-various/uefi_qemu_test /uefi_qemu_test
+ENV UEFI_TARGETS=aarch64-unknown-uefi,i686-unknown-uefi,x86_64-unknown-uefi \
+    CC_aarch64_unknown_uefi=clang-11 \
+    CXX_aarch64_unknown_uefi=clang++-11 \
+    CC_i686_unknown_uefi=clang-11 \
+    CXX_i686_unknown_uefi=clang++-11 \
+    CC_x86_64_unknown_uefi=clang-11 \
+    CXX_x86_64_unknown_uefi=clang++-11
+ENV UEFI_SCRIPT python3 /checkout/x.py --stage 2 build --host='' --target $UEFI_TARGETS && \
+  python3 -u /uefi_qemu_test/run.py
+
+ENV SCRIPT $WASM_SCRIPT && $NVPTX_SCRIPT && $MUSL_SCRIPT && $UEFI_SCRIPT

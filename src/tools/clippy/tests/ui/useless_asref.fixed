@@ -1,6 +1,9 @@
-// run-rustfix
-
 #![deny(clippy::useless_asref)]
+#![allow(
+    clippy::explicit_auto_deref,
+    clippy::uninlined_format_args,
+    clippy::needless_pass_by_ref_mut
+)]
 
 use std::fmt::Debug;
 
@@ -67,7 +70,7 @@ fn not_ok() {
         foo_rslice(mrrrrrslice);
         foo_rslice(mrrrrrslice);
     }
-    #[allow(unused_parens, clippy::double_parens)]
+    #[allow(unused_parens, clippy::double_parens, clippy::needless_borrow)]
     foo_rrrrmr((&&&&MoreRef));
 
     generic_not_ok(mrslice);

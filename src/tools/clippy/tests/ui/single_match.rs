@@ -1,5 +1,11 @@
 #![warn(clippy::single_match)]
-
+#![allow(
+    unused,
+    clippy::uninlined_format_args,
+    clippy::needless_if,
+    clippy::redundant_guards,
+    clippy::redundant_pattern_matching
+)]
 fn dummy() {}
 
 fn single_match() {
@@ -145,6 +151,84 @@ fn if_suggestion() {
     };
 }
 
+// See: issue #8282
+fn ranges() {
+    enum E {
+        V,
+    }
+    let x = (Some(E::V), Some(42));
+
+    // Don't lint, because the `E` enum can be extended with additional fields later. Thus, the
+    // proposed replacement to `if let Some(E::V)` may hide non-exhaustive warnings that appeared
+    // because of `match` construction.
+    match x {
+        (Some(E::V), _) => {},
+        (None, _) => {},
+    }
+
+    // lint
+    match x {
+        (Some(_), _) => {},
+        (None, _) => {},
+    }
+
+    // lint
+    match x {
+        (Some(E::V), _) => todo!(),
+        (_, _) => {},
+    }
+
+    // lint
+    match (Some(42), Some(E::V), Some(42)) {
+        (.., Some(E::V), _) => {},
+        (..) => {},
+    }
+
+    // Don't lint, see above.
+    match (Some(E::V), Some(E::V), Some(E::V)) {
+        (.., Some(E::V), _) => {},
+        (.., None, _) => {},
+    }
+
+    // Don't lint, see above.
+    match (Some(E::V), Some(E::V), Some(E::V)) {
+        (Some(E::V), ..) => {},
+        (None, ..) => {},
+    }
+
+    // Don't lint, see above.
+    match (Some(E::V), Some(E::V), Some(E::V)) {
+        (_, Some(E::V), ..) => {},
+        (_, None, ..) => {},
+    }
+}
+
+fn skip_type_aliases() {
+    enum OptionEx {
+        Some(i32),
+        None,
+    }
+    enum ResultEx {
+        Err(i32),
+        Ok(i32),
+    }
+
+    use OptionEx::{None, Some};
+    use ResultEx::{Err, Ok};
+
+    // don't lint
+    match Err(42) {
+        Ok(_) => dummy(),
+        Err(_) => (),
+    };
+
+    // don't lint
+    match Some(1i32) {
+        Some(_) => dummy(),
+        None => (),
+    };
+}
+
 macro_rules! single_match {
     ($num:literal) => {
         match $num {
@@ -156,4 +240,73 @@ macro_rules! single_match {
 
 fn main() {
     single_match!(5);
+
+    // Don't lint
+    let _ = match Some(0) {
+        #[cfg(feature = "foo")]
+        Some(10) => 11,
+        Some(x) => x,
+        _ => 0,
+    };
+}
+
+fn issue_10808(bar: Option<i32>) {
+    match bar {
+        Some(v) => unsafe {
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+        _ => {},
+    }
+
+    match bar {
+        #[rustfmt::skip]
+        Some(v) => {
+            unsafe {
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+        _ => {},
+    }
+}
+
+mod issue8634 {
+    struct SomeError(i32, i32);
+
+    fn foo(x: Result<i32, ()>) {
+        match x {
+            Ok(y) => {
+                println!("Yay! {y}");
+            },
+            Err(()) => {
+                // Ignore this error because blah blah blah.
+            },
+        }
+    }
+
+    fn bar(x: Result<i32, SomeError>) {
+        match x {
+            Ok(y) => {
+                println!("Yay! {y}");
+            },
+            Err(_) => {
+                // TODO: Process the error properly.
+            },
+        }
+    }
+
+    fn block_comment(x: Result<i32, SomeError>) {
+        match x {
+            Ok(y) => {
+                println!("Yay! {y}");
+            },
+            Err(_) => {
+                /*
+                let's make sure that this also
+                does not lint block comments.
+                */
+            },
+        }
+    }
 }

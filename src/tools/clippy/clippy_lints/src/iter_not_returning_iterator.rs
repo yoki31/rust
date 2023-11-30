@@ -1,8 +1,10 @@
-use clippy_utils::{diagnostics::span_lint, return_ty, ty::implements_trait};
-use rustc_hir::{ImplItem, ImplItemKind};
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::get_parent_node;
+use clippy_utils::ty::implements_trait;
+use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{FnSig, ImplItem, ImplItemKind, Item, ItemKind, Node, TraitItem, TraitItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::symbol::kw;
 use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
@@ -13,7 +15,7 @@ declare_clippy_lint! {
     /// Methods named `iter` or `iter_mut` conventionally return an `Iterator`.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// // `String` does not implement `Iterator`
     /// struct Data {}
     /// impl Data {
@@ -23,7 +25,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// use std::str::Chars;
     /// struct Data {}
     /// impl Data {
@@ -32,6 +34,7 @@ declare_clippy_lint! {
     ///    }
     /// }
     /// ```
+    #[clippy::version = "1.57.0"]
     pub ITER_NOT_RETURNING_ITERATOR,
     pedantic,
     "methods named `iter` or `iter_mut` that do not return an `Iterator`"
@@ -39,26 +42,51 @@ declare_clippy_lint! {
 
 declare_lint_pass!(IterNotReturningIterator => [ITER_NOT_RETURNING_ITERATOR]);
 
-impl LateLintPass<'_> for IterNotReturningIterator {
-    fn check_impl_item(&mut self, cx: &LateContext<'tcx>, impl_item: &'tcx ImplItem<'tcx>) {
-        let name: &str = &impl_item.ident.name.as_str();
-        if_chain! {
-            if let ImplItemKind::Fn(fn_sig, _) = &impl_item.kind;
-            let ret_ty = return_ty(cx, impl_item.hir_id());
-            if matches!(name, "iter" | "iter_mut");
-            if let [param] = cx.tcx.fn_arg_names(impl_item.def_id);
-            if param.name == kw::SelfLower;
-            if let Some(iter_trait_id) = cx.tcx.get_diagnostic_item(sym::Iterator);
-            if !implements_trait(cx, ret_ty, iter_trait_id, &[]);
-
-            then {
-                span_lint(
-                    cx,
-                    ITER_NOT_RETURNING_ITERATOR,
-                    fn_sig.span,
-                    &format!("this method is named `{}` but its return type does not implement `Iterator`", name),
-                );
+impl<'tcx> LateLintPass<'tcx> for IterNotReturningIterator {
+    fn check_trait_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx TraitItem<'_>) {
+        let name = item.ident.name.as_str();
+        if matches!(name, "iter" | "iter_mut") {
+            if let TraitItemKind::Fn(fn_sig, _) = &item.kind {
+                check_sig(cx, name, fn_sig, item.owner_id.def_id);
             }
+        }
+    }
+
+    fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'tcx>) {
+        let name = item.ident.name.as_str();
+        if matches!(name, "iter" | "iter_mut")
+            && !matches!(
+                get_parent_node(cx.tcx, item.hir_id()),
+                Some(Node::Item(Item { kind: ItemKind::Impl(i), .. })) if i.of_trait.is_some()
+            )
+        {
+            if let ImplItemKind::Fn(fn_sig, _) = &item.kind {
+                check_sig(cx, name, fn_sig, item.owner_id.def_id);
+            }
+        }
+    }
+}
+
+fn check_sig(cx: &LateContext<'_>, name: &str, sig: &FnSig<'_>, fn_id: LocalDefId) {
+    if sig.decl.implicit_self.has_implicit_self() {
+        let ret_ty = cx
+            .tcx
+            .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(fn_id).instantiate_identity().output());
+        let ret_ty = cx
+            .tcx
+            .try_normalize_erasing_regions(cx.param_env, ret_ty)
+            .unwrap_or(ret_ty);
+        if cx
+            .tcx
+            .get_diagnostic_item(sym::Iterator)
+            .map_or(false, |iter_id| !implements_trait(cx, ret_ty, iter_id, &[]))
+        {
+            span_lint(
+                cx,
+                ITER_NOT_RETURNING_ITERATOR,
+                sig.span,
+                &format!("this method is named `{name}` but its return type does not implement `Iterator`"),
+            );
         }
     }
 }

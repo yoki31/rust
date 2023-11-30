@@ -1,26 +1,43 @@
-// Configure jemalloc as the `global_allocator` when configured. This is
-// so that we use the sized deallocation apis jemalloc provides
-// (namely `sdallocx`).
+#![feature(unix_sigpipe)]
+
+// A note about jemalloc: rustc uses jemalloc when built for CI and
+// distribution. The obvious way to do this is with the `#[global_allocator]`
+// mechanism. However, for complicated reasons (see
+// https://github.com/rust-lang/rust/pull/81782#issuecomment-784438001 for some
+// details) that mechanism doesn't work here. Also, we must use a consistent
+// allocator across the rustc <-> llvm boundary, and `#[global_allocator]`
+// wouldn't provide that.
 //
-// The symbol overrides documented below are also performed so that we can
-// ensure that we use a consistent allocator across the rustc <-> llvm boundary
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// Instead, we use a lower-level mechanism. rustc is linked with jemalloc in a
+// way such that jemalloc's implementation of `malloc`, `free`, etc., override
+// the libc allocator's implementation. This means that Rust's `System`
+// allocator, which calls `libc::malloc()` et al., is actually calling into
+// jemalloc.
+//
+// A consequence of not using `GlobalAlloc` (and the `tikv-jemallocator` crate
+// provides an impl of that trait, which is called `Jemalloc`) is that we
+// cannot use the sized deallocation APIs (`sdallocx`) that jemalloc provides.
+// It's unclear how much performance is lost because of this.
+//
+// As for the symbol overrides in `main` below: we're pulling in a static copy
+// of jemalloc. We need to actually reference its symbols for it to get linked.
+// The two crates we link to here, `std` and `rustc_driver`, are both dynamic
+// libraries. So we must reference jemalloc symbols one way or another, because
+// this file is the only object code in the rustc executable.
+//
+// NOTE: if you are reading this comment because you want to set a custom `global_allocator` for
+// benchmarking, consider using the benchmarks in the `rustc-perf` collector suite instead:
+// https://github.com/rust-lang/rustc-perf/blob/master/collector/README.md#profiling
+//
+// NOTE: if you are reading this comment because you want to replace jemalloc with another allocator
+// to compare their performance, see
+// https://github.com/rust-lang/rust/commit/b90cfc887c31c3e7a9e6d462e2464db1fe506175#diff-43914724af6e464c1da2171e4a9b6c7e607d5bc1203fa95c0ab85be4122605ef
+// for an example of how to do so.
 
-#[cfg(feature = "tikv-jemalloc-sys")]
-use tikv_jemalloc_sys as jemalloc_sys;
-
+#[unix_sigpipe = "sig_dfl"]
 fn main() {
-    // Pull in jemalloc when enabled.
-    //
-    // Note that we're pulling in a static copy of jemalloc which means that to
-    // pull it in we need to actually reference its symbols for it to get
-    // linked. The two crates we link to here, std and rustc_driver, are both
-    // dynamic libraries. That means to pull in jemalloc we actually need to
-    // reference allocation symbols one way or another (as this file is the only
-    // object code in the rustc executable).
-    #[cfg(feature = "tikv-jemalloc-sys")]
+    // See the comment at the top of this file for an explanation of this.
+    #[cfg(feature = "jemalloc-sys")]
     {
         use std::os::raw::{c_int, c_void};
 
@@ -53,6 +70,5 @@ fn main() {
         }
     }
 
-    rustc_driver::set_sigpipe_handler();
     rustc_driver::main()
 }

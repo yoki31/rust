@@ -1,16 +1,19 @@
+use std::any::Any;
+
 use super::write::WriteBackendMethods;
 use super::CodegenObject;
 use crate::back::write::TargetMachineFactoryFn;
 use crate::{CodegenResults, ModuleCodegen};
 
 use rustc_ast::expand::allocator::AllocatorKind;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::ErrorReported;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_errors::ErrorGuaranteed;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, LayoutOf, TyAndLayout};
-use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::util::Providers;
 use rustc_session::{
     config::{self, OutputFilenames, PrintRequest},
     cstore::MetadataLoaderDyn,
@@ -20,9 +23,7 @@ use rustc_span::symbol::Symbol;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::spec::Target;
 
-pub use rustc_data_structures::sync::MetadataRef;
-
-use std::any::Any;
+use std::fmt;
 
 pub trait BackendTypes {
     type Value: CodegenObject;
@@ -57,9 +58,13 @@ impl<'tcx, T> Backend<'tcx> for T where
 }
 
 pub trait CodegenBackend {
+    /// Locale resources for diagnostic messages - a string the content of the Fluent resource.
+    /// Called before `init` so that all other functions are able to emit translatable diagnostics.
+    fn locale_resource(&self) -> &'static str;
+
     fn init(&self, _sess: &Session) {}
-    fn print(&self, _req: PrintRequest, _sess: &Session) {}
-    fn target_features(&self, _sess: &Session) -> Vec<Symbol> {
+    fn print(&self, _req: &PrintRequest, _out: &mut dyn PrintBackendInfo, _sess: &Session) {}
+    fn target_features(&self, _sess: &Session, _allow_unstable: bool) -> Vec<Symbol> {
         vec![]
     }
     fn print_passes(&self) {}
@@ -80,7 +85,6 @@ pub trait CodegenBackend {
     }
 
     fn provide(&self, _providers: &mut Providers) {}
-    fn provide_extern(&self, _providers: &mut ExternProviders) {}
     fn codegen_crate<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -97,37 +101,28 @@ pub trait CodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorReported>;
+        outputs: &OutputFilenames,
+    ) -> Result<(CodegenResults, FxIndexMap<WorkProductId, WorkProduct>), ErrorGuaranteed>;
 
-    /// This is called on the returned `Box<dyn Any>` from `join_codegen`
-    ///
-    /// # Panics
-    ///
-    /// Panics when the passed `Box<dyn Any>` was not returned by `join_codegen`.
+    /// This is called on the returned `CodegenResults` from `join_codegen`
     fn link(
         &self,
         sess: &Session,
         codegen_results: CodegenResults,
         outputs: &OutputFilenames,
-    ) -> Result<(), ErrorReported>;
+    ) -> Result<(), ErrorGuaranteed>;
 }
 
-pub trait ExtraBackendMethods: CodegenBackend + WriteBackendMethods + Sized + Send + Sync {
-    fn new_metadata(&self, sess: TyCtxt<'_>, mod_name: &str) -> Self::Module;
-    fn write_compressed_metadata<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        metadata: &EncodedMetadata,
-        llvm_module: &mut Self::Module,
-    );
+pub trait ExtraBackendMethods:
+    CodegenBackend + WriteBackendMethods + Sized + Send + Sync + DynSend + DynSync
+{
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
-        module_llvm: &mut Self::Module,
         module_name: &str,
         kind: AllocatorKind,
-        has_alloc_error_handler: bool,
-    );
+        alloc_error_handler_kind: AllocatorKind,
+    ) -> Self::Module;
     /// This generates the codegen unit and returns it along with
     /// a `u64` giving an estimate of the unit's processing cost.
     fn compile_codegen_unit(
@@ -139,18 +134,8 @@ pub trait ExtraBackendMethods: CodegenBackend + WriteBackendMethods + Sized + Se
         &self,
         sess: &Session,
         opt_level: config::OptLevel,
+        target_features: &[String],
     ) -> TargetMachineFactoryFn<Self>;
-    fn target_cpu<'b>(&self, sess: &'b Session) -> &'b str;
-    fn tune_cpu<'b>(&self, sess: &'b Session) -> Option<&'b str>;
-
-    fn spawn_thread<F, T>(_time_trace: bool, f: F) -> std::thread::JoinHandle<T>
-    where
-        F: FnOnce() -> T,
-        F: Send + 'static,
-        T: Send + 'static,
-    {
-        std::thread::spawn(f)
-    }
 
     fn spawn_named_thread<F, T>(
         _time_trace: bool,
@@ -163,5 +148,21 @@ pub trait ExtraBackendMethods: CodegenBackend + WriteBackendMethods + Sized + Se
         T: Send + 'static,
     {
         std::thread::Builder::new().name(name).spawn(f)
+    }
+}
+
+pub trait PrintBackendInfo {
+    fn infallible_write_fmt(&mut self, args: fmt::Arguments<'_>);
+}
+
+impl PrintBackendInfo for String {
+    fn infallible_write_fmt(&mut self, args: fmt::Arguments<'_>) {
+        fmt::Write::write_fmt(self, args).unwrap();
+    }
+}
+
+impl dyn PrintBackendInfo + '_ {
+    pub fn write_fmt(&mut self, args: fmt::Arguments<'_>) {
+        self.infallible_write_fmt(args);
     }
 }

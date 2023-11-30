@@ -58,6 +58,7 @@
 pub trait Index<Idx: ?Sized> {
     /// The returned type after indexing.
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_diagnostic_item = "IndexOutput"]
     type Output: ?Sized;
 
     /// Performs the indexing (`container[index]`) operation.
@@ -106,7 +107,7 @@ pub trait Index<Idx: ?Sized> {
 ///     type Output = Weight;
 ///
 ///     fn index(&self, index: Side) -> &Self::Output {
-///         println!("Accessing {:?}-side of balance immutably", index);
+///         println!("Accessing {index:?}-side of balance immutably");
 ///         match index {
 ///             Side::Left => &self.left,
 ///             Side::Right => &self.right,
@@ -116,7 +117,7 @@ pub trait Index<Idx: ?Sized> {
 ///
 /// impl IndexMut<Side> for Balance {
 ///     fn index_mut(&mut self, index: Side) -> &mut Self::Output {
-///         println!("Accessing {:?}-side of balance mutably", index);
+///         println!("Accessing {index:?}-side of balance mutably");
 ///         match index {
 ///             Side::Left => &mut self.left,
 ///             Side::Right => &mut self.right,
@@ -152,7 +153,7 @@ see chapter in The Book <https://doc.rust-lang.org/book/ch08-02-strings.html#ind
 see chapter in The Book <https://doc.rust-lang.org/book/ch08-02-strings.html#indexing-into-strings>"
     ),
     on(
-        _Self = "std::string::String",
+        _Self = "alloc::string::String",
         note = "you can use `.chars().nth()` or `.bytes().nth()`
 see chapter in The Book <https://doc.rust-lang.org/book/ch08-02-strings.html#indexing-into-strings>"
     ),

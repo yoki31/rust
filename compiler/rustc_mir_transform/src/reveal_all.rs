@@ -9,14 +9,8 @@ pub struct RevealAll;
 
 impl<'tcx> MirPass<'tcx> for RevealAll {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        // This pass must run before inlining, since we insert callee bodies in RevealAll mode.
-        // Do not apply this transformation to generators.
-        if (tcx.sess.mir_opt_level() >= 3 || super::inline::is_enabled(tcx))
-            && body.generator.is_none()
-        {
-            let param_env = tcx.param_env_reveal_all_normalized(body.source.def_id());
-            RevealAllVisitor { tcx, param_env }.visit_body(body);
-        }
+        let param_env = tcx.param_env_reveal_all_normalized(body.source.def_id());
+        RevealAllVisitor { tcx, param_env }.visit_body_preserves_cfg(body);
     }
 }
 
@@ -32,27 +26,47 @@ impl<'tcx> MutVisitor<'tcx> for RevealAllVisitor<'tcx> {
     }
 
     #[inline]
-    fn visit_ty(&mut self, ty: &mut Ty<'tcx>, _: TyContext) {
-        *ty = self.tcx.normalize_erasing_regions(self.param_env, ty);
+    fn visit_place(
+        &mut self,
+        place: &mut Place<'tcx>,
+        _context: PlaceContext,
+        _location: Location,
+    ) {
+        // Performance optimization: don't reintern if there is no `OpaqueCast` to remove.
+        if place.projection.iter().all(|elem| !matches!(elem, ProjectionElem::OpaqueCast(_))) {
+            return;
+        }
+        // `OpaqueCast` projections are only needed if there are opaque types on which projections are performed.
+        // After the `RevealAll` pass, all opaque types are replaced with their hidden types, so we don't need these
+        // projections anymore.
+        place.projection = self.tcx.mk_place_elems(
+            &place
+                .projection
+                .into_iter()
+                .filter(|elem| !matches!(elem, ProjectionElem::OpaqueCast(_)))
+                .collect::<Vec<_>>(),
+        );
+        self.super_place(place, _context, _location);
     }
 
     #[inline]
-    fn process_projection_elem(
-        &mut self,
-        elem: PlaceElem<'tcx>,
-        _: Location,
-    ) -> Option<PlaceElem<'tcx>> {
-        match elem {
-            PlaceElem::Field(field, ty) => {
-                let new_ty = self.tcx.normalize_erasing_regions(self.param_env, ty);
-                if ty != new_ty { Some(PlaceElem::Field(field, new_ty)) } else { None }
-            }
-            // None of those contain a Ty.
-            PlaceElem::Index(..)
-            | PlaceElem::Deref
-            | PlaceElem::ConstantIndex { .. }
-            | PlaceElem::Subslice { .. }
-            | PlaceElem::Downcast(..) => None,
+    fn visit_constant(&mut self, constant: &mut ConstOperand<'tcx>, location: Location) {
+        // We have to use `try_normalize_erasing_regions` here, since it's
+        // possible that we visit impossible-to-satisfy where clauses here,
+        // see #91745
+        if let Ok(c) = self.tcx.try_normalize_erasing_regions(self.param_env, constant.const_) {
+            constant.const_ = c;
+        }
+        self.super_constant(constant, location);
+    }
+
+    #[inline]
+    fn visit_ty(&mut self, ty: &mut Ty<'tcx>, _: TyContext) {
+        // We have to use `try_normalize_erasing_regions` here, since it's
+        // possible that we visit impossible-to-satisfy where clauses here,
+        // see #91745
+        if let Ok(t) = self.tcx.try_normalize_erasing_regions(self.param_env, *ty) {
+            *ty = t;
         }
     }
 }

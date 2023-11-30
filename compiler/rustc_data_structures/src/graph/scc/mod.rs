@@ -8,7 +8,7 @@
 use crate::fx::FxHashSet;
 use crate::graph::vec_graph::VecGraph;
 use crate::graph::{DirectedGraph, GraphSuccessors, WithNumEdges, WithNumNodes, WithSuccessors};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexSlice, IndexVec};
 use std::ops::Range;
 
 #[cfg(test)]
@@ -27,7 +27,7 @@ pub struct Sccs<N: Idx, S: Idx> {
     scc_data: SccData<S>,
 }
 
-struct SccData<S: Idx> {
+pub struct SccData<S: Idx> {
     /// For each SCC, the range of `all_successors` where its
     /// successors can be found.
     ranges: IndexVec<S, Range<usize>>,
@@ -38,9 +38,17 @@ struct SccData<S: Idx> {
     all_successors: Vec<S>,
 }
 
-impl<N: Idx, S: Idx> Sccs<N, S> {
+impl<N: Idx, S: Idx + Ord> Sccs<N, S> {
     pub fn new(graph: &(impl DirectedGraph<Node = N> + WithNumNodes + WithSuccessors)) -> Self {
         SccsConstruction::construct(graph)
+    }
+
+    pub fn scc_indices(&self) -> &IndexSlice<N, S> {
+        &self.scc_indices
+    }
+
+    pub fn scc_data(&self) -> &SccData<S> {
+        &self.scc_data
     }
 
     /// Returns the number of SCCs in the graph.
@@ -85,7 +93,7 @@ impl<N: Idx, S: Idx> DirectedGraph for Sccs<N, S> {
     type Node = S;
 }
 
-impl<N: Idx, S: Idx> WithNumNodes for Sccs<N, S> {
+impl<N: Idx, S: Idx + Ord> WithNumNodes for Sccs<N, S> {
     fn num_nodes(&self) -> usize {
         self.num_sccs()
     }
@@ -97,13 +105,13 @@ impl<N: Idx, S: Idx> WithNumEdges for Sccs<N, S> {
     }
 }
 
-impl<N: Idx, S: Idx> GraphSuccessors<'graph> for Sccs<N, S> {
+impl<'graph, N: Idx, S: Idx> GraphSuccessors<'graph> for Sccs<N, S> {
     type Item = S;
 
     type Iter = std::iter::Cloned<std::slice::Iter<'graph, S>>;
 }
 
-impl<N: Idx, S: Idx> WithSuccessors for Sccs<N, S> {
+impl<N: Idx, S: Idx + Ord> WithSuccessors for Sccs<N, S> {
     fn successors(&self, node: S) -> <Self as GraphSuccessors<'_>>::Iter {
         self.successors(node).iter().cloned()
     }
@@ -113,6 +121,14 @@ impl<S: Idx> SccData<S> {
     /// Number of SCCs,
     fn len(&self) -> usize {
         self.ranges.len()
+    }
+
+    pub fn ranges(&self) -> &IndexSlice<S, Range<usize>> {
+        &self.ranges
+    }
+
+    pub fn all_successors(&self) -> &Vec<S> {
+        &self.all_successors
     }
 
     /// Returns the successors of the given SCC.
@@ -233,10 +249,9 @@ where
             .map(G::Node::new)
             .map(|node| match this.start_walk_from(node) {
                 WalkReturn::Complete { scc_index } => scc_index,
-                WalkReturn::Cycle { min_depth } => panic!(
-                    "`start_walk_node({:?})` returned cycle with depth {:?}",
-                    node, min_depth
-                ),
+                WalkReturn::Cycle { min_depth } => {
+                    panic!("`start_walk_node({node:?})` returned cycle with depth {min_depth:?}")
+                }
             })
             .collect();
 
@@ -272,8 +287,7 @@ where
             NodeState::NotVisited => return None,
 
             NodeState::InCycleWith { parent } => panic!(
-                "`find_state` returned `InCycleWith({:?})`, which ought to be impossible",
-                parent
+                "`find_state` returned `InCycleWith({parent:?})`, which ought to be impossible"
             ),
         })
     }
@@ -369,7 +383,7 @@ where
                     previous_node = previous;
                 }
                 // Only InCycleWith nodes were added to the reverse linked list.
-                other => panic!("Invalid previous link while compressing cycle: {:?}", other),
+                other => panic!("Invalid previous link while compressing cycle: {other:?}"),
             }
 
             debug!("find_state: parent_state = {:?}", node_state);
@@ -394,7 +408,7 @@ where
                 // NotVisited can not be part of a cycle since it should
                 // have instead gotten explored.
                 NodeState::NotVisited | NodeState::InCycleWith { .. } => {
-                    panic!("invalid parent state: {:?}", node_state)
+                    panic!("invalid parent state: {node_state:?}")
                 }
             }
         }
@@ -478,7 +492,7 @@ where
             let returned_walk =
                 return_value.take().into_iter().map(|walk| (*successor_node, Some(walk)));
 
-            let successor_walk = successors.by_ref().map(|successor_node| {
+            let successor_walk = successors.map(|successor_node| {
                 debug!(?node, ?successor_node);
                 (successor_node, self.inspect_node(successor_node))
             });

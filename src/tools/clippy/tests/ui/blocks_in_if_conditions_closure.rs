@@ -1,5 +1,10 @@
 #![warn(clippy::blocks_in_if_conditions)]
-#![allow(unused, clippy::let_and_return)]
+#![allow(
+    unused,
+    clippy::let_and_return,
+    clippy::needless_if,
+    clippy::unnecessary_literal_unwrap
+)]
 
 fn predicate<F: FnOnce(T) -> bool, T>(pfn: F, val: T) -> bool {
     pfn(val)
@@ -16,6 +21,8 @@ fn pred_test() {
         && sky == "blue"
         && predicate(
             |x| {
+                //~^ ERROR: in an `if` condition, avoid complex blocks or closures with blocks
+                //~| NOTE: `-D clippy::blocks-in-if-conditions` implied by `-D warnings`
                 let target = 3;
                 x == target
             },
@@ -25,6 +32,7 @@ fn pred_test() {
 
     if predicate(
         |x| {
+            //~^ ERROR: in an `if` condition, avoid complex blocks or closures with blocks; in
             let target = 3;
             x == target
         },
@@ -42,6 +50,14 @@ fn macro_in_closure() {
     if option.unwrap_or_else(|| unimplemented!()) {
         unimplemented!()
     }
+}
+
+fn closure(_: impl FnMut()) -> bool {
+    true
+}
+
+fn function_with_empty_closure() {
+    if closure(|| {}) {}
 }
 
 #[rustfmt::skip]

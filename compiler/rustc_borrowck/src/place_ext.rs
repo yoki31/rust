@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use crate::borrow_set::LocalsStateAtExit;
 use rustc_hir as hir;
 use rustc_middle::mir::ProjectionElem;
@@ -5,7 +7,7 @@ use rustc_middle::mir::{Body, Mutability, Place};
 use rustc_middle::ty::{self, TyCtxt};
 
 /// Extension methods for the `Place` type.
-crate trait PlaceExt<'tcx> {
+pub trait PlaceExt<'tcx> {
     /// Returns `true` if we can safely ignore borrows of this place.
     /// This is true whenever there is no action that the user can do
     /// to the place `self` that would invalidate the borrow. This is true
@@ -44,11 +46,9 @@ impl<'tcx> PlaceExt<'tcx> for Place<'tcx> {
             }
         }
 
-        for (i, elem) in self.projection.iter().enumerate() {
-            let proj_base = &self.projection[..i];
-
+        for (i, (proj_base, elem)) in self.iter_projections().enumerate() {
             if elem == ProjectionElem::Deref {
-                let ty = Place::ty_from(self.local, proj_base, body, tcx).ty;
+                let ty = proj_base.ty(body, tcx).ty;
                 match ty.kind() {
                     ty::Ref(_, _, hir::Mutability::Not) if i == 0 => {
                         // For references to thread-local statics, we do need
@@ -61,7 +61,7 @@ impl<'tcx> PlaceExt<'tcx> for Place<'tcx> {
                     ty::RawPtr(..) | ty::Ref(_, _, hir::Mutability::Not) => {
                         // For both derefs of raw pointers and `&T`
                         // references, the original path is `Copy` and
-                        // therefore not significant.  In particular,
+                        // therefore not significant. In particular,
                         // there is nothing the user can do to the
                         // original path that would invalidate the
                         // newly created reference -- and if there

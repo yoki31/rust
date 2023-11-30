@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 cd $(dirname "$0")/../
@@ -8,86 +8,164 @@ source ./scripts/setup_rust_fork.sh
 echo "[TEST] Test suite of rustc"
 pushd rust
 
-cargo install ripgrep
+command -v rg >/dev/null 2>&1 || cargo install ripgrep
 
-rm -r src/test/ui/{extern/,panics/,unsized-locals/,thinlto/,simd*,*lto*.rs,linkage*,unwind-*.rs} || true
-for test in $(rg --files-with-matches "asm!|catch_unwind|should_panic|lto|// needs-asm-support" src/test/ui); do
+rm -r tests/ui/{unsized-locals/,lto/,linkage*} || true
+for test in $(rg --files-with-matches "lto" tests/{codegen-units,ui,incremental}); do
   rm $test
 done
 
-for test in $(rg -i --files-with-matches "//(\[\w+\])?~|// error-pattern:|// build-fail|// run-fail|-Cllvm-args" src/test/ui); do
+for test in $(rg -i --files-with-matches "//(\[\w+\])?~[^\|]*\s*ERR|// error-pattern:|// build-fail|// run-fail|-Cllvm-args" tests/ui); do
   rm $test
 done
 
-git checkout -- src/test/ui/issues/auxiliary/issue-3136-a.rs # contains //~ERROR, but shouldn't be removed
+git checkout -- tests/ui/issues/auxiliary/issue-3136-a.rs # contains //~ERROR, but shouldn't be removed
+git checkout -- tests/ui/proc-macro/pretty-print-hack/
+git checkout -- tests/ui/entry-point/auxiliary/bad_main_functions.rs
+rm tests/ui/parser/unclosed-delimiter-in-dep.rs # submodule contains //~ERROR
 
-# these all depend on unwinding support
-rm src/test/ui/backtrace.rs
-rm src/test/ui/array-slice-vec/box-of-array-of-drop-*.rs
-rm src/test/ui/array-slice-vec/slice-panic-*.rs
-rm src/test/ui/array-slice-vec/nested-vec-3.rs
-rm src/test/ui/cleanup-rvalue-temp-during-incomplete-alloc.rs
-rm src/test/ui/issues/issue-26655.rs
-rm src/test/ui/issues/issue-29485.rs
-rm src/test/ui/issues/issue-30018-panic.rs
-rm src/test/ui/multi-panic.rs
-rm src/test/ui/sepcomp/sepcomp-unwind.rs
-rm src/test/ui/structs-enums/unit-like-struct-drop-run.rs
-rm src/test/ui/terminate-in-initializer.rs
-rm src/test/ui/threads-sendsync/task-stderr.rs
-rm src/test/ui/numbers-arithmetic/int-abs-overflow.rs
-rm src/test/ui/drop/drop-trait-enum.rs
-rm src/test/ui/numbers-arithmetic/issue-8460.rs
-rm src/test/ui/rt-explody-panic-payloads.rs
-rm src/test/incremental/change_crate_dep_kind.rs
+# missing features
+# ================
 
-rm src/test/ui/issues/issue-28950.rs # depends on stack size optimizations
-rm src/test/ui/init-large-type.rs # same
-rm src/test/ui/sse2.rs # cpuid not supported, so sse2 not detected
-rm src/test/ui/issues/issue-33992.rs # unsupported linkages
-rm src/test/ui/issues/issue-51947.rs # same
-rm src/test/ui/numbers-arithmetic/saturating-float-casts.rs # intrinsic gives different but valid result
-rm src/test/ui/mir/mir_misc_casts.rs # depends on deduplication of constants
-rm src/test/ui/mir/mir_raw_fat_ptr.rs # same
-rm src/test/ui/consts/issue-33537.rs # same
-rm src/test/ui/async-await/async-fn-size-moved-locals.rs # -Cpanic=abort shrinks some generator by one byte
-rm src/test/ui/async-await/async-fn-size-uninit-locals.rs # same
-rm src/test/ui/generator/size-moved-locals.rs # same
-rm src/test/ui/fn/dyn-fn-alignment.rs # wants a 256 byte alignment
-rm src/test/ui/test-attrs/test-fn-signature-verification-for-explicit-return-type.rs # "Cannot run dynamic test fn out-of-process"
-rm src/test/ui/intrinsics/intrinsic-nearby.rs # unimplemented nearbyintf32 and nearbyintf64 intrinsics
+# requires stack unwinding
+# FIXME add needs-unwind to these tests
+rm -r tests/run-make/libtest-junit
+rm tests/ui/asm/may_unwind.rs
 
-rm src/test/incremental/hashes/inline_asm.rs # inline asm
-rm src/test/incremental/issue-72386.rs # same
-rm src/test/incremental/issue-49482.rs # same
-rm src/test/incremental/issue-54059.rs # same
-rm src/test/incremental/lto.rs # requires lto
+# extra warning about -Cpanic=abort for proc macros
+rm tests/ui/proc-macro/crt-static.rs
+rm tests/ui/proc-macro/proc-macro-deprecated-attr.rs
+rm tests/ui/proc-macro/quote-debug.rs
+rm tests/ui/proc-macro/no-missing-docs.rs
+rm tests/ui/rust-2018/proc-macro-crate-in-paths.rs
+rm tests/ui/proc-macro/allowed-signatures.rs
+rm tests/ui/proc-macro/no-mangle-in-proc-macro-issue-111888.rs
 
-rm -r src/test/run-make/emit-shared-files # requires the rustdoc executable in build/bin/
-rm -r src/test/run-make/unstable-flag-required # same
-rm -r src/test/run-make/emit-named-files # requires full --emit support
+# vendor intrinsics
+rm tests/ui/sse2.rs # CodegenBackend::target_features not yet implemented
+rm tests/ui/simd/array-type.rs # "Index argument for `simd_insert` is not a constant"
 
-rm src/test/pretty/asm.rs # inline asm
-rm src/test/pretty/raw-str-nonexpr.rs # same
+# exotic linkages
+rm tests/ui/issues/issue-33992.rs # unsupported linkages
+rm tests/incremental/hashes/function_interfaces.rs # same
+rm tests/incremental/hashes/statics.rs # same
 
-rm -r src/test/run-pass-valgrind/unsized-locals
+# variadic arguments
+rm tests/ui/abi/mir/mir_codegen_calls_variadic.rs # requires float varargs
+rm tests/ui/abi/variadic-ffi.rs # requires callee side vararg support
+rm -r tests/run-make/c-link-to-rust-va-list-fn # requires callee side vararg support
 
-rm src/test/ui/json-bom-plus-crlf-multifile.rs # differing warning
-rm src/test/ui/json-bom-plus-crlf.rs # same
-rm src/test/ui/match/issue-82392.rs # differing error
-rm src/test/ui/type-alias-impl-trait/cross_crate_ice*.rs # requires removed aux dep
+# unsized locals
+rm -r tests/run-pass-valgrind/unsized-locals
 
-rm src/test/ui/allocator/no_std-alloc-error-handler-default.rs # missing rust_oom definition
-rm src/test/ui/cfg/cfg-panic.rs
-rm -r src/test/ui/hygiene/
+# misc unimplemented things
+rm tests/ui/intrinsics/intrinsic-nearby.rs # unimplemented nearbyintf32 and nearbyintf64 intrinsics
+rm tests/ui/target-feature/missing-plusminus.rs # error not implemented
+rm tests/ui/fn/dyn-fn-alignment.rs # wants a 256 byte alignment
+rm -r tests/run-make/emit-named-files # requires full --emit support
+rm -r tests/run-make/repr128-dwarf # debuginfo test
+rm -r tests/run-make/split-debuginfo # same
+rm -r tests/run-make/symbols-include-type-name # --emit=asm not supported
+rm -r tests/run-make/target-specs # i686 not supported by Cranelift
+rm -r tests/run-make/mismatching-target-triples # same
+rm tests/ui/asm/x86_64/issue-82869.rs # vector regs in inline asm not yet supported
+rm tests/ui/asm/x86_64/issue-96797.rs # const and sym inline asm operands don't work entirely correctly
 
-rm -r src/test/ui/polymorphization/ # polymorphization not yet supported
-rm src/test/codegen-units/polymorphization/unused_type_parameters.rs # same
+# requires LTO
+rm -r tests/run-make/cdylib
+rm -r tests/run-make/issue-14500
+rm -r tests/run-make/issue-64153
+rm -r tests/run-make/codegen-options-parsing
+rm -r tests/run-make/lto-*
+rm -r tests/run-make/reproducible-build-2
+rm -r tests/run-make/issue-109934-lto-debuginfo
 
-rm -r src/test/run-make/fmt-write-bloat/ # tests an optimization
-rm src/test/ui/abi/mir/mir_codegen_calls_variadic.rs # requires float varargs
-rm src/test/ui/abi/variadic-ffi.rs # requires callee side vararg support
+# optimization tests
+# ==================
+rm tests/ui/codegen/issue-28950.rs # depends on stack size optimizations
+rm tests/ui/codegen/init-large-type.rs # same
+rm tests/ui/issues/issue-40883.rs # same
+rm -r tests/run-make/fmt-write-bloat/ # tests an optimization
+
+# backend specific tests
+# ======================
+rm tests/incremental/thinlto/cgu_invalidated_when_import_{added,removed}.rs # requires LLVM
+rm -r tests/run-make/cross-lang-lto # same
+rm -r tests/run-make/issue-7349 # same
+rm -r tests/run-make/sepcomp-inlining # same
+rm -r tests/run-make/sepcomp-separate # same
+rm -r tests/run-make/sepcomp-cci-copies # same
+rm -r tests/run-make/volatile-intrinsics # same
+rm -r tests/run-make/llvm-ident # same
+rm -r tests/run-make/no-builtins-attribute # same
+rm tests/ui/abi/stack-protector.rs # requires stack protector support
+rm -r tests/run-make/emit-stack-sizes # requires support for -Z emit-stack-sizes
+rm -r tests/run-make/optimization-remarks-dir # remarks are LLVM specific
+
+# giving different but possibly correct results
+# =============================================
+rm tests/ui/mir/mir_misc_casts.rs # depends on deduplication of constants
+rm tests/ui/mir/mir_raw_fat_ptr.rs # same
+rm tests/ui/consts/issue-33537.rs # same
+rm tests/ui/layout/valid_range_oob.rs # different ICE message
+rm tests/ui/const-generics/generic_const_exprs/issue-80742.rs # gives error instead of ICE with cg_clif
+
+# rustdoc-clif passes extra args, suppressing the help message when no args are passed
+rm -r tests/run-make/issue-88756-default-output
+
+# doesn't work due to the way the rustc test suite is invoked.
+# should work when using ./x.py test the way it is intended
+# ============================================================
+rm -r tests/run-make/remap-path-prefix-dwarf # requires llvm-dwarfdump
+rm -r tests/ui/consts/missing_span_in_backtrace.rs # expects sysroot source to be elsewhere
+
+# genuine bugs
+# ============
+rm tests/incremental/spike-neg1.rs # errors out for some reason
+rm tests/incremental/spike-neg2.rs # same
+
+rm tests/ui/simd/simd-bitmask.rs # simd_bitmask doesn't implement [u*; N] return type
+
+rm -r tests/run-make/issue-51671 # wrong filename given in case of --emit=obj
+rm -r tests/run-make/issue-30063 # same
+rm -r tests/run-make/multiple-emits # same
+rm -r tests/run-make/output-type-permutations # same
+rm -r tests/run-make/used # same
+rm -r tests/run-make/no-alloc-shim
+rm -r tests/run-make/emit-to-stdout
+rm -r tests/run-make/compressed-debuginfo
+
+rm -r tests/run-make/extern-fn-explicit-align # argument alignment not yet supported
+
+rm tests/ui/codegen/subtyping-enforces-type-equality.rs # assert_assignable bug with Coroutine's
+
+# bugs in the test suite
+# ======================
+rm tests/ui/backtrace.rs # TODO warning
+rm tests/ui/process/nofile-limit.rs # TODO some AArch64 linking issue
+
+rm tests/ui/stdio-is-blocking.rs # really slow with unoptimized libstd
+
+cp ../dist/bin/rustdoc-clif ../dist/bin/rustdoc # some tests expect bin/rustdoc to exist
+
+# prevent $(RUSTDOC) from picking up the sysroot built by x.py. It conflicts with the one used by
+# rustdoc-clif
+cat <<EOF | git apply -
+diff --git a/tests/run-make/tools.mk b/tests/run-make/tools.mk
+index ea06b620c4c..b969d0009c6 100644
+--- a/tests/run-make/tools.mk
++++ b/tests/run-make/tools.mk
+@@ -9,7 +9,7 @@ RUSTC_ORIGINAL := \$(RUSTC)
+ BARE_RUSTC := \$(HOST_RPATH_ENV) '\$(RUSTC)'
+ BARE_RUSTDOC := \$(HOST_RPATH_ENV) '\$(RUSTDOC)'
+ RUSTC := \$(BARE_RUSTC) --out-dir \$(TMPDIR) -L \$(TMPDIR) \$(RUSTFLAGS) -Ainternal_features
+-RUSTDOC := \$(BARE_RUSTDOC) -L \$(TARGET_RPATH_DIR)
++RUSTDOC := \$(BARE_RUSTDOC)
+ ifdef RUSTC_LINKER
+ RUSTC := \$(RUSTC) -Clinker='\$(RUSTC_LINKER)'
+ RUSTDOC := \$(RUSTDOC) -Clinker='\$(RUSTC_LINKER)'
+EOF
 
 echo "[TEST] rustc test suite"
-RUST_TEST_NOCAPTURE=1 COMPILETEST_FORCE_STAGE0=1 ./x.py test --stage 0 src/test/{codegen-units,run-make,run-pass-valgrind,ui}
+COMPILETEST_FORCE_STAGE0=1 ./x.py test --stage 0 --test-args=--nocapture tests/{codegen-units,run-make,run-pass-valgrind,ui,incremental}
 popd

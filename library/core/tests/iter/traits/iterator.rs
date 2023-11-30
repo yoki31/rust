@@ -1,3 +1,6 @@
+use core::cmp::Ordering;
+use core::num::NonZeroUsize;
+
 /// A wrapper struct that implements `Eq` and `Ord` based on the wrapped
 /// integer modulo 3. Used to test that `Iterator::max` and `Iterator::min`
 /// return the correct element if some of them are equal.
@@ -150,11 +153,11 @@ fn test_iterator_advance_by() {
         let mut iter = v.iter();
         assert_eq!(iter.advance_by(i), Ok(()));
         assert_eq!(iter.next().unwrap(), &v[i]);
-        assert_eq!(iter.advance_by(100), Err(v.len() - 1 - i));
+        assert_eq!(iter.advance_by(100), Err(NonZeroUsize::new(100 - (v.len() - 1 - i)).unwrap()));
     }
 
     assert_eq!(v.iter().advance_by(v.len()), Ok(()));
-    assert_eq!(v.iter().advance_by(100), Err(v.len()));
+    assert_eq!(v.iter().advance_by(100), Err(NonZeroUsize::new(100 - v.len()).unwrap()));
 }
 
 #[test]
@@ -165,11 +168,11 @@ fn test_iterator_advance_back_by() {
         let mut iter = v.iter();
         assert_eq!(iter.advance_back_by(i), Ok(()));
         assert_eq!(iter.next_back().unwrap(), &v[v.len() - 1 - i]);
-        assert_eq!(iter.advance_back_by(100), Err(v.len() - 1 - i));
+        assert_eq!(iter.advance_back_by(100), Err(NonZeroUsize::new(100 - (v.len() - 1 - i)).unwrap()));
     }
 
     assert_eq!(v.iter().advance_back_by(v.len()), Ok(()));
-    assert_eq!(v.iter().advance_back_by(100), Err(v.len()));
+    assert_eq!(v.iter().advance_back_by(100), Err(NonZeroUsize::new(100 - v.len()).unwrap()));
 }
 
 #[test]
@@ -180,11 +183,11 @@ fn test_iterator_rev_advance_back_by() {
         let mut iter = v.iter().rev();
         assert_eq!(iter.advance_back_by(i), Ok(()));
         assert_eq!(iter.next_back().unwrap(), &v[i]);
-        assert_eq!(iter.advance_back_by(100), Err(v.len() - 1 - i));
+        assert_eq!(iter.advance_back_by(100), Err(NonZeroUsize::new(100 - (v.len() - 1 - i)).unwrap()));
     }
 
     assert_eq!(v.iter().rev().advance_back_by(v.len()), Ok(()));
-    assert_eq!(v.iter().rev().advance_back_by(100), Err(v.len()));
+    assert_eq!(v.iter().rev().advance_back_by(100), Err(NonZeroUsize::new(100 - v.len()).unwrap()));
 }
 
 #[test]
@@ -369,11 +372,39 @@ fn test_by_ref() {
 
 #[test]
 fn test_is_sorted() {
+    // Tests on integers
     assert!([1, 2, 2, 9].iter().is_sorted());
     assert!(![1, 3, 2].iter().is_sorted());
     assert!([0].iter().is_sorted());
-    assert!(std::iter::empty::<i32>().is_sorted());
+    assert!([0, 0].iter().is_sorted());
+    assert!(core::iter::empty::<i32>().is_sorted());
+
+    // Tests on floats
+    assert!([1.0f32, 2.0, 2.0, 9.0].iter().is_sorted());
+    assert!(![1.0f32, 3.0f32, 2.0f32].iter().is_sorted());
+    assert!([0.0f32].iter().is_sorted());
+    assert!([0.0f32, 0.0f32].iter().is_sorted());
+    // Test cases with NaNs
+    assert!([f32::NAN].iter().is_sorted());
+    assert!(![f32::NAN, f32::NAN].iter().is_sorted());
     assert!(![0.0, 1.0, f32::NAN].iter().is_sorted());
+    // Tests from <https://github.com/rust-lang/rust/pull/55045#discussion_r229689884>
+    assert!(![f32::NAN, f32::NAN, f32::NAN].iter().is_sorted());
+    assert!(![1.0, f32::NAN, 2.0].iter().is_sorted());
+    assert!(![2.0, f32::NAN, 1.0].iter().is_sorted());
+    assert!(![2.0, f32::NAN, 1.0, 7.0].iter().is_sorted());
+    assert!(![2.0, f32::NAN, 1.0, 0.0].iter().is_sorted());
+    assert!(![-f32::NAN, -1.0, 0.0, 1.0, f32::NAN].iter().is_sorted());
+    assert!(![f32::NAN, -f32::NAN, -1.0, 0.0, 1.0].iter().is_sorted());
+    assert!(![1.0, f32::NAN, -f32::NAN, -1.0, 0.0].iter().is_sorted());
+    assert!(![0.0, 1.0, f32::NAN, -f32::NAN, -1.0].iter().is_sorted());
+    assert!(![-1.0, 0.0, 1.0, f32::NAN, -f32::NAN].iter().is_sorted());
+
+    // Tests for is_sorted_by
+    assert!(![6, 2, 8, 5, 1, -60, 1337].iter().is_sorted());
+    assert!([6, 2, 8, 5, 1, -60, 1337].iter().is_sorted_by(|_, _| Some(Ordering::Less)));
+
+    // Tests for is_sorted_by_key
     assert!([-2, -1, 0, 3].iter().is_sorted());
     assert!(![-2i32, -1, 0, 3].iter().is_sorted_by_key(|n| n.abs()));
     assert!(!["c", "bb", "aaa"].iter().is_sorted());
@@ -424,11 +455,11 @@ fn test_iterator_rev_advance_by() {
         let mut iter = v.iter().rev();
         assert_eq!(iter.advance_by(i), Ok(()));
         assert_eq!(iter.next().unwrap(), &v[v.len() - 1 - i]);
-        assert_eq!(iter.advance_by(100), Err(v.len() - 1 - i));
+        assert_eq!(iter.advance_by(100), Err(NonZeroUsize::new(100 - (v.len() - 1 - i)).unwrap()));
     }
 
     assert_eq!(v.iter().rev().advance_by(v.len()), Ok(()));
-    assert_eq!(v.iter().rev().advance_by(100), Err(v.len()));
+    assert_eq!(v.iter().rev().advance_by(100), Err(NonZeroUsize::new(100 - v.len()).unwrap()));
 }
 
 #[test]
@@ -455,6 +486,34 @@ fn test_find_map() {
 }
 
 #[test]
+fn test_try_reduce() {
+    let v = [1usize, 2, 3, 4, 5];
+    let sum = v.into_iter().try_reduce(|x, y| x.checked_add(y));
+    assert_eq!(sum, Some(Some(15)));
+
+    let v = [1, 2, 3, 4, 5, usize::MAX];
+    let sum = v.into_iter().try_reduce(|x, y| x.checked_add(y));
+    assert_eq!(sum, None);
+
+    let v: [usize; 0] = [];
+    let sum = v.into_iter().try_reduce(|x, y| x.checked_add(y));
+    assert_eq!(sum, Some(None));
+
+    let v = ["1", "2", "3", "4", "5"];
+    let max = v.into_iter().try_reduce(|x, y| {
+        if x.parse::<usize>().ok()? > y.parse::<usize>().ok()? { Some(x) } else { Some(y) }
+    });
+    assert_eq!(max, Some(Some("5")));
+
+    let v = ["1", "2", "3", "4", "5"];
+    let max: Result<Option<_>, <usize as std::str::FromStr>::Err> =
+        v.into_iter().try_reduce(|x, y| {
+            if x.parse::<usize>()? > y.parse::<usize>()? { Ok(x) } else { Ok(y) }
+        });
+    assert_eq!(max, Ok(Some("5")));
+}
+
+#[test]
 fn test_iterator_len() {
     let v: &[_] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     assert_eq!(v[..4].iter().count(), 4);
@@ -467,4 +526,102 @@ fn test_collect() {
     let a = vec![1, 2, 3, 4, 5];
     let b: Vec<isize> = a.iter().cloned().collect();
     assert!(a == b);
+}
+
+#[test]
+fn test_try_collect() {
+    use core::ops::ControlFlow::{Break, Continue};
+
+    let u = vec![Some(1), Some(2), Some(3)];
+    let v = u.into_iter().try_collect::<Vec<i32>>();
+    assert_eq!(v, Some(vec![1, 2, 3]));
+
+    let u = vec![Some(1), Some(2), None, Some(3)];
+    let mut it = u.into_iter();
+    let v = it.try_collect::<Vec<i32>>();
+    assert_eq!(v, None);
+    let v = it.try_collect::<Vec<i32>>();
+    assert_eq!(v, Some(vec![3]));
+
+    let u: Vec<Result<i32, ()>> = vec![Ok(1), Ok(2), Ok(3)];
+    let v = u.into_iter().try_collect::<Vec<i32>>();
+    assert_eq!(v, Ok(vec![1, 2, 3]));
+
+    let u = vec![Ok(1), Ok(2), Err(()), Ok(3)];
+    let v = u.into_iter().try_collect::<Vec<i32>>();
+    assert_eq!(v, Err(()));
+
+    let numbers = vec![1, 2, 3, 4, 5];
+    let all_positive = numbers
+        .iter()
+        .cloned()
+        .map(|n| if n > 0 { Some(n) } else { None })
+        .try_collect::<Vec<i32>>();
+    assert_eq!(all_positive, Some(numbers));
+
+    let numbers = vec![-2, -1, 0, 1, 2];
+    let all_positive =
+        numbers.into_iter().map(|n| if n > 0 { Some(n) } else { None }).try_collect::<Vec<i32>>();
+    assert_eq!(all_positive, None);
+
+    let u = [Continue(1), Continue(2), Break(3), Continue(4), Continue(5)];
+    let mut it = u.into_iter();
+
+    let v = it.try_collect::<Vec<_>>();
+    assert_eq!(v, Break(3));
+
+    let v = it.try_collect::<Vec<_>>();
+    assert_eq!(v, Continue(vec![4, 5]));
+}
+
+#[test]
+fn test_collect_into() {
+    let a = vec![1, 2, 3, 4, 5];
+    let mut b = Vec::new();
+    a.iter().cloned().collect_into(&mut b);
+    assert!(a == b);
+}
+
+#[test]
+fn iter_try_collect_uses_try_fold_not_next() {
+    // This makes sure it picks up optimizations, and doesn't use the `&mut I` impl.
+    struct PanicOnNext<I>(I);
+    impl<I: Iterator> Iterator for PanicOnNext<I> {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<Self::Item> {
+            panic!("Iterator::next should not be called!")
+        }
+        fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R
+        where
+            Self: Sized,
+            F: FnMut(B, Self::Item) -> R,
+            R: std::ops::Try<Output = B>,
+        {
+            self.0.try_fold(init, f)
+        }
+    }
+
+    let it = (0..10).map(Some);
+    let _ = PanicOnNext(it).try_collect::<Vec<_>>();
+    // validation is just that it didn't panic.
+}
+
+#[test]
+fn test_next_chunk() {
+    let mut it = 0..12;
+    assert_eq!(it.next_chunk().unwrap(), [0, 1, 2, 3]);
+    assert_eq!(it.next_chunk().unwrap(), []);
+    assert_eq!(it.next_chunk().unwrap(), [4, 5, 6, 7, 8, 9]);
+    assert_eq!(it.next_chunk::<4>().unwrap_err().as_slice(), &[10, 11]);
+
+    let mut it = std::iter::repeat_with(|| panic!());
+    assert_eq!(it.next_chunk::<0>().unwrap(), []);
+}
+
+// just tests by whether or not this compiles
+fn _empty_impl_all_auto_traits<T>() {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+    fn all_auto_traits<T: Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+
+    all_auto_traits::<std::iter::Empty<T>>();
 }

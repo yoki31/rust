@@ -5,6 +5,7 @@ LL |     a = a + 1;
    |     ^^^^^^^^^ help: replace it with: `a += 1`
    |
    = note: `-D clippy::assign-op-pattern` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::assign_op_pattern)]`
 
 error: manual implementation of an assign operation
   --> $DIR/assign_ops.rs:8:5
@@ -54,5 +55,17 @@ error: manual implementation of an assign operation
 LL |     s = s + "bla";
    |     ^^^^^^^^^^^^^ help: replace it with: `s += "bla"`
 
-error: aborting due to 9 previous errors
+error: manual implementation of an assign operation
+  --> $DIR/assign_ops.rs:24:5
+   |
+LL |     a = a + Wrapping(1u32);
+   |     ^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `a += Wrapping(1u32)`
+
+error: manual implementation of an assign operation
+  --> $DIR/assign_ops.rs:26:5
+   |
+LL |     v[0] = v[0] + v[1];
+   |     ^^^^^^^^^^^^^^^^^^ help: replace it with: `v[0] += v[1]`
+
+error: aborting due to 11 previous errors
 

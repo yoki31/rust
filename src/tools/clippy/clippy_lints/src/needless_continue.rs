@@ -55,7 +55,7 @@ declare_clippy_lint! {
     /// statement within the THEN block and omitting the else block completely.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # fn condition() -> bool { false }
     /// # fn update_condition() {}
     /// # let x = false;
@@ -72,7 +72,7 @@ declare_clippy_lint! {
     ///
     /// Could be rewritten as
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn condition() -> bool { false }
     /// # fn update_condition() {}
     /// # let x = false;
@@ -87,7 +87,7 @@ declare_clippy_lint! {
     ///
     /// As another example, the following code
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn waiting() -> bool { false }
     /// loop {
     ///     if waiting() {
@@ -100,7 +100,7 @@ declare_clippy_lint! {
     /// ```
     /// Could be rewritten as
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn waiting() -> bool { false }
     /// loop {
     ///     if waiting() {
@@ -110,6 +110,7 @@ declare_clippy_lint! {
     ///     # break;
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_CONTINUE,
     pedantic,
     "`continue` statements that can be replaced by a rearrangement of code"
@@ -188,7 +189,7 @@ fn needless_continue_in_else(else_expr: &ast::Expr, label: Option<&ast::Label>) 
 }
 
 fn is_first_block_stmt_continue(block: &ast::Block, label: Option<&ast::Label>) -> bool {
-    block.stmts.get(0).map_or(false, |stmt| match stmt.kind {
+    block.stmts.first().map_or(false, |stmt| match stmt.kind {
         ast::StmtKind::Semi(ref e) | ast::StmtKind::Expr(ref e) => {
             if let ast::ExprKind::Continue(ref l) = e.kind {
                 compare_labels(label, l.as_ref())
@@ -286,7 +287,7 @@ const DROP_ELSE_BLOCK_MSG: &str = "consider dropping the `else` clause";
 
 const DROP_CONTINUE_EXPRESSION_MSG: &str = "consider dropping the `continue` expression";
 
-fn emit_warning<'a>(cx: &EarlyContext<'_>, data: &'a LintData<'_>, header: &str, typ: LintType) {
+fn emit_warning(cx: &EarlyContext<'_>, data: &LintData<'_>, header: &str, typ: LintType) {
     // snip    is the whole *help* message that appears after the warning.
     // message is the warning message.
     // expr    is the expression which the lint warning message refers to.
@@ -308,11 +309,11 @@ fn emit_warning<'a>(cx: &EarlyContext<'_>, data: &'a LintData<'_>, header: &str,
         expr.span,
         message,
         None,
-        &format!("{}\n{}", header, snip),
+        &format!("{header}\n{snip}"),
     );
 }
 
-fn suggestion_snippet_for_continue_inside_if<'a>(cx: &EarlyContext<'_>, data: &'a LintData<'_>) -> String {
+fn suggestion_snippet_for_continue_inside_if(cx: &EarlyContext<'_>, data: &LintData<'_>) -> String {
     let cond_code = snippet(cx, data.if_cond.span, "..");
 
     let continue_code = snippet_block(cx, data.if_block.span, "..", Some(data.if_expr.span));
@@ -321,15 +322,12 @@ fn suggestion_snippet_for_continue_inside_if<'a>(cx: &EarlyContext<'_>, data: &'
 
     let indent_if = indent_of(cx, data.if_expr.span).unwrap_or(0);
     format!(
-        "{indent}if {} {}\n{indent}{}",
-        cond_code,
-        continue_code,
-        else_code,
+        "{indent}if {cond_code} {continue_code}\n{indent}{else_code}",
         indent = " ".repeat(indent_if),
     )
 }
 
-fn suggestion_snippet_for_continue_inside_else<'a>(cx: &EarlyContext<'_>, data: &'a LintData<'_>) -> String {
+fn suggestion_snippet_for_continue_inside_else(cx: &EarlyContext<'_>, data: &LintData<'_>) -> String {
     let cond_code = snippet(cx, data.if_cond.span, "..");
 
     // Region B
@@ -348,7 +346,7 @@ fn suggestion_snippet_for_continue_inside_else<'a>(cx: &EarlyContext<'_>, data: 
             let span = cx.sess().source_map().stmt_span(stmt.span, data.loop_block.span);
             let snip = snippet_block(cx, span, "..", None).into_owned();
             snip.lines()
-                .map(|line| format!("{}{}", " ".repeat(indent), line))
+                .map(|line| format!("{}{line}", " ".repeat(indent)))
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -357,31 +355,26 @@ fn suggestion_snippet_for_continue_inside_else<'a>(cx: &EarlyContext<'_>, data: 
 
     let indent_if = indent_of(cx, data.if_expr.span).unwrap_or(0);
     format!(
-        "{indent_if}if {} {}\n{indent}// merged code follows:\n{}\n{indent_if}}}",
-        cond_code,
-        block_code,
-        to_annex,
+        "{indent_if}if {cond_code} {block_code}\n{indent}// merged code follows:\n{to_annex}\n{indent_if}}}",
         indent = " ".repeat(indent),
         indent_if = " ".repeat(indent_if),
     )
 }
 
-fn check_and_warn<'a>(cx: &EarlyContext<'_>, expr: &'a ast::Expr) {
-    if_chain! {
-        if let ast::ExprKind::Loop(loop_block, ..) = &expr.kind;
-        if let Some(last_stmt) = loop_block.stmts.last();
-        if let ast::StmtKind::Expr(inner_expr) | ast::StmtKind::Semi(inner_expr) = &last_stmt.kind;
-        if let ast::ExprKind::Continue(_) = inner_expr.kind;
-        then {
-            span_lint_and_help(
-                cx,
-                NEEDLESS_CONTINUE,
-                last_stmt.span,
-                MSG_REDUNDANT_CONTINUE_EXPRESSION,
-                None,
-                DROP_CONTINUE_EXPRESSION_MSG,
-            );
-        }
+fn check_and_warn(cx: &EarlyContext<'_>, expr: &ast::Expr) {
+    if let ast::ExprKind::Loop(loop_block, ..) = &expr.kind
+        && let Some(last_stmt) = loop_block.stmts.last()
+        && let ast::StmtKind::Expr(inner_expr) | ast::StmtKind::Semi(inner_expr) = &last_stmt.kind
+        && let ast::ExprKind::Continue(_) = inner_expr.kind
+    {
+        span_lint_and_help(
+            cx,
+            NEEDLESS_CONTINUE,
+            last_stmt.span,
+            MSG_REDUNDANT_CONTINUE_EXPRESSION,
+            None,
+            DROP_CONTINUE_EXPRESSION_MSG,
+        );
     }
     with_loop_block(expr, |loop_block, label| {
         for (i, stmt) in loop_block.stmts.iter().enumerate() {
@@ -413,7 +406,7 @@ fn check_and_warn<'a>(cx: &EarlyContext<'_>, expr: &'a ast::Expr) {
 /// till a non-whitespace character is found.  e.g., the string. If no closing `}` is present, the
 /// string will be preserved.
 ///
-/// ```rust
+/// ```no_run
 /// {
 ///     let x = 5;
 /// }
@@ -439,7 +432,7 @@ fn erode_from_back(s: &str) -> String {
 }
 
 fn span_of_first_expr_in_block(block: &ast::Block) -> Option<Span> {
-    block.stmts.get(0).map(|stmt| stmt.span)
+    block.stmts.first().map(|stmt| stmt.span)
 }
 
 #[cfg(test)]

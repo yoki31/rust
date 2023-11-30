@@ -15,14 +15,10 @@ use crate::panic::Location;
 /// use std::panic;
 ///
 /// panic::set_hook(Box::new(|panic_info| {
-///     if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-///         println!("panic occurred: {:?}", s);
-///     } else {
-///         println!("panic occurred");
-///     }
+///     println!("panic occurred: {panic_info}");
 /// }));
 ///
-/// panic!("Normal panic");
+/// panic!("critical system failure");
 /// ```
 #[lang = "panic_info"]
 #[stable(feature = "panic_hooks", since = "1.10.0")]
@@ -31,6 +27,8 @@ pub struct PanicInfo<'a> {
     payload: &'a (dyn Any + Send),
     message: Option<&'a fmt::Arguments<'a>>,
     location: &'a Location<'a>,
+    can_unwind: bool,
+    force_no_backtrace: bool,
 }
 
 impl<'a> PanicInfo<'a> {
@@ -44,9 +42,11 @@ impl<'a> PanicInfo<'a> {
     pub fn internal_constructor(
         message: Option<&'a fmt::Arguments<'a>>,
         location: &'a Location<'a>,
+        can_unwind: bool,
+        force_no_backtrace: bool,
     ) -> Self {
         struct NoPayload;
-        PanicInfo { location, message, payload: &NoPayload }
+        PanicInfo { location, message, payload: &NoPayload, can_unwind, force_no_backtrace }
     }
 
     #[unstable(
@@ -73,7 +73,7 @@ impl<'a> PanicInfo<'a> {
     ///
     /// panic::set_hook(Box::new(|panic_info| {
     ///     if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-    ///         println!("panic occurred: {:?}", s);
+    ///         println!("panic occurred: {s:?}");
     ///     } else {
     ///         println!("panic occurred");
     ///     }
@@ -127,22 +127,51 @@ impl<'a> PanicInfo<'a> {
         // deal with that case in std::panicking::default_hook and core::panicking::panic_fmt.
         Some(&self.location)
     }
+
+    /// Returns whether the panic handler is allowed to unwind the stack from
+    /// the point where the panic occurred.
+    ///
+    /// This is true for most kinds of panics with the exception of panics
+    /// caused by trying to unwind out of a `Drop` implementation or a function
+    /// whose ABI does not support unwinding.
+    ///
+    /// It is safe for a panic handler to unwind even when this function returns
+    /// false, however this will simply cause the panic handler to be called
+    /// again.
+    #[must_use]
+    #[unstable(feature = "panic_can_unwind", issue = "92988")]
+    pub fn can_unwind(&self) -> bool {
+        self.can_unwind
+    }
+
+    #[unstable(
+        feature = "panic_internals",
+        reason = "internal details of the implementation of the `panic!` and related macros",
+        issue = "none"
+    )]
+    #[doc(hidden)]
+    #[inline]
+    pub fn force_no_backtrace(&self) -> bool {
+        self.force_no_backtrace
+    }
 }
 
 #[stable(feature = "panic_hook_display", since = "1.26.0")]
 impl fmt::Display for PanicInfo<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("panicked at ")?;
+        self.location.fmt(formatter)?;
         if let Some(message) = self.message {
-            write!(formatter, "'{}', ", message)?
+            formatter.write_str(":\n")?;
+            formatter.write_fmt(*message)?;
         } else if let Some(payload) = self.payload.downcast_ref::<&'static str>() {
-            write!(formatter, "'{}', ", payload)?
+            formatter.write_str(":\n")?;
+            formatter.write_str(payload)?;
         }
         // NOTE: we cannot use downcast_ref::<String>() here
-        // since String is not available in libcore!
+        // since String is not available in core!
         // The payload is a String when `std::panic!` is called with multiple arguments,
         // but in that case the message is also available.
-
-        self.location.fmt(formatter)
+        Ok(())
     }
 }

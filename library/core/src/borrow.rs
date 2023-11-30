@@ -1,4 +1,4 @@
-//! A module for working with borrowed data.
+//! Utilities for working with borrowed data.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -22,11 +22,11 @@
 /// Types express that they can be borrowed as some type `T` by implementing
 /// `Borrow<T>`, providing a reference to a `T` in the trait’s
 /// [`borrow`] method. A type is free to borrow as several different types.
-/// If it wishes to mutably borrow as the type – allowing the underlying data
+/// If it wishes to mutably borrow as the type, allowing the underlying data
 /// to be modified, it can additionally implement [`BorrowMut<T>`].
 ///
 /// Further, when providing implementations for additional traits, it needs
-/// to be considered whether they should behave identical to those of the
+/// to be considered whether they should behave identically to those of the
 /// underlying type as a consequence of acting as a representation of that
 /// underlying type. Generic code typically uses `Borrow<T>` when it relies
 /// on the identical behavior of these additional trait implementations.

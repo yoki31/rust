@@ -1,4 +1,5 @@
 use super::*;
+use crate::panic::{RefUnwindSafe, UnwindSafe};
 
 fn generate_fake_frames() -> Vec<BacktraceFrame> {
     vec![
@@ -43,9 +44,8 @@ fn generate_fake_frames() -> Vec<BacktraceFrame> {
 #[test]
 fn test_debug() {
     let backtrace = Backtrace {
-        inner: Inner::Captured(LazilyResolvedCapture::new(Capture {
+        inner: Inner::Captured(LazyLock::preinit(Capture {
             actual_start: 1,
-            resolved: true,
             frames: generate_fake_frames(),
         })),
     };
@@ -57,18 +57,17 @@ fn test_debug() {
     \n    { fn: \"std::rt::lang_start\", file: \"rust/rt.rs\", line: 400 },\
     \n]";
 
-    assert_eq!(format!("{:#?}", backtrace), expected);
+    assert_eq!(format!("{backtrace:#?}"), expected);
 
     // Format the backtrace a second time, just to make sure lazily resolved state is stable
-    assert_eq!(format!("{:#?}", backtrace), expected);
+    assert_eq!(format!("{backtrace:#?}"), expected);
 }
 
 #[test]
 fn test_frames() {
     let backtrace = Backtrace {
-        inner: Inner::Captured(LazilyResolvedCapture::new(Capture {
+        inner: Inner::Captured(LazyLock::preinit(Capture {
             actual_start: 1,
-            resolved: true,
             frames: generate_fake_frames(),
         })),
     };
@@ -91,5 +90,11 @@ fn test_frames() {
 
     let mut iter = frames.iter().zip(expected.iter());
 
-    assert!(iter.all(|(f, e)| format!("{:#?}", f) == *e));
+    assert!(iter.all(|(f, e)| format!("{f:#?}") == *e));
+}
+
+#[test]
+fn backtrace_unwind_safe() {
+    fn assert_unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+    assert_unwind_safe::<Backtrace>();
 }

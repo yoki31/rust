@@ -6,20 +6,20 @@ use std::io::Write;
 use crate::config::{Color, Config, Verbosity};
 
 #[derive(Debug, PartialEq)]
-pub enum DiffLine {
+pub(crate) enum DiffLine {
     Context(String),
     Expected(String),
     Resulting(String),
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Mismatch {
+pub(crate) struct Mismatch {
     /// The line number in the formatted version.
-    pub line_number: u32,
+    pub(crate) line_number: u32,
     /// The line number in the original version.
-    pub line_number_orig: u32,
+    pub(crate) line_number_orig: u32,
     /// The set of lines (context and old/new) in the mismatch.
-    pub lines: Vec<DiffLine>,
+    pub(crate) lines: Vec<DiffLine>,
 }
 
 impl Mismatch {
@@ -95,7 +95,7 @@ impl fmt::Display for ModifiedLines {
             )?;
 
             for line in &chunk.lines {
-                writeln!(f, "{}", line)?;
+                writeln!(f, "{line}")?;
             }
         }
 
@@ -166,12 +166,12 @@ impl OutputWriter {
                 if let Some(color) = color {
                     t.fg(color).unwrap();
                 }
-                writeln!(t, "{}", msg).unwrap();
+                writeln!(t, "{msg}").unwrap();
                 if color.is_some() {
                     t.reset().unwrap();
                 }
             }
-            None => println!("{}", msg),
+            None => println!("{msg}"),
         }
     }
 }
@@ -265,16 +265,15 @@ where
         for line in mismatch.lines {
             match line {
                 DiffLine::Context(ref str) => {
-                    writer.writeln(&format!(" {}{}", str, line_terminator), None)
+                    writer.writeln(&format!(" {str}{line_terminator}"), None)
                 }
                 DiffLine::Expected(ref str) => writer.writeln(
-                    &format!("+{}{}", str, line_terminator),
+                    &format!("+{str}{line_terminator}"),
                     Some(term::color::GREEN),
                 ),
-                DiffLine::Resulting(ref str) => writer.writeln(
-                    &format!("-{}{}", str, line_terminator),
-                    Some(term::color::RED),
-                ),
+                DiffLine::Resulting(ref str) => {
+                    writer.writeln(&format!("-{str}{line_terminator}"), Some(term::color::RED))
+                }
             }
         }
     }

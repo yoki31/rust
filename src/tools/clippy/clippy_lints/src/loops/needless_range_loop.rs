@@ -3,15 +3,13 @@ use clippy_utils::diagnostics::{multispan_sugg, span_lint_and_then};
 use clippy_utils::source::snippet;
 use clippy_utils::ty::has_iter_method;
 use clippy_utils::visitors::is_local_used;
-use clippy_utils::{contains_name, higher, is_integer_const, match_trait_method, paths, sugg, SpanlessEq};
-use if_chain::if_chain;
+use clippy_utils::{contains_name, higher, is_integer_const, sugg, SpanlessEq};
 use rustc_ast::ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::intravisit::{walk_expr, NestedVisitorMap, Visitor};
-use rustc_hir::{BinOpKind, BorrowKind, Expr, ExprKind, HirId, Mutability, Pat, PatKind, QPath};
+use rustc_hir::intravisit::{walk_expr, Visitor};
+use rustc_hir::{BinOpKind, BorrowKind, Closure, Expr, ExprKind, HirId, Mutability, Pat, PatKind, QPath};
 use rustc_lint::LateContext;
-use rustc_middle::hir::map::Map;
 use rustc_middle::middle::region;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::symbol::{sym, Symbol};
@@ -20,7 +18,7 @@ use std::mem;
 
 /// Checks for looping over a range and then indexing a sequence with it.
 /// The iteratee must be a range literal.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
     pat: &'tcx Pat<'_>,
@@ -58,10 +56,9 @@ pub(super) fn check<'tcx>(
 
                 // ensure that the indexed variable was declared before the loop, see #601
                 if let Some(indexed_extent) = indexed_extent {
-                    let parent_id = cx.tcx.hir().get_parent_item(expr.hir_id);
-                    let parent_def_id = cx.tcx.hir().local_def_id(parent_id);
+                    let parent_def_id = cx.tcx.hir().get_parent_item(expr.hir_id);
                     let region_scope_tree = cx.tcx.region_scope_tree(parent_def_id);
-                    let pat_extent = region_scope_tree.var_scope(pat.hir_id.local_id);
+                    let pat_extent = region_scope_tree.var_scope(pat.hir_id.local_id).unwrap();
                     if region_scope_tree.is_subscope_of(indexed_extent, pat_extent) {
                         return;
                     }
@@ -83,7 +80,7 @@ pub(super) fn check<'tcx>(
 
                 let skip = if starts_at_zero {
                     String::new()
-                } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, start) {
+                } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, start, cx) {
                     return;
                 } else {
                     format!(".skip({})", snippet(cx, start.span, ".."))
@@ -111,7 +108,7 @@ pub(super) fn check<'tcx>(
 
                     if is_len_call(end, indexed) || is_end_eq_array_len(cx, end, limits, indexed_ty) {
                         String::new()
-                    } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, take_expr) {
+                    } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, take_expr, cx) {
                         return;
                     } else {
                         match limits {
@@ -119,7 +116,9 @@ pub(super) fn check<'tcx>(
                                 let take_expr = sugg::Sugg::hir(cx, take_expr, "<count>");
                                 format!(".take({})", take_expr + sugg::ONE)
                             },
-                            ast::RangeLimits::HalfOpen => format!(".take({})", snippet(cx, take_expr.span, "..")),
+                            ast::RangeLimits::HalfOpen => {
+                                format!(".take({})", snippet(cx, take_expr.span, ".."))
+                            },
                         }
                     }
                 } else {
@@ -145,16 +144,16 @@ pub(super) fn check<'tcx>(
                         cx,
                         NEEDLESS_RANGE_LOOP,
                         arg.span,
-                        &format!("the loop variable `{}` is used to index `{}`", ident.name, indexed),
+                        &format!("the loop variable `{}` is used to index `{indexed}`", ident.name),
                         |diag| {
                             multispan_sugg(
                                 diag,
-                                "consider using an iterator",
+                                "consider using an iterator and enumerate()",
                                 vec![
                                     (pat.span, format!("({}, <item>)", ident.name)),
                                     (
                                         arg.span,
-                                        format!("{}.{}().enumerate(){}{}", indexed, method, method_1, method_2),
+                                        format!("{indexed}.{method}().enumerate(){method_1}{method_2}"),
                                     ),
                                 ],
                             );
@@ -162,16 +161,16 @@ pub(super) fn check<'tcx>(
                     );
                 } else {
                     let repl = if starts_at_zero && take_is_empty {
-                        format!("&{}{}", ref_mut, indexed)
+                        format!("&{ref_mut}{indexed}")
                     } else {
-                        format!("{}.{}(){}{}", indexed, method, method_1, method_2)
+                        format!("{indexed}.{method}(){method_1}{method_2}")
                     };
 
                     span_lint_and_then(
                         cx,
                         NEEDLESS_RANGE_LOOP,
                         arg.span,
-                        &format!("the loop variable `{}` is only used to index `{}`", ident.name, indexed),
+                        &format!("the loop variable `{}` is only used to index `{indexed}`", ident.name),
                         |diag| {
                             multispan_sugg(
                                 diag,
@@ -187,16 +186,13 @@ pub(super) fn check<'tcx>(
 }
 
 fn is_len_call(expr: &Expr<'_>, var: Symbol) -> bool {
-    if_chain! {
-        if let ExprKind::MethodCall(method, _, len_args, _) = expr.kind;
-        if len_args.len() == 1;
-        if method.ident.name == sym::len;
-        if let ExprKind::Path(QPath::Resolved(_, path)) = len_args[0].kind;
-        if path.segments.len() == 1;
-        if path.segments[0].ident.name == var;
-        then {
-            return true;
-        }
+    if let ExprKind::MethodCall(method, recv, [], _) = expr.kind
+        && method.ident.name == sym::len
+        && let ExprKind::Path(QPath::Resolved(_, path)) = recv.kind
+        && path.segments.len() == 1
+        && path.segments[0].ident.name == var
+    {
+        return true;
     }
 
     false
@@ -208,17 +204,15 @@ fn is_end_eq_array_len<'tcx>(
     limits: ast::RangeLimits,
     indexed_ty: Ty<'tcx>,
 ) -> bool {
-    if_chain! {
-        if let ExprKind::Lit(ref lit) = end.kind;
-        if let ast::LitKind::Int(end_int, _) = lit.node;
-        if let ty::Array(_, arr_len_const) = indexed_ty.kind();
-        if let Some(arr_len) = arr_len_const.try_eval_usize(cx.tcx, cx.param_env);
-        then {
-            return match limits {
-                ast::RangeLimits::Closed => end_int + 1 >= arr_len.into(),
-                ast::RangeLimits::HalfOpen => end_int >= arr_len.into(),
-            };
-        }
+    if let ExprKind::Lit(lit) = end.kind
+        && let ast::LitKind::Int(end_int, _) = lit.node
+        && let ty::Array(_, arr_len_const) = indexed_ty.kind()
+        && let Some(arr_len) = arr_len_const.try_eval_target_usize(cx.tcx, cx.param_env)
+    {
+        return match limits {
+            ast::RangeLimits::Closed => end_int + 1 >= arr_len.into(),
+            ast::RangeLimits::HalfOpen => end_int >= arr_len.into(),
+        };
     }
 
     false
@@ -249,46 +243,49 @@ struct VarVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> VarVisitor<'a, 'tcx> {
     fn check(&mut self, idx: &'tcx Expr<'_>, seqexpr: &'tcx Expr<'_>, expr: &'tcx Expr<'_>) -> bool {
-        if_chain! {
+        if let ExprKind::Path(ref seqpath) = seqexpr.kind
             // the indexed container is referenced by a name
-            if let ExprKind::Path(ref seqpath) = seqexpr.kind;
-            if let QPath::Resolved(None, seqvar) = *seqpath;
-            if seqvar.segments.len() == 1;
-            if is_local_used(self.cx, idx, self.var);
-            then {
-                if self.prefer_mutable {
-                    self.indexed_mut.insert(seqvar.segments[0].ident.name);
-                }
-                let index_used_directly = matches!(idx.kind, ExprKind::Path(_));
-                let res = self.cx.qpath_res(seqpath, seqexpr.hir_id);
-                match res {
-                    Res::Local(hir_id) => {
-                        let parent_id = self.cx.tcx.hir().get_parent_item(expr.hir_id);
-                        let parent_def_id = self.cx.tcx.hir().local_def_id(parent_id);
-                        let extent = self.cx.tcx.region_scope_tree(parent_def_id).var_scope(hir_id.local_id);
-                        if index_used_directly {
-                            self.indexed_directly.insert(
-                                seqvar.segments[0].ident.name,
-                                (Some(extent), self.cx.typeck_results().node_type(seqexpr.hir_id)),
-                            );
-                        } else {
-                            self.indexed_indirectly.insert(seqvar.segments[0].ident.name, Some(extent));
-                        }
-                        return false;  // no need to walk further *on the variable*
+            && let QPath::Resolved(None, seqvar) = *seqpath
+            && seqvar.segments.len() == 1
+            && is_local_used(self.cx, idx, self.var)
+        {
+            if self.prefer_mutable {
+                self.indexed_mut.insert(seqvar.segments[0].ident.name);
+            }
+            let index_used_directly = matches!(idx.kind, ExprKind::Path(_));
+            let res = self.cx.qpath_res(seqpath, seqexpr.hir_id);
+            match res {
+                Res::Local(hir_id) => {
+                    let parent_def_id = self.cx.tcx.hir().get_parent_item(expr.hir_id);
+                    let extent = self
+                        .cx
+                        .tcx
+                        .region_scope_tree(parent_def_id)
+                        .var_scope(hir_id.local_id)
+                        .unwrap();
+                    if index_used_directly {
+                        self.indexed_directly.insert(
+                            seqvar.segments[0].ident.name,
+                            (Some(extent), self.cx.typeck_results().node_type(seqexpr.hir_id)),
+                        );
+                    } else {
+                        self.indexed_indirectly
+                            .insert(seqvar.segments[0].ident.name, Some(extent));
                     }
-                    Res::Def(DefKind::Static | DefKind::Const, ..) => {
-                        if index_used_directly {
-                            self.indexed_directly.insert(
-                                seqvar.segments[0].ident.name,
-                                (None, self.cx.typeck_results().node_type(seqexpr.hir_id)),
-                            );
-                        } else {
-                            self.indexed_indirectly.insert(seqvar.segments[0].ident.name, None);
-                        }
-                        return false;  // no need to walk further *on the variable*
+                    return false; // no need to walk further *on the variable*
+                },
+                Res::Def(DefKind::Static(_) | DefKind::Const, ..) => {
+                    if index_used_directly {
+                        self.indexed_directly.insert(
+                            seqvar.segments[0].ident.name,
+                            (None, self.cx.typeck_results().node_type(seqexpr.hir_id)),
+                        );
+                    } else {
+                        self.indexed_indirectly.insert(seqvar.segments[0].ident.name, None);
                     }
-                    _ => (),
-                }
+                    return false; // no need to walk further *on the variable*
+                },
+                _ => (),
             }
         }
         true
@@ -296,36 +293,37 @@ impl<'a, 'tcx> VarVisitor<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
-    type Map = Map<'tcx>;
-
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
-        if_chain! {
+        if let ExprKind::MethodCall(meth, args_0, [args_1, ..], _) = &expr.kind
             // a range index op
-            if let ExprKind::MethodCall(meth, _, [args_0, args_1, ..], _) = &expr.kind;
-            if (meth.ident.name == sym::index && match_trait_method(self.cx, expr, &paths::INDEX))
-                || (meth.ident.name == sym::index_mut && match_trait_method(self.cx, expr, &paths::INDEX_MUT));
-            if !self.check(args_1, args_0, expr);
-            then { return }
+            && let Some(trait_id) = self
+                .cx
+                .typeck_results()
+                .type_dependent_def_id(expr.hir_id)
+                .and_then(|def_id| self.cx.tcx.trait_of_item(def_id))
+            && ((meth.ident.name == sym::index && self.cx.tcx.lang_items().index_trait() == Some(trait_id))
+                || (meth.ident.name == sym::index_mut && self.cx.tcx.lang_items().index_mut_trait() == Some(trait_id)))
+            && !self.check(args_1, args_0, expr)
+        {
+            return;
         }
 
-        if_chain! {
+        if let ExprKind::Index(seqexpr, idx, _) = expr.kind
             // an index op
-            if let ExprKind::Index(seqexpr, idx) = expr.kind;
-            if !self.check(idx, seqexpr, expr);
-            then { return }
+            && !self.check(idx, seqexpr, expr)
+        {
+            return;
         }
 
-        if_chain! {
+        if let ExprKind::Path(QPath::Resolved(None, path)) = expr.kind
             // directly using a variable
-            if let ExprKind::Path(QPath::Resolved(None, path)) = expr.kind;
-            if let Res::Local(local_id) = path.res;
-            then {
-                if local_id == self.var {
-                    self.nonindex = true;
-                } else {
-                    // not the correct variable, but still a variable
-                    self.referenced.insert(path.segments[0].ident.name);
-                }
+            && let Res::Local(local_id) = path.res
+        {
+            if local_id == self.var {
+                self.nonindex = true;
+            } else {
+                // not the correct variable, but still a variable
+                self.referenced.insert(path.segments[0].ident.name);
             }
         }
 
@@ -356,9 +354,12 @@ impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
                     self.visit_expr(expr);
                 }
             },
-            ExprKind::MethodCall(_, _, args, _) => {
+            ExprKind::MethodCall(_, receiver, args, _) => {
                 let def_id = self.cx.typeck_results().type_dependent_def_id(expr.hir_id).unwrap();
-                for (ty, expr) in iter::zip(self.cx.tcx.fn_sig(def_id).inputs().skip_binder(), args) {
+                for (ty, expr) in iter::zip(
+                    self.cx.tcx.fn_sig(def_id).instantiate_identity().inputs().skip_binder(),
+                    std::iter::once(receiver).chain(args.iter()),
+                ) {
                     self.prefer_mutable = false;
                     if let ty::Ref(_, _, mutbl) = *ty.kind() {
                         if mutbl == Mutability::Mut {
@@ -368,15 +369,12 @@ impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
                     self.visit_expr(expr);
                 }
             },
-            ExprKind::Closure(_, _, body_id, ..) => {
-                let body = self.cx.tcx.hir().body(body_id);
-                self.visit_expr(&body.value);
+            ExprKind::Closure(&Closure { body, .. }) => {
+                let body = self.cx.tcx.hir().body(body);
+                self.visit_expr(body.value);
             },
             _ => walk_expr(self, expr),
         }
         self.prefer_mutable = old;
-    }
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
     }
 }

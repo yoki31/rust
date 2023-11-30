@@ -1,14 +1,18 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_index::bit_set::{HybridBitSet, SparseBitMatrix};
-use rustc_index::vec::Idx;
-use rustc_index::vec::IndexVec;
+use rustc_index::bit_set::SparseBitMatrix;
+use rustc_index::interval::IntervalSet;
+use rustc_index::interval::SparseIntervalMatrix;
+use rustc_index::Idx;
+use rustc_index::IndexVec;
 use rustc_middle::mir::{BasicBlock, Body, Location};
 use rustc_middle::ty::{self, RegionVid};
 use std::fmt::Debug;
 use std::rc::Rc;
 
 /// Maps between a `Location` and a `PointIndex` (and vice versa).
-crate struct RegionValueElements {
+pub(crate) struct RegionValueElements {
     /// For each basic block, how many points are contained within?
     statements_before_block: IndexVec<BasicBlock, usize>,
 
@@ -20,10 +24,10 @@ crate struct RegionValueElements {
 }
 
 impl RegionValueElements {
-    crate fn new(body: &Body<'_>) -> Self {
+    pub(crate) fn new(body: &Body<'_>) -> Self {
         let mut num_points = 0;
         let statements_before_block: IndexVec<BasicBlock, usize> = body
-            .basic_blocks()
+            .basic_blocks
             .iter()
             .map(|block_data| {
                 let v = num_points;
@@ -35,7 +39,7 @@ impl RegionValueElements {
         debug!("RegionValueElements: num_points={:#?}", num_points);
 
         let mut basic_blocks = IndexVec::with_capacity(num_points);
-        for (bb, bb_data) in body.basic_blocks().iter_enumerated() {
+        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
             basic_blocks.extend((0..=bb_data.statements.len()).map(|_| bb));
         }
 
@@ -43,30 +47,30 @@ impl RegionValueElements {
     }
 
     /// Total number of point indices
-    crate fn num_points(&self) -> usize {
+    pub(crate) fn num_points(&self) -> usize {
         self.num_points
     }
 
     /// Converts a `Location` into a `PointIndex`. O(1).
-    crate fn point_from_location(&self, location: Location) -> PointIndex {
+    pub(crate) fn point_from_location(&self, location: Location) -> PointIndex {
         let Location { block, statement_index } = location;
         let start_index = self.statements_before_block[block];
         PointIndex::new(start_index + statement_index)
     }
 
     /// Converts a `Location` into a `PointIndex`. O(1).
-    crate fn entry_point(&self, block: BasicBlock) -> PointIndex {
+    pub(crate) fn entry_point(&self, block: BasicBlock) -> PointIndex {
         let start_index = self.statements_before_block[block];
         PointIndex::new(start_index)
     }
 
     /// Return the PointIndex for the block start of this index.
-    crate fn to_block_start(&self, index: PointIndex) -> PointIndex {
+    pub(crate) fn to_block_start(&self, index: PointIndex) -> PointIndex {
         PointIndex::new(self.statements_before_block[self.basic_blocks[index]])
     }
 
     /// Converts a `PointIndex` back to a location. O(1).
-    crate fn to_location(&self, index: PointIndex) -> Location {
+    pub(crate) fn to_location(&self, index: PointIndex) -> Location {
         assert!(index.index() < self.num_points);
         let block = self.basic_blocks[index];
         let start_index = self.statements_before_block[block];
@@ -78,7 +82,7 @@ impl RegionValueElements {
     /// out of range (because they round up to the nearest 2^N number
     /// of bits). Use this function to filter such points out if you
     /// like.
-    crate fn point_in_range(&self, index: PointIndex) -> bool {
+    pub(crate) fn point_in_range(&self, index: PointIndex) -> bool {
         index.index() < self.num_points
     }
 }
@@ -86,18 +90,21 @@ impl RegionValueElements {
 rustc_index::newtype_index! {
     /// A single integer representing a `Location` in the MIR control-flow
     /// graph. Constructed efficiently from `RegionValueElements`.
-    pub struct PointIndex { DEBUG_FORMAT = "PointIndex({})" }
+    #[orderable]
+    #[debug_format = "PointIndex({})"]
+    pub struct PointIndex {}
 }
 
 rustc_index::newtype_index! {
     /// A single integer representing a `ty::Placeholder`.
-    pub struct PlaceholderIndex { DEBUG_FORMAT = "PlaceholderIndex({})" }
+    #[debug_format = "PlaceholderIndex({})"]
+    pub struct PlaceholderIndex {}
 }
 
 /// An individual element in a region value -- the value of a
 /// particular region variable consists of a set of these elements.
 #[derive(Debug, Clone)]
-crate enum RegionElement {
+pub(crate) enum RegionElement {
     /// A point in the control-flow graph.
     Location(Location),
 
@@ -110,91 +117,103 @@ crate enum RegionElement {
     PlaceholderRegion(ty::PlaceholderRegion),
 }
 
-/// When we initially compute liveness, we use a bit matrix storing
-/// points for each region-vid.
-crate struct LivenessValues<N: Idx> {
+/// Records the CFG locations where each region is live. When we initially compute liveness, we use
+/// an interval matrix storing liveness ranges for each region-vid.
+pub(crate) struct LivenessValues {
     elements: Rc<RegionValueElements>,
-    points: SparseBitMatrix<N, PointIndex>,
+    points: SparseIntervalMatrix<RegionVid, PointIndex>,
 }
 
-impl<N: Idx> LivenessValues<N> {
-    /// Creates a new set of "region values" that tracks causal information.
-    /// Each of the regions in num_region_variables will be initialized with an
-    /// empty set of points and no causal information.
-    crate fn new(elements: Rc<RegionValueElements>) -> Self {
-        Self { points: SparseBitMatrix::new(elements.num_points), elements }
+impl LivenessValues {
+    /// Create an empty map of regions to locations where they're live.
+    pub(crate) fn new(elements: Rc<RegionValueElements>) -> Self {
+        Self { points: SparseIntervalMatrix::new(elements.num_points), elements }
     }
 
     /// Iterate through each region that has a value in this set.
-    crate fn rows(&self) -> impl Iterator<Item = N> {
+    pub(crate) fn regions(&self) -> impl Iterator<Item = RegionVid> {
         self.points.rows()
     }
 
-    /// Adds the given element to the value for the given region. Returns whether
-    /// the element is newly added (i.e., was not already present).
-    crate fn add_element(&mut self, row: N, location: Location) -> bool {
-        debug!("LivenessValues::add(r={:?}, location={:?})", row, location);
-        let index = self.elements.point_from_location(location);
-        self.points.insert(row, index)
+    /// Records `region` as being live at the given `location`.
+    pub(crate) fn add_location(&mut self, region: RegionVid, location: Location) {
+        debug!("LivenessValues::add_location(region={:?}, location={:?})", region, location);
+        let point = self.elements.point_from_location(location);
+        self.points.insert(region, point);
     }
 
-    /// Adds all the elements in the given bit array into the given
-    /// region. Returns whether any of them are newly added.
-    crate fn add_elements(&mut self, row: N, locations: &HybridBitSet<PointIndex>) -> bool {
-        debug!("LivenessValues::add_elements(row={:?}, locations={:?})", row, locations);
-        self.points.union_row(row, locations)
+    /// Records `region` as being live at all the given `points`.
+    pub(crate) fn add_points(&mut self, region: RegionVid, points: &IntervalSet<PointIndex>) {
+        debug!("LivenessValues::add_points(region={:?}, points={:?})", region, points);
+        self.points.union_row(region, points);
     }
 
-    /// Adds all the control-flow points to the values for `r`.
-    crate fn add_all_points(&mut self, row: N) {
-        self.points.insert_all_into_row(row);
+    /// Records `region` as being live at all the control-flow points.
+    pub(crate) fn add_all_points(&mut self, region: RegionVid) {
+        self.points.insert_all_into_row(region);
     }
 
-    /// Returns `true` if the region `r` contains the given element.
-    crate fn contains(&self, row: N, location: Location) -> bool {
-        let index = self.elements.point_from_location(location);
-        self.points.contains(row, index)
+    /// Returns whether `region` is marked live at the given `location`.
+    pub(crate) fn is_live_at(&self, region: RegionVid, location: Location) -> bool {
+        let point = self.elements.point_from_location(location);
+        self.points.row(region).is_some_and(|r| r.contains(point))
     }
 
-    /// Returns an iterator of all the elements contained by the region `r`
-    crate fn get_elements(&self, row: N) -> impl Iterator<Item = Location> + '_ {
+    /// Returns whether `region` is marked live at any location.
+    pub(crate) fn is_live_anywhere(&self, region: RegionVid) -> bool {
+        self.live_points(region).next().is_some()
+    }
+
+    /// Returns an iterator of all the points where `region` is live.
+    fn live_points(&self, region: RegionVid) -> impl Iterator<Item = PointIndex> + '_ {
         self.points
-            .row(row)
+            .row(region)
             .into_iter()
             .flat_map(|set| set.iter())
-            .take_while(move |&p| self.elements.point_in_range(p))
-            .map(move |p| self.elements.to_location(p))
+            .take_while(|&p| self.elements.point_in_range(p))
     }
 
-    /// Returns a "pretty" string value of the region. Meant for debugging.
-    crate fn region_value_str(&self, r: N) -> String {
-        region_value_str(self.get_elements(r).map(RegionElement::Location))
+    /// For debugging purposes, returns a pretty-printed string of the points where the `region` is
+    /// live.
+    pub(crate) fn pretty_print_live_points(&self, region: RegionVid) -> String {
+        pretty_print_region_elements(
+            self.live_points(region).map(|p| RegionElement::Location(self.elements.to_location(p))),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn point_from_location(&self, location: Location) -> PointIndex {
+        self.elements.point_from_location(location)
     }
 }
 
 /// Maps from `ty::PlaceholderRegion` values that are used in the rest of
 /// rustc to the internal `PlaceholderIndex` values that are used in
 /// NLL.
-#[derive(Default)]
-crate struct PlaceholderIndices {
+#[derive(Debug, Default)]
+pub(crate) struct PlaceholderIndices {
     indices: FxIndexSet<ty::PlaceholderRegion>,
 }
 
 impl PlaceholderIndices {
-    crate fn insert(&mut self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
+    /// Returns the `PlaceholderIndex` for the inserted `PlaceholderRegion`
+    pub(crate) fn insert(&mut self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
         let (index, _) = self.indices.insert_full(placeholder);
         index.into()
     }
 
-    crate fn lookup_index(&self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
+    pub(crate) fn lookup_index(&self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
         self.indices.get_index_of(&placeholder).unwrap().into()
     }
 
-    crate fn lookup_placeholder(&self, placeholder: PlaceholderIndex) -> ty::PlaceholderRegion {
+    pub(crate) fn lookup_placeholder(
+        &self,
+        placeholder: PlaceholderIndex,
+    ) -> ty::PlaceholderRegion {
         self.indices[placeholder.index()]
     }
 
-    crate fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.indices.len()
     }
 }
@@ -218,14 +237,14 @@ impl PlaceholderIndices {
 /// because (since it is returned) it must live for at least `'a`. But
 /// it would also contain various points from within the function.
 #[derive(Clone)]
-crate struct RegionValues<N: Idx> {
+pub(crate) struct RegionValues<N: Idx> {
     elements: Rc<RegionValueElements>,
     placeholder_indices: Rc<PlaceholderIndices>,
-    points: SparseBitMatrix<N, PointIndex>,
+    points: SparseIntervalMatrix<N, PointIndex>,
     free_regions: SparseBitMatrix<N, RegionVid>,
 
     /// Placeholders represent bound regions -- so something like `'a`
-    /// in for<'a> fn(&'a u32)`.
+    /// in `for<'a> fn(&'a u32)`.
     placeholders: SparseBitMatrix<N, PlaceholderIndex>,
 }
 
@@ -233,7 +252,7 @@ impl<N: Idx> RegionValues<N> {
     /// Creates a new set of "region values" that tracks causal information.
     /// Each of the regions in num_region_variables will be initialized with an
     /// empty set of points and no causal information.
-    crate fn new(
+    pub(crate) fn new(
         elements: &Rc<RegionValueElements>,
         num_universal_regions: usize,
         placeholder_indices: &Rc<PlaceholderIndices>,
@@ -241,7 +260,7 @@ impl<N: Idx> RegionValues<N> {
         let num_placeholders = placeholder_indices.len();
         Self {
             elements: elements.clone(),
-            points: SparseBitMatrix::new(elements.num_points),
+            points: SparseIntervalMatrix::new(elements.num_points),
             placeholder_indices: placeholder_indices.clone(),
             free_regions: SparseBitMatrix::new(num_universal_regions),
             placeholders: SparseBitMatrix::new(num_placeholders),
@@ -250,33 +269,49 @@ impl<N: Idx> RegionValues<N> {
 
     /// Adds the given element to the value for the given region. Returns whether
     /// the element is newly added (i.e., was not already present).
-    crate fn add_element(&mut self, r: N, elem: impl ToElementIndex) -> bool {
+    pub(crate) fn add_element(&mut self, r: N, elem: impl ToElementIndex) -> bool {
         debug!("add(r={:?}, elem={:?})", r, elem);
         elem.add_to_row(self, r)
     }
 
     /// Adds all the control-flow points to the values for `r`.
-    crate fn add_all_points(&mut self, r: N) {
+    pub(crate) fn add_all_points(&mut self, r: N) {
         self.points.insert_all_into_row(r);
     }
 
     /// Adds all elements in `r_from` to `r_to` (because e.g., `r_to:
     /// r_from`).
-    crate fn add_region(&mut self, r_to: N, r_from: N) -> bool {
+    pub(crate) fn add_region(&mut self, r_to: N, r_from: N) -> bool {
         self.points.union_rows(r_from, r_to)
             | self.free_regions.union_rows(r_from, r_to)
             | self.placeholders.union_rows(r_from, r_to)
     }
 
     /// Returns `true` if the region `r` contains the given element.
-    crate fn contains(&self, r: N, elem: impl ToElementIndex) -> bool {
+    pub(crate) fn contains(&self, r: N, elem: impl ToElementIndex) -> bool {
         elem.contained_in_row(self, r)
+    }
+
+    /// Returns the lowest statement index in `start..=end` which is not contained by `r`.
+    pub(crate) fn first_non_contained_inclusive(
+        &self,
+        r: N,
+        block: BasicBlock,
+        start: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let row = self.points.row(r)?;
+        let block = self.elements.entry_point(block);
+        let start = block.plus(start);
+        let end = block.plus(end);
+        let first_unset = row.first_unset_in(start..=end)?;
+        Some(first_unset.index() - block.index())
     }
 
     /// `self[to] |= values[from]`, essentially: that is, take all the
     /// elements for the region `from` from `values` and add them to
     /// the region `to` in `self`.
-    crate fn merge_liveness<M: Idx>(&mut self, to: N, from: M, values: &LivenessValues<M>) {
+    pub(crate) fn merge_liveness(&mut self, to: N, from: RegionVid, values: &LivenessValues) {
         if let Some(set) = values.points.row(from) {
             self.points.union_row(to, set);
         }
@@ -284,7 +319,7 @@ impl<N: Idx> RegionValues<N> {
 
     /// Returns `true` if `sup_region` contains all the CFG points that
     /// `sub_region` contains. Ignores universal regions.
-    crate fn contains_points(&self, sup_region: N, sub_region: N) -> bool {
+    pub(crate) fn contains_points(&self, sup_region: N, sub_region: N) -> bool {
         if let Some(sub_row) = self.points.row(sub_region) {
             if let Some(sup_row) = self.points.row(sup_region) {
                 sup_row.superset(sub_row)
@@ -299,7 +334,7 @@ impl<N: Idx> RegionValues<N> {
     }
 
     /// Returns the locations contained within a given region `r`.
-    crate fn locations_outlived_by<'a>(&'a self, r: N) -> impl Iterator<Item = Location> + 'a {
+    pub(crate) fn locations_outlived_by<'a>(&'a self, r: N) -> impl Iterator<Item = Location> + 'a {
         self.points.row(r).into_iter().flat_map(move |set| {
             set.iter()
                 .take_while(move |&p| self.elements.point_in_range(p))
@@ -308,7 +343,7 @@ impl<N: Idx> RegionValues<N> {
     }
 
     /// Returns just the universal regions that are contained in a given region's value.
-    crate fn universal_regions_outlived_by<'a>(
+    pub(crate) fn universal_regions_outlived_by<'a>(
         &'a self,
         r: N,
     ) -> impl Iterator<Item = RegionVid> + 'a {
@@ -316,7 +351,7 @@ impl<N: Idx> RegionValues<N> {
     }
 
     /// Returns all the elements contained in a given region's value.
-    crate fn placeholders_contained_in<'a>(
+    pub(crate) fn placeholders_contained_in<'a>(
         &'a self,
         r: N,
     ) -> impl Iterator<Item = ty::PlaceholderRegion> + 'a {
@@ -328,7 +363,10 @@ impl<N: Idx> RegionValues<N> {
     }
 
     /// Returns all the elements contained in a given region's value.
-    crate fn elements_contained_in<'a>(&'a self, r: N) -> impl Iterator<Item = RegionElement> + 'a {
+    pub(crate) fn elements_contained_in<'a>(
+        &'a self,
+        r: N,
+    ) -> impl Iterator<Item = RegionElement> + 'a {
         let points_iter = self.locations_outlived_by(r).map(RegionElement::Location);
 
         let free_regions_iter =
@@ -341,12 +379,12 @@ impl<N: Idx> RegionValues<N> {
     }
 
     /// Returns a "pretty" string value of the region. Meant for debugging.
-    crate fn region_value_str(&self, r: N) -> String {
-        region_value_str(self.elements_contained_in(r))
+    pub(crate) fn region_value_str(&self, r: N) -> String {
+        pretty_print_region_elements(self.elements_contained_in(r))
     }
 }
 
-crate trait ToElementIndex: Debug + Copy {
+pub(crate) trait ToElementIndex: Debug + Copy {
     fn add_to_row<N: Idx>(self, values: &mut RegionValues<N>, row: N) -> bool;
 
     fn contained_in_row<N: Idx>(self, values: &RegionValues<N>, row: N) -> bool;
@@ -386,11 +424,12 @@ impl ToElementIndex for ty::PlaceholderRegion {
     }
 }
 
-crate fn location_set_str(
+/// For debugging purposes, returns a pretty-printed string of the given points.
+pub(crate) fn pretty_print_points(
     elements: &RegionValueElements,
     points: impl IntoIterator<Item = PointIndex>,
 ) -> String {
-    region_value_str(
+    pretty_print_region_elements(
         points
             .into_iter()
             .take_while(|&p| elements.point_in_range(p))
@@ -399,7 +438,8 @@ crate fn location_set_str(
     )
 }
 
-fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String {
+/// For debugging purposes, returns a pretty-printed string of the given region elements.
+fn pretty_print_region_elements(elements: impl IntoIterator<Item = RegionElement>) -> String {
     let mut result = String::new();
     result.push('{');
 
@@ -441,7 +481,7 @@ fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String
                 }
 
                 push_sep(&mut result);
-                result.push_str(&format!("{:?}", fr));
+                result.push_str(&format!("{fr:?}"));
             }
 
             RegionElement::PlaceholderRegion(placeholder) => {
@@ -452,7 +492,7 @@ fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String
                 }
 
                 push_sep(&mut result);
-                result.push_str(&format!("{:?}", placeholder));
+                result.push_str(&format!("{placeholder:?}"));
             }
         }
     }
@@ -468,7 +508,7 @@ fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String
 
     fn push_location_range(str: &mut String, location1: Location, location2: Location) {
         if location1 == location2 {
-            str.push_str(&format!("{:?}", location1));
+            str.push_str(&format!("{location1:?}"));
         } else {
             assert_eq!(location1.block, location2.block);
             str.push_str(&format!(

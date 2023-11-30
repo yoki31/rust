@@ -25,7 +25,7 @@ enum FloatConv {
 #[derive(Copy, Clone)]
 struct CannotUseFpConv;
 
-fn is_riscv_aggregate<'a, Ty>(arg: &ArgAbi<'a, Ty>) -> bool {
+fn is_riscv_aggregate<Ty>(arg: &ArgAbi<'_, Ty>) -> bool {
     match arg.layout.abi {
         Abi::Vector { .. } => true,
         _ => arg.layout.is_aggregate(),
@@ -44,8 +44,8 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
 {
     match arg_layout.abi {
-        Abi::Scalar(scalar) => match scalar.value {
-            abi::Int(..) | abi::Pointer => {
+        Abi::Scalar(scalar) => match scalar.primitive() {
+            abi::Int(..) | abi::Pointer(_) => {
                 if arg_layout.size.bits() > xlen {
                     return Err(CannotUseFpConv);
                 }
@@ -89,6 +89,17 @@ where
             }
             FieldsShape::Union(_) => {
                 if !arg_layout.is_zst() {
+                    if arg_layout.is_transparent() {
+                        let non_1zst_elem = arg_layout.non_1zst_field(cx).expect("not exactly one non-1-ZST field in non-ZST repr(transparent) union").1;
+                        return should_use_fp_conv_helper(
+                            cx,
+                            &non_1zst_elem,
+                            xlen,
+                            flen,
+                            field1_kind,
+                            field2_kind,
+                        );
+                    }
                     return Err(CannotUseFpConv);
                 }
             }
@@ -147,6 +158,10 @@ fn classify_ret<'a, Ty, C>(cx: &C, arg: &mut ArgAbi<'a, Ty>, xlen: u64, flen: u6
 where
     Ty: TyAbiInterface<'a, C> + Copy,
 {
+    if !arg.layout.is_sized() {
+        // Not touching this...
+        return false; // I guess? return value of this function is not documented
+    }
     if let Some(conv) = should_use_fp_conv(cx, &arg.layout, xlen, flen) {
         match conv {
             FloatConv::Float(f) => {
@@ -209,6 +224,10 @@ fn classify_arg<'a, Ty, C>(
 ) where
     Ty: TyAbiInterface<'a, C> + Copy,
 {
+    if !arg.layout.is_sized() {
+        // Not touching this...
+        return;
+    }
     if !is_vararg {
         match should_use_fp_conv(cx, &arg.layout, xlen, flen) {
             Some(FloatConv::Float(f)) if *avail_fprs >= 1 => {
@@ -296,9 +315,9 @@ fn classify_arg<'a, Ty, C>(
     }
 }
 
-fn extend_integer_width<'a, Ty>(arg: &mut ArgAbi<'a, Ty>, xlen: u64) {
+fn extend_integer_width<Ty>(arg: &mut ArgAbi<'_, Ty>, xlen: u64) {
     if let Abi::Scalar(scalar) = arg.layout.abi {
-        if let abi::Int(i, _) = scalar.value {
+        if let abi::Int(i, _) = scalar.primitive() {
             // 32-bit integers are always sign-extended
             if i.size().bits() == 32 && xlen > 32 {
                 if let PassMode::Direct(ref mut attrs) = arg.mode {
@@ -340,7 +359,7 @@ where
             arg,
             xlen,
             flen,
-            i >= fn_abi.fixed_count,
+            i >= fn_abi.fixed_count as usize,
             &mut avail_gprs,
             &mut avail_fprs,
         );

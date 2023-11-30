@@ -56,7 +56,7 @@ macro_rules! err_machine_stop {
 // In the `throw_*` macros, avoid `return` to make them work with `try {}`.
 #[macro_export]
 macro_rules! throw_unsup {
-    ($($tt:tt)*) => { Err::<!, _>(err_unsup!($($tt)*))? };
+    ($($tt:tt)*) => { do yeet err_unsup!($($tt)*) };
 }
 
 #[macro_export]
@@ -66,12 +66,12 @@ macro_rules! throw_unsup_format {
 
 #[macro_export]
 macro_rules! throw_inval {
-    ($($tt:tt)*) => { Err::<!, _>(err_inval!($($tt)*))? };
+    ($($tt:tt)*) => { do yeet err_inval!($($tt)*) };
 }
 
 #[macro_export]
 macro_rules! throw_ub {
-    ($($tt:tt)*) => { Err::<!, _>(err_ub!($($tt)*))? };
+    ($($tt:tt)*) => { do yeet err_ub!($($tt)*) };
 }
 
 #[macro_export]
@@ -81,12 +81,36 @@ macro_rules! throw_ub_format {
 
 #[macro_export]
 macro_rules! throw_exhaust {
-    ($($tt:tt)*) => { Err::<!, _>(err_exhaust!($($tt)*))? };
+    ($($tt:tt)*) => { do yeet err_exhaust!($($tt)*) };
 }
 
 #[macro_export]
 macro_rules! throw_machine_stop {
-    ($($tt:tt)*) => { Err::<!, _>(err_machine_stop!($($tt)*))? };
+    ($($tt:tt)*) => { do yeet err_machine_stop!($($tt)*) };
+}
+
+#[macro_export]
+macro_rules! err_ub_custom {
+    ($msg:expr $(, $($name:ident = $value:expr),* $(,)?)?) => {{
+        $(
+            let ($($name,)*) = ($($value,)*);
+        )?
+        err_ub!(Custom(
+            rustc_middle::error::CustomSubdiagnostic {
+                msg: || $msg,
+                add_args: Box::new(move |mut set_arg| {
+                    $($(
+                        set_arg(stringify!($name).into(), rustc_errors::IntoDiagnosticArg::into_diagnostic_arg($name));
+                    )*)?
+                })
+            }
+        ))
+    }};
+}
+
+#[macro_export]
+macro_rules! throw_ub_custom {
+    ($($tt:tt)*) => { do yeet err_ub_custom!($($tt)*) };
 }
 
 mod allocation;
@@ -95,7 +119,6 @@ mod pointer;
 mod queries;
 mod value;
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io;
 use std::io::{Read, Write};
@@ -106,27 +129,32 @@ use rustc_ast::LitKind;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::{HashMapExt, Lock};
 use rustc_data_structures::tiny_list::TinyList;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_serialize::{Decodable, Encodable};
-use rustc_target::abi::Endian;
+use rustc_target::abi::{AddressSpace, Endian, HasDataLayout};
 
 use crate::mir;
 use crate::ty::codec::{TyDecoder, TyEncoder};
-use crate::ty::subst::GenericArgKind;
+use crate::ty::GenericArgKind;
 use crate::ty::{self, Instance, Ty, TyCtxt};
 
 pub use self::error::{
-    struct_error, CheckInAllocMsg, ErrorHandled, EvalToAllocationRawResult, EvalToConstValueResult,
-    InterpError, InterpErrorInfo, InterpResult, InvalidProgramInfo, MachineStopType,
-    ResourceExhaustionInfo, UndefinedBehaviorInfo, UninitBytesAccess, UnsupportedOpInfo,
+    struct_error, BadBytesAccess, CheckAlignMsg, CheckInAllocMsg, ErrorHandled,
+    EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, ExpectedKind,
+    InterpError, InterpErrorInfo, InterpResult, InvalidMetaKind, InvalidProgramInfo,
+    MachineStopType, Misalignment, PointerKind, ReportedErrorInfo, ResourceExhaustionInfo,
+    ScalarSizeMismatch, UndefinedBehaviorInfo, UnsupportedOpInfo, ValidationErrorInfo,
+    ValidationErrorKind,
 };
 
-pub use self::value::{get_slice_bytes, ConstAlloc, ConstValue, Scalar, ScalarMaybeUninit};
+pub use self::value::Scalar;
 
 pub use self::allocation::{
-    alloc_range, AllocRange, Allocation, InitChunk, InitChunkIter, InitMask, Relocations,
+    alloc_range, AllocBytes, AllocError, AllocRange, AllocResult, Allocation, ConstAllocation,
+    InitChunk, InitChunkIter,
 };
 
 pub use self::pointer::{Pointer, PointerArithmetic, Provenance};
@@ -135,7 +163,7 @@ pub use self::pointer::{Pointer, PointerArithmetic, Provenance};
 /// - A constant
 /// - A static
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable, Lift)]
+#[derive(HashStable, TypeFoldable, TypeVisitable)]
 pub struct GlobalId<'tcx> {
     /// For a constant or static, the `Instance` of the item itself.
     /// For a promoted global, the `Instance` of the function they belong to.
@@ -145,11 +173,11 @@ pub struct GlobalId<'tcx> {
     pub promoted: Option<mir::Promoted>,
 }
 
-impl GlobalId<'tcx> {
+impl<'tcx> GlobalId<'tcx> {
     pub fn display(self, tcx: TyCtxt<'tcx>) -> String {
-        let instance_name = with_no_trimmed_paths(|| tcx.def_path_str(self.instance.def.def_id()));
+        let instance_name = with_no_trimmed_paths!(tcx.def_path_str(self.instance.def.def_id()));
         if let Some(promoted) = self.promoted {
-            format!("{}::{:?}", instance_name, promoted)
+            format!("{instance_name}::{promoted:?}")
         } else {
             instance_name
         }
@@ -174,7 +202,7 @@ pub enum LitToConstError {
     /// This is used for graceful error handling (`delay_span_bug`) in
     /// type checking (`Const::from_anon_const`).
     TypeError,
-    Reported,
+    Reported(ErrorGuaranteed),
 }
 
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -188,44 +216,48 @@ impl fmt::Debug for AllocId {
     }
 }
 
-impl fmt::Display for AllocId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
-}
+// No "Display" since AllocIds are not usually user-visible.
 
 #[derive(TyDecodable, TyEncodable)]
 enum AllocDiscriminant {
     Alloc,
     Fn,
+    VTable,
     Static,
 }
 
-pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<'tcx>>(
+pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<I = TyCtxt<'tcx>>>(
     encoder: &mut E,
     tcx: TyCtxt<'tcx>,
     alloc_id: AllocId,
-) -> Result<(), E::Error> {
+) {
     match tcx.global_alloc(alloc_id) {
         GlobalAlloc::Memory(alloc) => {
             trace!("encoding {:?} with {:#?}", alloc_id, alloc);
-            AllocDiscriminant::Alloc.encode(encoder)?;
-            alloc.encode(encoder)?;
+            AllocDiscriminant::Alloc.encode(encoder);
+            alloc.encode(encoder);
         }
         GlobalAlloc::Function(fn_instance) => {
             trace!("encoding {:?} with {:#?}", alloc_id, fn_instance);
-            AllocDiscriminant::Fn.encode(encoder)?;
-            fn_instance.encode(encoder)?;
+            AllocDiscriminant::Fn.encode(encoder);
+            fn_instance.encode(encoder);
+        }
+        GlobalAlloc::VTable(ty, poly_trait_ref) => {
+            trace!("encoding {:?} with {ty:#?}, {poly_trait_ref:#?}", alloc_id);
+            AllocDiscriminant::VTable.encode(encoder);
+            ty.encode(encoder);
+            poly_trait_ref.encode(encoder);
         }
         GlobalAlloc::Static(did) => {
             assert!(!tcx.is_thread_local_static(did));
             // References to statics doesn't need to know about their allocations,
             // just about its `DefId`.
-            AllocDiscriminant::Static.encode(encoder)?;
-            did.encode(encoder)?;
+            AllocDiscriminant::Static.encode(encoder);
+            // Cannot use `did.encode(encoder)` because of a bug around
+            // specializations and method calls.
+            Encodable::<E>::encode(&did, encoder);
         }
     }
-    Ok(())
 }
 
 // Used to avoid infinite recursion when decoding cyclic allocations.
@@ -243,7 +275,7 @@ pub struct AllocDecodingState {
     // For each `AllocId`, we keep track of which decoding state it's currently in.
     decoding_state: Vec<Lock<State>>,
     // The offsets of each allocation in the data stream.
-    data_offsets: Vec<u32>,
+    data_offsets: Vec<u64>,
 }
 
 impl AllocDecodingState {
@@ -258,8 +290,9 @@ impl AllocDecodingState {
         AllocDecodingSession { state: self, session_id }
     }
 
-    pub fn new(data_offsets: Vec<u32>) -> Self {
-        let decoding_state = vec![Lock::new(State::Empty); data_offsets.len()];
+    pub fn new(data_offsets: Vec<u64>) -> Self {
+        let decoding_state =
+            std::iter::repeat_with(|| Lock::new(State::Empty)).take(data_offsets.len()).collect();
 
         Self { decoding_state, data_offsets }
     }
@@ -273,20 +306,20 @@ pub struct AllocDecodingSession<'s> {
 
 impl<'s> AllocDecodingSession<'s> {
     /// Decodes an `AllocId` in a thread-safe way.
-    pub fn decode_alloc_id<D>(&self, decoder: &mut D) -> Result<AllocId, D::Error>
+    pub fn decode_alloc_id<'tcx, D>(&self, decoder: &mut D) -> AllocId
     where
-        D: TyDecoder<'tcx>,
+        D: TyDecoder<I = TyCtxt<'tcx>>,
     {
         // Read the index of the allocation.
-        let idx = usize::try_from(decoder.read_u32()?).unwrap();
+        let idx = usize::try_from(decoder.read_u32()).unwrap();
         let pos = usize::try_from(self.state.data_offsets[idx]).unwrap();
 
         // Decode the `AllocDiscriminant` now so that we know if we have to reserve an
         // `AllocId`.
         let (alloc_kind, pos) = decoder.with_position(pos, |decoder| {
-            let alloc_kind = AllocDiscriminant::decode(decoder)?;
-            Ok((alloc_kind, decoder.position()))
-        })?;
+            let alloc_kind = AllocDiscriminant::decode(decoder);
+            (alloc_kind, decoder.position())
+        });
 
         // Check the decoding state to see if it's already decoded or if we should
         // decode it here.
@@ -295,7 +328,7 @@ impl<'s> AllocDecodingSession<'s> {
 
             match *entry {
                 State::Done(alloc_id) => {
-                    return Ok(alloc_id);
+                    return alloc_id;
                 }
                 ref mut entry @ State::Empty => {
                     // We are allowed to decode.
@@ -303,12 +336,14 @@ impl<'s> AllocDecodingSession<'s> {
                         AllocDiscriminant::Alloc => {
                             // If this is an allocation, we need to reserve an
                             // `AllocId` so we can decode cyclic graphs.
-                            let alloc_id = decoder.tcx().reserve_alloc_id();
+                            let alloc_id = decoder.interner().reserve_alloc_id();
                             *entry =
                                 State::InProgress(TinyList::new_single(self.session_id), alloc_id);
                             Some(alloc_id)
                         }
-                        AllocDiscriminant::Fn | AllocDiscriminant::Static => {
+                        AllocDiscriminant::Fn
+                        | AllocDiscriminant::Static
+                        | AllocDiscriminant::VTable => {
                             // Fns and statics cannot be cyclic, and their `AllocId`
                             // is determined later by interning.
                             *entry =
@@ -329,7 +364,7 @@ impl<'s> AllocDecodingSession<'s> {
                 State::InProgress(ref mut sessions, alloc_id) => {
                     if sessions.contains(&self.session_id) {
                         // Don't recurse.
-                        return Ok(alloc_id);
+                        return alloc_id;
                     } else {
                         // Start decoding concurrently.
                         sessions.insert(self.session_id);
@@ -343,37 +378,48 @@ impl<'s> AllocDecodingSession<'s> {
         let alloc_id = decoder.with_position(pos, |decoder| {
             match alloc_kind {
                 AllocDiscriminant::Alloc => {
-                    let alloc = <&'tcx Allocation as Decodable<_>>::decode(decoder)?;
+                    let alloc = <ConstAllocation<'tcx> as Decodable<_>>::decode(decoder);
                     // We already have a reserved `AllocId`.
                     let alloc_id = alloc_id.unwrap();
                     trace!("decoded alloc {:?}: {:#?}", alloc_id, alloc);
-                    decoder.tcx().set_alloc_id_same_memory(alloc_id, alloc);
-                    Ok(alloc_id)
+                    decoder.interner().set_alloc_id_same_memory(alloc_id, alloc);
+                    alloc_id
                 }
                 AllocDiscriminant::Fn => {
                     assert!(alloc_id.is_none());
                     trace!("creating fn alloc ID");
-                    let instance = ty::Instance::decode(decoder)?;
+                    let instance = ty::Instance::decode(decoder);
                     trace!("decoded fn alloc instance: {:?}", instance);
-                    let alloc_id = decoder.tcx().create_fn_alloc(instance);
-                    Ok(alloc_id)
+                    let alloc_id = decoder.interner().reserve_and_set_fn_alloc(instance);
+                    alloc_id
+                }
+                AllocDiscriminant::VTable => {
+                    assert!(alloc_id.is_none());
+                    trace!("creating vtable alloc ID");
+                    let ty = <Ty<'_> as Decodable<D>>::decode(decoder);
+                    let poly_trait_ref =
+                        <Option<ty::PolyExistentialTraitRef<'_>> as Decodable<D>>::decode(decoder);
+                    trace!("decoded vtable alloc instance: {ty:?}, {poly_trait_ref:?}");
+                    let alloc_id =
+                        decoder.interner().reserve_and_set_vtable_alloc(ty, poly_trait_ref);
+                    alloc_id
                 }
                 AllocDiscriminant::Static => {
                     assert!(alloc_id.is_none());
                     trace!("creating extern static alloc ID");
-                    let did = <DefId as Decodable<D>>::decode(decoder)?;
+                    let did = <DefId as Decodable<D>>::decode(decoder);
                     trace!("decoded static def-ID: {:?}", did);
-                    let alloc_id = decoder.tcx().create_static_alloc(did);
-                    Ok(alloc_id)
+                    let alloc_id = decoder.interner().reserve_and_set_static_alloc(did);
+                    alloc_id
                 }
             }
-        })?;
+        });
 
         self.state.decoding_state[idx].with_lock(|entry| {
             *entry = State::Done(alloc_id);
         });
 
-        Ok(alloc_id)
+        alloc_id
     }
 }
 
@@ -383,18 +429,20 @@ impl<'s> AllocDecodingSession<'s> {
 pub enum GlobalAlloc<'tcx> {
     /// The alloc ID is used as a function pointer.
     Function(Instance<'tcx>),
+    /// This alloc ID points to a symbolic (not-reified) vtable.
+    VTable(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>),
     /// The alloc ID points to a "lazy" static variable that did not get computed (yet).
     /// This is also used to break the cycle in recursive statics.
     Static(DefId),
     /// The alloc ID points to memory.
-    Memory(&'tcx Allocation),
+    Memory(ConstAllocation<'tcx>),
 }
 
-impl GlobalAlloc<'tcx> {
+impl<'tcx> GlobalAlloc<'tcx> {
     /// Panics if the `GlobalAlloc` does not refer to an `GlobalAlloc::Memory`
     #[track_caller]
     #[inline]
-    pub fn unwrap_memory(&self) -> &'tcx Allocation {
+    pub fn unwrap_memory(&self) -> ConstAllocation<'tcx> {
         match *self {
             GlobalAlloc::Memory(mem) => mem,
             _ => bug!("expected memory, got {:?}", self),
@@ -410,9 +458,30 @@ impl GlobalAlloc<'tcx> {
             _ => bug!("expected function, got {:?}", self),
         }
     }
+
+    /// Panics if the `GlobalAlloc` is not `GlobalAlloc::VTable`
+    #[track_caller]
+    #[inline]
+    pub fn unwrap_vtable(&self) -> (Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>) {
+        match *self {
+            GlobalAlloc::VTable(ty, poly_trait_ref) => (ty, poly_trait_ref),
+            _ => bug!("expected vtable, got {:?}", self),
+        }
+    }
+
+    /// The address space that this `GlobalAlloc` should be placed in.
+    #[inline]
+    pub fn address_space(&self, cx: &impl HasDataLayout) -> AddressSpace {
+        match self {
+            GlobalAlloc::Function(..) => cx.data_layout().instruction_address_space,
+            GlobalAlloc::Static(..) | GlobalAlloc::Memory(..) | GlobalAlloc::VTable(..) => {
+                AddressSpace::DATA
+            }
+        }
+    }
 }
 
-crate struct AllocMap<'tcx> {
+pub(crate) struct AllocMap<'tcx> {
     /// Maps `AllocId`s to their corresponding allocations.
     alloc_map: FxHashMap<AllocId, GlobalAlloc<'tcx>>,
 
@@ -428,7 +497,7 @@ crate struct AllocMap<'tcx> {
 }
 
 impl<'tcx> AllocMap<'tcx> {
-    crate fn new() -> Self {
+    pub(crate) fn new() -> Self {
         AllocMap {
             alloc_map: Default::default(),
             dedup: Default::default(),
@@ -457,19 +526,19 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Reserves a new ID *if* this allocation has not been dedup-reserved before.
-    /// Should only be used for function pointers and statics, we don't want
-    /// to dedup IDs for "real" memory!
+    /// Should only be used for "symbolic" allocations (function pointers, vtables, statics), we
+    /// don't want to dedup IDs for "real" memory!
     fn reserve_and_set_dedup(self, alloc: GlobalAlloc<'tcx>) -> AllocId {
         let mut alloc_map = self.alloc_map.lock();
         match alloc {
-            GlobalAlloc::Function(..) | GlobalAlloc::Static(..) => {}
+            GlobalAlloc::Function(..) | GlobalAlloc::Static(..) | GlobalAlloc::VTable(..) => {}
             GlobalAlloc::Memory(..) => bug!("Trying to dedup-reserve memory with real data!"),
         }
         if let Some(&alloc_id) = alloc_map.dedup.get(&alloc) {
             return alloc_id;
         }
         let id = alloc_map.reserve();
-        debug!("creating alloc {:?} with id {}", alloc, id);
+        debug!("creating alloc {alloc:?} with id {id:?}");
         alloc_map.alloc_map.insert(id, alloc.clone());
         alloc_map.dedup.insert(alloc, id);
         id
@@ -477,22 +546,22 @@ impl<'tcx> TyCtxt<'tcx> {
 
     /// Generates an `AllocId` for a static or return a cached one in case this function has been
     /// called on the same static before.
-    pub fn create_static_alloc(self, static_id: DefId) -> AllocId {
+    pub fn reserve_and_set_static_alloc(self, static_id: DefId) -> AllocId {
         self.reserve_and_set_dedup(GlobalAlloc::Static(static_id))
     }
 
-    /// Generates an `AllocId` for a function.  Depending on the function type,
+    /// Generates an `AllocId` for a function. Depending on the function type,
     /// this might get deduplicated or assigned a new ID each time.
-    pub fn create_fn_alloc(self, instance: Instance<'tcx>) -> AllocId {
+    pub fn reserve_and_set_fn_alloc(self, instance: Instance<'tcx>) -> AllocId {
         // Functions cannot be identified by pointers, as asm-equal functions can get deduplicated
         // by the linker (we set the "unnamed_addr" attribute for LLVM) and functions can be
         // duplicated across crates.
         // We thus generate a new `AllocId` for every mention of a function. This means that
         // `main as fn() == main as fn()` is false, while `let x = main as fn(); x == x` is true.
         // However, formatting code relies on function identity (see #58320), so we only do
-        // this for generic functions.  Lifetime parameters are ignored.
+        // this for generic functions. Lifetime parameters are ignored.
         let is_generic = instance
-            .substs
+            .args
             .into_iter()
             .any(|kind| !matches!(kind.unpack(), GenericArgKind::Lifetime(_)));
         if is_generic {
@@ -507,12 +576,21 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
+    /// Generates an `AllocId` for a (symbolic, not-reified) vtable. Will get deduplicated.
+    pub fn reserve_and_set_vtable_alloc(
+        self,
+        ty: Ty<'tcx>,
+        poly_trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
+    ) -> AllocId {
+        self.reserve_and_set_dedup(GlobalAlloc::VTable(ty, poly_trait_ref))
+    }
+
     /// Interns the `Allocation` and return a new `AllocId`, even if there's already an identical
     /// `Allocation` with a different `AllocId`.
     /// Statics with identical content will still point to the same `Allocation`, i.e.,
     /// their data will be deduplicated through `Allocation` interning -- but they
     /// are different places in memory and as such need different IDs.
-    pub fn create_memory_alloc(self, mem: &'tcx Allocation) -> AllocId {
+    pub fn reserve_and_set_memory_alloc(self, mem: ConstAllocation<'tcx>) -> AllocId {
         let id = self.reserve_alloc_id();
         self.set_alloc_id_memory(id, mem);
         id
@@ -524,7 +602,7 @@ impl<'tcx> TyCtxt<'tcx> {
     /// This function exists to allow const eval to detect the difference between evaluation-
     /// local dangling pointers and allocations in constants/statics.
     #[inline]
-    pub fn get_global_alloc(self, id: AllocId) -> Option<GlobalAlloc<'tcx>> {
+    pub fn try_get_global_alloc(self, id: AllocId) -> Option<GlobalAlloc<'tcx>> {
         self.alloc_map.lock().alloc_map.get(&id).cloned()
     }
 
@@ -533,25 +611,25 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Panics in case the `AllocId` is dangling. Since that is impossible for `AllocId`s in
     /// constants (as all constants must pass interning and validation that check for dangling
     /// ids), this function is frequently used throughout rustc, but should not be used within
-    /// the miri engine.
+    /// the interpreter.
     pub fn global_alloc(self, id: AllocId) -> GlobalAlloc<'tcx> {
-        match self.get_global_alloc(id) {
+        match self.try_get_global_alloc(id) {
             Some(alloc) => alloc,
-            None => bug!("could not find allocation for {}", id),
+            None => bug!("could not find allocation for {id:?}"),
         }
     }
 
     /// Freezes an `AllocId` created with `reserve` by pointing it at an `Allocation`. Trying to
     /// call this function twice, even with the same `Allocation` will ICE the compiler.
-    pub fn set_alloc_id_memory(self, id: AllocId, mem: &'tcx Allocation) {
+    pub fn set_alloc_id_memory(self, id: AllocId, mem: ConstAllocation<'tcx>) {
         if let Some(old) = self.alloc_map.lock().alloc_map.insert(id, GlobalAlloc::Memory(mem)) {
-            bug!("tried to set allocation ID {}, but it was already existing as {:#?}", id, old);
+            bug!("tried to set allocation ID {id:?}, but it was already existing as {old:#?}");
         }
     }
 
     /// Freezes an `AllocId` created with `reserve` by pointing it at an `Allocation`. May be called
     /// twice for the same `(AllocId, Allocation)` pair.
-    fn set_alloc_id_same_memory(self, id: AllocId, mem: &'tcx Allocation) {
+    fn set_alloc_id_same_memory(self, id: AllocId, mem: ConstAllocation<'tcx>) {
         self.alloc_map.lock().alloc_map.insert_same(id, GlobalAlloc::Memory(mem));
     }
 }

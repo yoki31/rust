@@ -1,110 +1,132 @@
 use rustc_ast::Attribute;
-use rustc_hir as hir;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::itemlikevisit::ItemLikeVisitor;
-use rustc_hir::ItemKind;
 use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt, LayoutError, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
+use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
+use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, TargetDataLayout};
+use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
+use rustc_trait_selection::{infer::TyCtxtInferExt, traits};
+
+use crate::errors::{
+    LayoutAbi, LayoutAlign, LayoutHomogeneousAggregate, LayoutInvalidAttribute, LayoutOf,
+    LayoutSize, UnrecognizedField,
+};
 
 pub fn test_layout(tcx: TyCtxt<'_>) {
-    if tcx.features().rustc_attrs {
+    if !tcx.features().rustc_attrs {
         // if the `rustc_attrs` feature is not enabled, don't bother testing layout
-        tcx.hir().visit_all_item_likes(&mut LayoutTest { tcx });
+        return;
     }
-}
-
-struct LayoutTest<'tcx> {
-    tcx: TyCtxt<'tcx>,
-}
-
-impl ItemLikeVisitor<'tcx> for LayoutTest<'tcx> {
-    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
-        match item.kind {
-            ItemKind::TyAlias(..)
-            | ItemKind::Enum(..)
-            | ItemKind::Struct(..)
-            | ItemKind::Union(..) => {
-                for attr in self.tcx.get_attrs(item.def_id.to_def_id()).iter() {
-                    if attr.has_name(sym::rustc_layout) {
-                        self.dump_layout_of(item.def_id, item, attr);
-                    }
+    for id in tcx.hir_crate_items(()).definitions() {
+        for attr in tcx.get_attrs(id, sym::rustc_layout) {
+            match tcx.def_kind(id) {
+                DefKind::TyAlias | DefKind::Enum | DefKind::Struct | DefKind::Union => {
+                    dump_layout_of(tcx, id, attr);
+                }
+                _ => {
+                    tcx.sess.emit_err(LayoutInvalidAttribute { span: tcx.def_span(id) });
                 }
             }
-            _ => {}
         }
     }
-
-    fn visit_trait_item(&mut self, _: &'tcx hir::TraitItem<'tcx>) {}
-    fn visit_impl_item(&mut self, _: &'tcx hir::ImplItem<'tcx>) {}
-    fn visit_foreign_item(&mut self, _: &'tcx hir::ForeignItem<'tcx>) {}
 }
 
-impl LayoutTest<'tcx> {
-    fn dump_layout_of(&self, item_def_id: LocalDefId, item: &hir::Item<'tcx>, attr: &Attribute) {
-        let tcx = self.tcx;
-        let param_env = self.tcx.param_env(item_def_id);
-        let ty = self.tcx.type_of(item_def_id);
-        match self.tcx.layout_of(param_env.and(ty)) {
-            Ok(ty_layout) => {
-                // Check out the `#[rustc_layout(..)]` attribute to tell what to dump.
-                // The `..` are the names of fields to dump.
-                let meta_items = attr.meta_item_list().unwrap_or_default();
-                for meta_item in meta_items {
-                    match meta_item.name_or_empty() {
-                        sym::abi => {
-                            self.tcx.sess.span_err(item.span, &format!("abi: {:?}", ty_layout.abi));
-                        }
+pub fn ensure_wf<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
+    ty: Ty<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+) -> bool {
+    let pred = ty::ClauseKind::WellFormed(ty.into());
+    let obligation = traits::Obligation::new(
+        tcx,
+        traits::ObligationCause::new(
+            span,
+            def_id,
+            traits::ObligationCauseCode::WellFormed(Some(traits::WellFormedLoc::Ty(def_id))),
+        ),
+        param_env,
+        pred,
+    );
+    let infcx = tcx.infer_ctxt().build();
+    let ocx = traits::ObligationCtxt::new(&infcx);
+    ocx.register_obligation(obligation);
+    let errors = ocx.select_all_or_error();
+    if !errors.is_empty() {
+        infcx.err_ctxt().report_fulfillment_errors(errors);
+        false
+    } else {
+        // looks WF!
+        true
+    }
+}
 
-                        sym::align => {
-                            self.tcx
-                                .sess
-                                .span_err(item.span, &format!("align: {:?}", ty_layout.align));
-                        }
+fn dump_layout_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId, attr: &Attribute) {
+    let param_env = tcx.param_env(item_def_id);
+    let ty = tcx.type_of(item_def_id).instantiate_identity();
+    let span = tcx.def_span(item_def_id.to_def_id());
+    if !ensure_wf(tcx, param_env, ty, item_def_id, span) {
+        return;
+    }
+    match tcx.layout_of(param_env.and(ty)) {
+        Ok(ty_layout) => {
+            // Check out the `#[rustc_layout(..)]` attribute to tell what to dump.
+            // The `..` are the names of fields to dump.
+            let meta_items = attr.meta_item_list().unwrap_or_default();
+            for meta_item in meta_items {
+                match meta_item.name_or_empty() {
+                    sym::abi => {
+                        tcx.sess.emit_err(LayoutAbi { span, abi: format!("{:?}", ty_layout.abi) });
+                    }
 
-                        sym::size => {
-                            self.tcx
-                                .sess
-                                .span_err(item.span, &format!("size: {:?}", ty_layout.size));
-                        }
+                    sym::align => {
+                        tcx.sess.emit_err(LayoutAlign {
+                            span,
+                            align: format!("{:?}", ty_layout.align),
+                        });
+                    }
 
-                        sym::homogeneous_aggregate => {
-                            self.tcx.sess.span_err(
-                                item.span,
-                                &format!(
-                                    "homogeneous_aggregate: {:?}",
-                                    ty_layout
-                                        .homogeneous_aggregate(&UnwrapLayoutCx { tcx, param_env }),
-                                ),
-                            );
-                        }
+                    sym::size => {
+                        tcx.sess
+                            .emit_err(LayoutSize { span, size: format!("{:?}", ty_layout.size) });
+                    }
 
-                        sym::debug => {
-                            let normalized_ty = self.tcx.normalize_erasing_regions(
-                                param_env.with_reveal_all_normalized(self.tcx),
+                    sym::homogeneous_aggregate => {
+                        tcx.sess.emit_err(LayoutHomogeneousAggregate {
+                            span,
+                            homogeneous_aggregate: format!(
+                                "{:?}",
+                                ty_layout.homogeneous_aggregate(&UnwrapLayoutCx { tcx, param_env })
+                            ),
+                        });
+                    }
+
+                    sym::debug => {
+                        let normalized_ty = format!(
+                            "{}",
+                            tcx.normalize_erasing_regions(
+                                param_env.with_reveal_all_normalized(tcx),
                                 ty,
-                            );
-                            self.tcx.sess.span_err(
-                                item.span,
-                                &format!("layout_of({:?}) = {:#?}", normalized_ty, *ty_layout),
-                            );
-                        }
+                            )
+                        );
+                        // FIXME: using the `Debug` impl here isn't ideal.
+                        let ty_layout = format!("{:#?}", *ty_layout);
+                        tcx.sess.emit_err(LayoutOf { span, normalized_ty, ty_layout });
+                    }
 
-                        name => {
-                            self.tcx.sess.span_err(
-                                meta_item.span(),
-                                &format!("unrecognized field name `{}`", name),
-                            );
-                        }
+                    name => {
+                        tcx.sess.emit_err(UnrecognizedField { span: meta_item.span(), name });
                     }
                 }
             }
+        }
 
-            Err(layout_error) => {
-                self.tcx.sess.span_err(item.span, &format!("layout error: {:?}", layout_error));
-            }
+        Err(layout_error) => {
+            tcx.sess.emit_fatal(Spanned { node: layout_error.into_diagnostic(), span });
         }
     }
 }
@@ -114,32 +136,27 @@ struct UnwrapLayoutCx<'tcx> {
     param_env: ParamEnv<'tcx>,
 }
 
-impl LayoutOfHelpers<'tcx> for UnwrapLayoutCx<'tcx> {
+impl<'tcx> LayoutOfHelpers<'tcx> for UnwrapLayoutCx<'tcx> {
     type LayoutOfResult = TyAndLayout<'tcx>;
 
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        span_bug!(
-            span,
-            "`#[rustc_layout(..)]` test resulted in `layout_of({}) = Err({})`",
-            ty,
-            err
-        );
+        span_bug!(span, "`#[rustc_layout(..)]` test resulted in `layout_of({ty}) = Err({err})`",);
     }
 }
 
-impl HasTyCtxt<'tcx> for UnwrapLayoutCx<'tcx> {
+impl<'tcx> HasTyCtxt<'tcx> for UnwrapLayoutCx<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 }
 
-impl HasParamEnv<'tcx> for UnwrapLayoutCx<'tcx> {
+impl<'tcx> HasParamEnv<'tcx> for UnwrapLayoutCx<'tcx> {
     fn param_env(&self) -> ParamEnv<'tcx> {
         self.param_env
     }
 }
 
-impl HasDataLayout for UnwrapLayoutCx<'tcx> {
+impl<'tcx> HasDataLayout for UnwrapLayoutCx<'tcx> {
     fn data_layout(&self) -> &TargetDataLayout {
         self.tcx.data_layout()
     }

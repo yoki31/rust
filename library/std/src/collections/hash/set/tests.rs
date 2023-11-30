@@ -1,8 +1,9 @@
-use super::super::map::RandomState;
 use super::HashSet;
 
+use crate::hash::RandomState;
 use crate::panic::{catch_unwind, AssertUnwindSafe};
 use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::Arc;
 
 #[test]
 fn test_zero_capacities() {
@@ -301,10 +302,10 @@ fn test_show() {
     set.insert(1);
     set.insert(2);
 
-    let set_str = format!("{:?}", set);
+    let set_str = format!("{set:?}");
 
     assert!(set_str == "{1, 2}" || set_str == "{2, 1}");
-    assert_eq!(format!("{:?}", empty), "{}");
+    assert_eq!(format!("{empty:?}"), "{}");
 }
 
 #[test]
@@ -418,18 +419,18 @@ fn test_retain() {
 }
 
 #[test]
-fn test_drain_filter() {
+fn test_extract_if() {
     let mut x: HashSet<_> = [1].iter().copied().collect();
     let mut y: HashSet<_> = [1].iter().copied().collect();
 
-    x.drain_filter(|_| true);
-    y.drain_filter(|_| false);
+    x.extract_if(|_| true).for_each(drop);
+    y.extract_if(|_| false).for_each(drop);
     assert_eq!(x.len(), 0);
     assert_eq!(y.len(), 1);
 }
 
 #[test]
-fn test_drain_filter_drop_panic_leak() {
+fn test_extract_if_drop_panic_leak() {
     static PREDS: AtomicU32 = AtomicU32::new(0);
     static DROPS: AtomicU32 = AtomicU32::new(0);
 
@@ -446,19 +447,20 @@ fn test_drain_filter_drop_panic_leak() {
     let mut set = (0..3).map(|i| D(i)).collect::<HashSet<_>>();
 
     catch_unwind(move || {
-        drop(set.drain_filter(|_| {
+        set.extract_if(|_| {
             PREDS.fetch_add(1, Ordering::SeqCst);
             true
-        }))
+        })
+        .for_each(drop)
     })
     .ok();
 
-    assert_eq!(PREDS.load(Ordering::SeqCst), 3);
+    assert_eq!(PREDS.load(Ordering::SeqCst), 2);
     assert_eq!(DROPS.load(Ordering::SeqCst), 3);
 }
 
 #[test]
-fn test_drain_filter_pred_panic_leak() {
+fn test_extract_if_pred_panic_leak() {
     static PREDS: AtomicU32 = AtomicU32::new(0);
     static DROPS: AtomicU32 = AtomicU32::new(0);
 
@@ -473,10 +475,11 @@ fn test_drain_filter_pred_panic_leak() {
     let mut set: HashSet<_> = (0..3).map(|_| D).collect();
 
     catch_unwind(AssertUnwindSafe(|| {
-        drop(set.drain_filter(|_| match PREDS.fetch_add(1, Ordering::SeqCst) {
+        set.extract_if(|_| match PREDS.fetch_add(1, Ordering::SeqCst) {
             0 => true,
             _ => panic!(),
-        }))
+        })
+        .for_each(drop)
     }))
     .ok();
 
@@ -495,4 +498,29 @@ fn from_array() {
     // If you make a change that causes this line to no longer infer,
     // that's a problem!
     let _must_not_require_type_annotation = HashSet::from([1, 2]);
+}
+
+#[test]
+fn const_with_hasher() {
+    const X: HashSet<(), ()> = HashSet::with_hasher(());
+    assert_eq!(X.len(), 0);
+}
+
+#[test]
+fn test_insert_does_not_overwrite_the_value() {
+    let first_value = Arc::new(17);
+    let second_value = Arc::new(17);
+
+    let mut set = HashSet::new();
+    let inserted = set.insert(first_value.clone());
+    assert!(inserted);
+
+    let inserted = set.insert(second_value);
+    assert!(!inserted);
+
+    assert!(
+        Arc::ptr_eq(set.iter().next().unwrap(), &first_value),
+        "Insert must not overwrite the value, so the contained value pointer \
+            must be the same as first value pointer we inserted"
+    );
 }

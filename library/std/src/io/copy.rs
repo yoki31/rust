@@ -1,5 +1,12 @@
-use super::{BufWriter, ErrorKind, Read, Result, Write, DEFAULT_BUF_SIZE};
+use super::{BorrowedBuf, BufReader, BufWriter, Read, Result, Write, DEFAULT_BUF_SIZE};
+use crate::alloc::Allocator;
+use crate::cmp;
+use crate::collections::VecDeque;
+use crate::io::IoSlice;
 use crate::mem::MaybeUninit;
+
+#[cfg(test)]
+mod tests;
 
 /// Copies the entire contents of a reader into a writer.
 ///
@@ -10,7 +17,7 @@ use crate::mem::MaybeUninit;
 /// On success, the total number of bytes that were copied from
 /// `reader` to `writer` is returned.
 ///
-/// If you’re wanting to copy the contents of one file to another and you’re
+/// If you want to copy the contents of one file to another and you’re
 /// working with filesystem paths, see the [`fs::copy`] function.
 ///
 /// [`fs::copy`]: crate::fs::copy
@@ -23,6 +30,7 @@ use crate::mem::MaybeUninit;
 ///
 /// [`read`]: Read::read
 /// [`write`]: Write::write
+/// [`ErrorKind::Interrupted`]: crate::io::ErrorKind::Interrupted
 ///
 /// # Examples
 ///
@@ -39,6 +47,16 @@ use crate::mem::MaybeUninit;
 ///     Ok(())
 /// }
 /// ```
+///
+/// # Platform-specific behavior
+///
+/// On Linux (including Android), this function uses `copy_file_range(2)`,
+/// `sendfile(2)` or `splice(2)` syscalls to move data directly between file
+/// descriptors if possible.
+///
+/// Note that platform-specific behavior [may change in the future][changes].
+///
+/// [changes]: crate::io#platform-specific-behavior
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn copy<R: ?Sized, W: ?Sized>(reader: &mut R, writer: &mut W) -> Result<u64>
 where
@@ -61,96 +79,216 @@ where
     R: Read,
     W: Write,
 {
-    BufferedCopySpec::copy_to(reader, writer)
+    let read_buf = BufferedReaderSpec::buffer_size(reader);
+    let write_buf = BufferedWriterSpec::buffer_size(writer);
+
+    if read_buf >= DEFAULT_BUF_SIZE && read_buf >= write_buf {
+        return BufferedReaderSpec::copy_to(reader, writer);
+    }
+
+    BufferedWriterSpec::copy_from(writer, reader)
+}
+
+/// Specialization of the read-write loop that reuses the internal
+/// buffer of a BufReader. If there's no buffer then the writer side
+/// should be used instead.
+trait BufferedReaderSpec {
+    fn buffer_size(&self) -> usize;
+
+    fn copy_to(&mut self, to: &mut (impl Write + ?Sized)) -> Result<u64>;
+}
+
+impl<T> BufferedReaderSpec for T
+where
+    Self: Read,
+    T: ?Sized,
+{
+    #[inline]
+    default fn buffer_size(&self) -> usize {
+        0
+    }
+
+    default fn copy_to(&mut self, _to: &mut (impl Write + ?Sized)) -> Result<u64> {
+        unreachable!("only called from specializations")
+    }
+}
+
+impl BufferedReaderSpec for &[u8] {
+    fn buffer_size(&self) -> usize {
+        // prefer this specialization since the source "buffer" is all we'll ever need,
+        // even if it's small
+        usize::MAX
+    }
+
+    fn copy_to(&mut self, to: &mut (impl Write + ?Sized)) -> Result<u64> {
+        let len = self.len();
+        to.write_all(self)?;
+        *self = &self[len..];
+        Ok(len as u64)
+    }
+}
+
+impl<A: Allocator> BufferedReaderSpec for VecDeque<u8, A> {
+    fn buffer_size(&self) -> usize {
+        // prefer this specialization since the source "buffer" is all we'll ever need,
+        // even if it's small
+        usize::MAX
+    }
+
+    fn copy_to(&mut self, to: &mut (impl Write + ?Sized)) -> Result<u64> {
+        let len = self.len();
+        let (front, back) = self.as_slices();
+        let bufs = &mut [IoSlice::new(front), IoSlice::new(back)];
+        to.write_all_vectored(bufs)?;
+        self.clear();
+        Ok(len as u64)
+    }
+}
+
+impl<I> BufferedReaderSpec for BufReader<I>
+where
+    Self: Read,
+    I: ?Sized,
+{
+    fn buffer_size(&self) -> usize {
+        self.capacity()
+    }
+
+    fn copy_to(&mut self, to: &mut (impl Write + ?Sized)) -> Result<u64> {
+        let mut len = 0;
+
+        loop {
+            // Hack: this relies on `impl Read for BufReader` always calling fill_buf
+            // if the buffer is empty, even for empty slices.
+            // It can't be called directly here since specialization prevents us
+            // from adding I: Read
+            match self.read(&mut []) {
+                Ok(_) => {}
+                Err(e) if e.is_interrupted() => continue,
+                Err(e) => return Err(e),
+            }
+            let buf = self.buffer();
+            if self.buffer().len() == 0 {
+                return Ok(len);
+            }
+
+            // In case the writer side is a BufWriter then its write_all
+            // implements an optimization that passes through large
+            // buffers to the underlying writer. That code path is #[cold]
+            // but we're still avoiding redundant memcopies when doing
+            // a copy between buffered inputs and outputs.
+            to.write_all(buf)?;
+            len += buf.len() as u64;
+            self.discard_buffer();
+        }
+    }
 }
 
 /// Specialization of the read-write loop that either uses a stack buffer
 /// or reuses the internal buffer of a BufWriter
-trait BufferedCopySpec: Write {
-    fn copy_to<R: Read + ?Sized>(reader: &mut R, writer: &mut Self) -> Result<u64>;
+trait BufferedWriterSpec: Write {
+    fn buffer_size(&self) -> usize;
+
+    fn copy_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<u64>;
 }
 
-impl<W: Write + ?Sized> BufferedCopySpec for W {
-    default fn copy_to<R: Read + ?Sized>(reader: &mut R, writer: &mut Self) -> Result<u64> {
-        stack_buffer_copy(reader, writer)
+impl<W: Write + ?Sized> BufferedWriterSpec for W {
+    #[inline]
+    default fn buffer_size(&self) -> usize {
+        0
+    }
+
+    default fn copy_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<u64> {
+        stack_buffer_copy(reader, self)
     }
 }
 
-impl<I: Write> BufferedCopySpec for BufWriter<I> {
-    fn copy_to<R: Read + ?Sized>(reader: &mut R, writer: &mut Self) -> Result<u64> {
-        if writer.capacity() < DEFAULT_BUF_SIZE {
-            return stack_buffer_copy(reader, writer);
-        }
+impl<I: Write + ?Sized> BufferedWriterSpec for BufWriter<I> {
+    fn buffer_size(&self) -> usize {
+        self.capacity()
+    }
 
-        // FIXME: #42788
-        //
-        //   - This creates a (mut) reference to a slice of
-        //     _uninitialized_ integers, which is **undefined behavior**
-        //
-        //   - Only the standard library gets to soundly "ignore" this,
-        //     based on its privileged knowledge of unstable rustc
-        //     internals;
-        unsafe {
-            let spare_cap = writer.buffer_mut().spare_capacity_mut();
-            reader.initializer().initialize(MaybeUninit::slice_assume_init_mut(spare_cap));
+    fn copy_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<u64> {
+        if self.capacity() < DEFAULT_BUF_SIZE {
+            return stack_buffer_copy(reader, self);
         }
 
         let mut len = 0;
+        let mut init = 0;
 
         loop {
-            let buf = writer.buffer_mut();
-            let spare_cap = buf.spare_capacity_mut();
+            let buf = self.buffer_mut();
+            let mut read_buf: BorrowedBuf<'_> = buf.spare_capacity_mut().into();
 
-            if spare_cap.len() >= DEFAULT_BUF_SIZE {
-                match reader.read(unsafe { MaybeUninit::slice_assume_init_mut(spare_cap) }) {
-                    Ok(0) => return Ok(len), // EOF reached
-                    Ok(bytes_read) => {
-                        assert!(bytes_read <= spare_cap.len());
-                        // SAFETY: The initializer contract guarantees that either it or `read`
-                        // will have initialized these bytes. And we just checked that the number
-                        // of bytes is within the buffer capacity.
-                        unsafe { buf.set_len(buf.len() + bytes_read) };
-                        len += bytes_read as u64;
-                        // Read again if the buffer still has enough capacity, as BufWriter itself would do
-                        // This will occur if the reader returns short reads
-                        continue;
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
+            unsafe {
+                // SAFETY: init is either 0 or the init_len from the previous iteration.
+                read_buf.set_init(init);
             }
 
-            writer.flush_buf()?;
+            if read_buf.capacity() >= DEFAULT_BUF_SIZE {
+                let mut cursor = read_buf.unfilled();
+                match reader.read_buf(cursor.reborrow()) {
+                    Ok(()) => {
+                        let bytes_read = cursor.written();
+
+                        if bytes_read == 0 {
+                            return Ok(len);
+                        }
+
+                        init = read_buf.init_len() - bytes_read;
+                        len += bytes_read as u64;
+
+                        // SAFETY: BorrowedBuf guarantees all of its filled bytes are init
+                        unsafe { buf.set_len(buf.len() + bytes_read) };
+
+                        // Read again if the buffer still has enough capacity, as BufWriter itself would do
+                        // This will occur if the reader returns short reads
+                    }
+                    Err(ref e) if e.is_interrupted() => {}
+                    Err(e) => return Err(e),
+                }
+            } else {
+                self.flush_buf()?;
+                init = 0;
+            }
         }
     }
 }
 
-fn stack_buffer_copy<R: Read + ?Sized, W: Write + ?Sized>(
+impl BufferedWriterSpec for Vec<u8> {
+    fn buffer_size(&self) -> usize {
+        cmp::max(DEFAULT_BUF_SIZE, self.capacity() - self.len())
+    }
+
+    fn copy_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<u64> {
+        reader.read_to_end(self).map(|bytes| u64::try_from(bytes).expect("usize overflowed u64"))
+    }
+}
+
+pub fn stack_buffer_copy<R: Read + ?Sized, W: Write + ?Sized>(
     reader: &mut R,
     writer: &mut W,
 ) -> Result<u64> {
-    let mut buf = MaybeUninit::<[u8; DEFAULT_BUF_SIZE]>::uninit();
-    // FIXME: #42788
-    //
-    //   - This creates a (mut) reference to a slice of
-    //     _uninitialized_ integers, which is **undefined behavior**
-    //
-    //   - Only the standard library gets to soundly "ignore" this,
-    //     based on its privileged knowledge of unstable rustc
-    //     internals;
-    unsafe {
-        reader.initializer().initialize(buf.assume_init_mut());
-    }
+    let buf: &mut [_] = &mut [MaybeUninit::uninit(); DEFAULT_BUF_SIZE];
+    let mut buf: BorrowedBuf<'_> = buf.into();
 
-    let mut written = 0;
+    let mut len = 0;
+
     loop {
-        let len = match reader.read(unsafe { buf.assume_init_mut() }) {
-            Ok(0) => return Ok(written),
-            Ok(len) => len,
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+        match reader.read_buf(buf.unfilled()) {
+            Ok(()) => {}
+            Err(e) if e.is_interrupted() => continue,
             Err(e) => return Err(e),
         };
-        writer.write_all(unsafe { &buf.assume_init_ref()[..len] })?;
-        written += len as u64;
+
+        if buf.filled().is_empty() {
+            break;
+        }
+
+        len += buf.filled().len() as u64;
+        writer.write_all(buf.filled())?;
+        buf.clear();
     }
+
+    Ok(len)
 }

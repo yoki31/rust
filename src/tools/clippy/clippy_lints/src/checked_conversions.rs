@@ -1,15 +1,13 @@
 //! lint on manually implemented checked conversions that could be transformed into `try_from`
 
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{meets_msrv, msrvs, SpanlessEq};
-use if_chain::if_chain;
-use rustc_ast::ast::LitKind;
+use clippy_utils::{in_constant, is_integer_literal, SpanlessEq};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOp, BinOpKind, Expr, ExprKind, QPath, TyKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_semver::RustcVersion;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 
 declare_clippy_lint! {
@@ -20,34 +18,30 @@ declare_clippy_lint! {
     /// Reduces the readability of statements & is error prone.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let foo: u32 = 5;
-    /// # let _ =
-    /// foo <= i32::MAX as u32
-    /// # ;
+    /// foo <= i32::MAX as u32;
     /// ```
     ///
-    /// Could be written:
-    ///
-    /// ```rust
-    /// # use std::convert::TryFrom;
+    /// Use instead:
+    /// ```no_run
     /// # let foo = 1;
-    /// # let _ =
-    /// i32::try_from(foo).is_ok()
-    /// # ;
+    /// # #[allow(unused)]
+    /// i32::try_from(foo).is_ok();
     /// ```
+    #[clippy::version = "1.37.0"]
     pub CHECKED_CONVERSIONS,
     pedantic,
     "`try_from` could replace manual bounds checking when casting"
 }
 
 pub struct CheckedConversions {
-    msrv: Option<RustcVersion>,
+    msrv: Msrv,
 }
 
 impl CheckedConversions {
     #[must_use]
-    pub fn new(msrv: Option<RustcVersion>) -> Self {
+    pub fn new(msrv: Msrv) -> Self {
         Self { msrv }
     }
 }
@@ -56,23 +50,21 @@ impl_lint_pass!(CheckedConversions => [CHECKED_CONVERSIONS]);
 
 impl<'tcx> LateLintPass<'tcx> for CheckedConversions {
     fn check_expr(&mut self, cx: &LateContext<'_>, item: &Expr<'_>) {
-        if !meets_msrv(self.msrv.as_ref(), &msrvs::TRY_FROM) {
+        if !self.msrv.meets(msrvs::TRY_FROM) {
             return;
         }
 
-        let result = if_chain! {
-            if !in_external_macro(cx.sess(), item.span);
-            if let ExprKind::Binary(op, left, right) = &item.kind;
-
-            then {
-                match op.node {
-                    BinOpKind::Ge | BinOpKind::Le => single_check(item),
-                    BinOpKind::And => double_check(cx, left, right),
-                    _ => None,
-                }
-            } else {
-                None
+        let result = if !in_constant(cx, item.hir_id)
+            && !in_external_macro(cx.sess(), item.span)
+            && let ExprKind::Binary(op, left, right) = &item.kind
+        {
+            match op.node {
+                BinOpKind::Ge | BinOpKind::Le => single_check(item),
+                BinOpKind::And => double_check(cx, left, right),
+                _ => None,
             }
+        } else {
+            None
         };
 
         if let Some(cv) = result {
@@ -85,7 +77,7 @@ impl<'tcx> LateLintPass<'tcx> for CheckedConversions {
                     item.span,
                     "checked cast can be simplified",
                     "try",
-                    format!("{}::try_from({}).is_ok()", to_type, snippet),
+                    format!("{to_type}::try_from({snippet}).is_ok()"),
                     applicability,
                 );
             }
@@ -122,7 +114,7 @@ struct Conversion<'a> {
 }
 
 /// The kind of conversion that is checked
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ConversionType {
     SignedToUnsigned,
     SignedToSigned,
@@ -197,16 +189,13 @@ impl ConversionType {
 
 /// Check for `expr <= (to_type::MAX as from_type)`
 fn check_upper_bound<'tcx>(expr: &'tcx Expr<'tcx>) -> Option<Conversion<'tcx>> {
-    if_chain! {
-         if let ExprKind::Binary(ref op, left, right) = &expr.kind;
-         if let Some((candidate, check)) = normalize_le_ge(op, left, right);
-         if let Some((from, to)) = get_types_from_cast(check, INTS, "max_value", "MAX");
-
-         then {
-             Conversion::try_new(candidate, from, to)
-         } else {
-            None
-        }
+    if let ExprKind::Binary(ref op, left, right) = &expr.kind
+        && let Some((candidate, check)) = normalize_le_ge(op, left, right)
+        && let Some((from, to)) = get_types_from_cast(check, INTS, "max_value", "MAX")
+    {
+        Conversion::try_new(candidate, from, to)
+    } else {
+        None
     }
 }
 
@@ -226,16 +215,7 @@ fn check_lower_bound<'tcx>(expr: &'tcx Expr<'tcx>) -> Option<Conversion<'tcx>> {
 
 /// Check for `expr >= 0`
 fn check_lower_bound_zero<'a>(candidate: &'a Expr<'_>, check: &'a Expr<'_>) -> Option<Conversion<'a>> {
-    if_chain! {
-        if let ExprKind::Lit(ref lit) = &check.kind;
-        if let LitKind::Int(0, _) = &lit.node;
-
-        then {
-            Some(Conversion::new_any(candidate))
-        } else {
-            None
-        }
-    }
+    is_integer_literal(check, 0).then(|| Conversion::new_any(candidate))
 }
 
 /// Check for `expr >= (to_type::MIN as from_type)`
@@ -256,36 +236,27 @@ fn get_types_from_cast<'a>(
 ) -> Option<(&'a str, &'a str)> {
     // `to_type::max_value() as from_type`
     // or `to_type::MAX as from_type`
-    let call_from_cast: Option<(&Expr<'_>, &str)> = if_chain! {
+    let call_from_cast: Option<(&Expr<'_>, &str)> = if let ExprKind::Cast(limit, from_type) = &expr.kind
         // to_type::max_value(), from_type
-        if let ExprKind::Cast(limit, from_type) = &expr.kind;
-        if let TyKind::Path(ref from_type_path) = &from_type.kind;
-        if let Some(from_sym) = int_ty_to_sym(from_type_path);
-
-        then {
-            Some((limit, from_sym))
-        } else {
-            None
-        }
+        && let TyKind::Path(ref from_type_path) = &from_type.kind
+        && let Some(from_sym) = int_ty_to_sym(from_type_path)
+    {
+        Some((limit, from_sym))
+    } else {
+        None
     };
 
     // `from_type::from(to_type::max_value())`
     let limit_from: Option<(&Expr<'_>, &str)> = call_from_cast.or_else(|| {
-        if_chain! {
+        if let ExprKind::Call(from_func, [limit]) = &expr.kind
             // `from_type::from, to_type::max_value()`
-            if let ExprKind::Call(from_func, args) = &expr.kind;
-            // `to_type::max_value()`
-            if args.len() == 1;
-            if let limit = &args[0];
             // `from_type::from`
-            if let ExprKind::Path(ref path) = &from_func.kind;
-            if let Some(from_sym) = get_implementing_type(path, INTS, "from");
-
-            then {
-                Some((limit, from_sym))
-            } else {
-                None
-            }
+            && let ExprKind::Path(ref path) = &from_func.kind
+            && let Some(from_sym) = get_implementing_type(path, INTS, "from")
+        {
+            Some((limit, from_sym))
+        } else {
+            None
         }
     });
 
@@ -314,31 +285,27 @@ fn get_types_from_cast<'a>(
 
 /// Gets the type which implements the called function
 fn get_implementing_type<'a>(path: &QPath<'_>, candidates: &'a [&str], function: &str) -> Option<&'a str> {
-    if_chain! {
-        if let QPath::TypeRelative(ty, path) = &path;
-        if path.ident.name.as_str() == function;
-        if let TyKind::Path(QPath::Resolved(None, tp)) = &ty.kind;
-        if let [int] = &*tp.segments;
-        then {
-            let name = &int.ident.name.as_str();
-            candidates.iter().find(|c| name == *c).copied()
-        } else {
-            None
-        }
+    if let QPath::TypeRelative(ty, path) = &path
+        && path.ident.name.as_str() == function
+        && let TyKind::Path(QPath::Resolved(None, tp)) = &ty.kind
+        && let [int] = tp.segments
+    {
+        let name = int.ident.name.as_str();
+        candidates.iter().find(|c| &name == *c).copied()
+    } else {
+        None
     }
 }
 
 /// Gets the type as a string, if it is a supported integer
 fn int_ty_to_sym<'tcx>(path: &QPath<'_>) -> Option<&'tcx str> {
-    if_chain! {
-        if let QPath::Resolved(_, path) = *path;
-        if let [ty] = &*path.segments;
-        then {
-            let name = &ty.ident.name.as_str();
-            INTS.iter().find(|c| name == *c).copied()
-        } else {
-            None
-        }
+    if let QPath::Resolved(_, path) = *path
+        && let [ty] = path.segments
+    {
+        let name = ty.ident.name.as_str();
+        INTS.iter().find(|c| &name == *c).copied()
+    } else {
+        None
     }
 }
 

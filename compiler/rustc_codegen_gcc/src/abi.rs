@@ -1,8 +1,13 @@
-use gccjit::{ToRValue, Type};
+#[cfg(feature = "master")]
+use gccjit::FnAttribute;
+use gccjit::{ToLValue, ToRValue, Type};
 use rustc_codegen_ssa::traits::{AbiBuilderMethods, BaseTypeMethods};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::bug;
 use rustc_middle::ty::Ty;
-use rustc_target::abi::call::{CastTarget, FnAbi, PassMode, Reg, RegKind};
+#[cfg(feature = "master")]
+use rustc_session::config;
+use rustc_target::abi::call::{ArgAttributes, CastTarget, FnAbi, PassMode, Reg, RegKind};
 
 use crate::builder::Builder;
 use crate::context::CodegenCx;
@@ -10,14 +15,22 @@ use crate::intrinsic::ArgAbiExt;
 use crate::type_of::LayoutGccExt;
 
 impl<'a, 'gcc, 'tcx> AbiBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
-    fn apply_attrs_callsite(&mut self, _fn_abi: &FnAbi<'tcx, Ty<'tcx>>, _callsite: Self::Value) {
-        // TODO(antoyo)
-    }
-
-    fn get_param(&self, index: usize) -> Self::Value {
-        self.cx.current_func.borrow().expect("current func")
-            .get_param(index as i32)
-            .to_rvalue()
+    fn get_param(&mut self, index: usize) -> Self::Value {
+        let func = self.current_func();
+        let param = func.get_param(index as i32);
+        let on_stack =
+            if let Some(on_stack_param_indices) = self.on_stack_function_params.borrow().get(&func) {
+                on_stack_param_indices.contains(&index)
+            }
+            else {
+                false
+            };
+        if on_stack {
+            param.to_lvalue().get_address(None)
+        }
+        else {
+            param.to_rvalue()
+        }
     }
 }
 
@@ -48,8 +61,8 @@ impl GccType for CastTarget {
         let mut args: Vec<_> = self
             .prefix
             .iter()
-            .flat_map(|option_kind| {
-                option_kind.map(|kind| Reg { kind, size: self.prefix_chunk_size }.gcc_type(cx))
+            .flat_map(|option_reg| {
+                option_reg.map(|reg| reg.gcc_type(cx))
             })
             .chain((0..rest_count).map(|_| rest_gcc_unit))
             .collect();
@@ -85,76 +98,124 @@ impl GccType for Reg {
     }
 }
 
+pub struct FnAbiGcc<'gcc> {
+    pub return_type: Type<'gcc>,
+    pub arguments_type: Vec<Type<'gcc>>,
+    pub is_c_variadic: bool,
+    pub on_stack_param_indices: FxHashSet<usize>,
+    #[cfg(feature = "master")]
+    pub fn_attributes: Vec<FnAttribute<'gcc>>,
+}
+
 pub trait FnAbiGccExt<'gcc, 'tcx> {
     // TODO(antoyo): return a function pointer type instead?
-    fn gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> (Type<'gcc>, Vec<Type<'gcc>>, bool);
+    fn gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> FnAbiGcc<'gcc>;
     fn ptr_to_gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc>;
 }
 
 impl<'gcc, 'tcx> FnAbiGccExt<'gcc, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
-    fn gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> (Type<'gcc>, Vec<Type<'gcc>>, bool) {
-        let args_capacity: usize = self.args.iter().map(|arg|
-            if arg.pad.is_some() {
-                1
-            }
-            else {
-                0
-            } +
-            if let PassMode::Pair(_, _) = arg.mode {
-                2
-            } else {
-                1
-            }
-        ).sum();
+    fn gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> FnAbiGcc<'gcc> {
+        let mut on_stack_param_indices = FxHashSet::default();
+
+        // This capacity calculation is approximate.
         let mut argument_tys = Vec::with_capacity(
-            if let PassMode::Indirect { .. } = self.ret.mode {
-                1
-            }
-            else {
-                0
-            } + args_capacity,
+            self.args.len() + if let PassMode::Indirect { .. } = self.ret.mode { 1 } else { 0 }
         );
 
-        let return_ty =
+        let return_type =
             match self.ret.mode {
                 PassMode::Ignore => cx.type_void(),
                 PassMode::Direct(_) | PassMode::Pair(..) => self.ret.layout.immediate_gcc_type(cx),
-                PassMode::Cast(cast) => cast.gcc_type(cx),
+                PassMode::Cast { ref cast, .. } => cast.gcc_type(cx),
                 PassMode::Indirect { .. } => {
                     argument_tys.push(cx.type_ptr_to(self.ret.memory_ty(cx)));
                     cx.type_void()
                 }
             };
+        #[cfg(feature = "master")]
+        let mut non_null_args = Vec::new();
 
-        for arg in &self.args {
-            // add padding
-            if let Some(ty) = arg.pad {
-                argument_tys.push(ty.gcc_type(cx));
+        #[cfg(feature = "master")]
+        let mut apply_attrs = |mut ty: Type<'gcc>, attrs: &ArgAttributes, arg_index: usize| {
+            if cx.sess().opts.optimize == config::OptLevel::No {
+                return ty;
             }
+            if attrs.regular.contains(rustc_target::abi::call::ArgAttribute::NoAlias) {
+                ty = ty.make_restrict()
+            }
+            if attrs.regular.contains(rustc_target::abi::call::ArgAttribute::NonNull) {
+                non_null_args.push(arg_index as i32 + 1);
+            }
+            ty
+        };
+        #[cfg(not(feature = "master"))]
+        let apply_attrs = |ty: Type<'gcc>, _attrs: &ArgAttributes, _arg_index: usize| {
+            ty
+        };
 
+        for arg in self.args.iter() {
             let arg_ty = match arg.mode {
                 PassMode::Ignore => continue,
-                PassMode::Direct(_) => arg.layout.immediate_gcc_type(cx),
-                PassMode::Pair(..) => {
-                    argument_tys.push(arg.layout.scalar_pair_element_gcc_type(cx, 0, true));
-                    argument_tys.push(arg.layout.scalar_pair_element_gcc_type(cx, 1, true));
+                PassMode::Pair(a, b) => {
+                    let arg_pos = argument_tys.len();
+                    argument_tys.push(apply_attrs(arg.layout.scalar_pair_element_gcc_type(cx, 0), &a, arg_pos));
+                    argument_tys.push(apply_attrs(arg.layout.scalar_pair_element_gcc_type(cx, 1), &b, arg_pos + 1));
                     continue;
                 }
-                PassMode::Indirect { extra_attrs: Some(_), .. } => {
-                    unimplemented!();
+                PassMode::Cast { ref cast, pad_i32 } => {
+                    // add padding
+                    if pad_i32 {
+                        argument_tys.push(Reg::i32().gcc_type(cx));
+                    }
+                    let ty = cast.gcc_type(cx);
+                    apply_attrs(ty, &cast.attrs, argument_tys.len())
                 }
-                PassMode::Cast(cast) => cast.gcc_type(cx),
-                PassMode::Indirect { extra_attrs: None, .. } => cx.type_ptr_to(arg.memory_ty(cx)),
+                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: true } => {
+                    // This is a "byval" argument, so we don't apply the `restrict` attribute on it.
+                    on_stack_param_indices.insert(argument_tys.len());
+                    arg.memory_ty(cx)
+                },
+                PassMode::Direct(attrs) => apply_attrs(arg.layout.immediate_gcc_type(cx), &attrs, argument_tys.len()),
+                PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => {
+                    apply_attrs(cx.type_ptr_to(arg.memory_ty(cx)), &attrs, argument_tys.len())
+                }
+                PassMode::Indirect { attrs, meta_attrs: Some(meta_attrs), on_stack } => {
+                    assert!(!on_stack);
+                    let ty = apply_attrs(cx.type_ptr_to(arg.memory_ty(cx)), &attrs, argument_tys.len());
+                    apply_attrs(ty, &meta_attrs, argument_tys.len())
+                }
             };
             argument_tys.push(arg_ty);
         }
 
-        (return_ty, argument_tys, self.c_variadic)
+        #[cfg(feature = "master")]
+        let fn_attrs = if non_null_args.is_empty() {
+            Vec::new()
+        } else {
+            vec![FnAttribute::NonNull(non_null_args)]
+        };
+
+        FnAbiGcc {
+            return_type,
+            arguments_type: argument_tys,
+            is_c_variadic: self.c_variadic,
+            on_stack_param_indices,
+            #[cfg(feature = "master")]
+            fn_attributes: fn_attrs,
+        }
     }
 
     fn ptr_to_gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc> {
-        let (return_type, params, variadic) = self.gcc_type(cx);
-        let pointer_type = cx.context.new_function_pointer_type(None, return_type, &params, variadic);
+        // FIXME(antoyo): Should we do something with `FnAbiGcc::fn_attributes`?
+        let FnAbiGcc {
+            return_type,
+            arguments_type,
+            is_c_variadic,
+            on_stack_param_indices,
+            ..
+        } = self.gcc_type(cx);
+        let pointer_type = cx.context.new_function_pointer_type(None, return_type, &arguments_type, is_c_variadic);
+        cx.on_stack_params.borrow_mut().insert(pointer_type.dyncast_function_ptr_type().expect("function ptr type"), on_stack_param_indices);
         pointer_type
     }
 }

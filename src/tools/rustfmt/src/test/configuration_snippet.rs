@@ -27,8 +27,13 @@ impl ConfigurationSection {
         lazy_static! {
             static ref CONFIG_NAME_REGEX: regex::Regex =
                 regex::Regex::new(r"^## `([^`]+)`").expect("failed creating configuration pattern");
+            // Configuration values, which will be passed to `from_str`:
+            //
+            // - must be prefixed with `####`
+            // - must be wrapped in backticks
+            // - may by wrapped in double quotes (which will be stripped)
             static ref CONFIG_VALUE_REGEX: regex::Regex =
-                regex::Regex::new(r#"^#### `"?([^`"]+)"?`"#)
+                regex::Regex::new(r#"^#### `"?([^`]+?)"?`"#)
                     .expect("failed creating configuration value pattern");
         }
 
@@ -110,14 +115,7 @@ impl ConfigCodeBlock {
         assert!(self.code_block.is_some() && self.code_block_start.is_some());
 
         // See if code block begins with #![rustfmt::skip].
-        let fmt_skip = self
-            .code_block
-            .as_ref()
-            .unwrap()
-            .lines()
-            .nth(0)
-            .unwrap_or("")
-            == "#![rustfmt::skip]";
+        let fmt_skip = self.fmt_skip();
 
         if self.config_name.is_none() && !fmt_skip {
             write_message(&format!(
@@ -136,6 +134,17 @@ impl ConfigCodeBlock {
             return false;
         }
         true
+    }
+
+    /// True if the code block starts with #![rustfmt::skip]
+    fn fmt_skip(&self) -> bool {
+        self.code_block
+            .as_ref()
+            .unwrap()
+            .lines()
+            .nth(0)
+            .unwrap_or("")
+            == "#![rustfmt::skip]"
     }
 
     fn has_parsing_errors<T: Write>(&self, session: &Session<'_, T>) -> bool {
@@ -224,13 +233,11 @@ impl ConfigCodeBlock {
                 Some(ConfigurationSection::ConfigName(name)) => {
                     assert!(
                         Config::is_valid_name(&name),
-                        "an unknown configuration option was found: {}",
-                        name
+                        "an unknown configuration option was found: {name}"
                     );
                     assert!(
                         hash_set.remove(&name),
-                        "multiple configuration guides found for option {}",
-                        name
+                        "multiple configuration guides found for option {name}"
                     );
                     code_block.set_config_name(Some(name));
                 }
@@ -251,12 +258,13 @@ fn configuration_snippet_tests() {
     let blocks = get_code_blocks();
     let failures = blocks
         .iter()
+        .filter(|block| !block.fmt_skip())
         .map(ConfigCodeBlock::formatted_is_idempotent)
         .fold(0, |acc, r| acc + (!r as u32));
 
     // Display results.
     println!("Ran {} configurations tests.", blocks.len());
-    assert_eq!(failures, 0, "{} configurations tests failed", failures);
+    assert_eq!(failures, 0, "{failures} configurations tests failed");
 }
 
 // Read Configurations.md and build a `Vec` of `ConfigCodeBlock` structs with one
@@ -279,9 +287,39 @@ fn get_code_blocks() -> Vec<ConfigCodeBlock> {
 
     for name in hash_set {
         if !Config::is_hidden_option(&name) {
-            panic!("{} does not have a configuration guide", name);
+            panic!("{name} does not have a configuration guide");
         }
     }
 
     code_blocks
+}
+
+#[test]
+fn check_unstable_option_tracking_issue_numbers() {
+    // Ensure that tracking issue links point to the correct issue number
+    let tracking_issue =
+        regex::Regex::new(r"\(tracking issue: \[#(?P<number>\d+)\]\((?P<link>\S+)\)\)")
+            .expect("failed creating configuration pattern");
+
+    let lines = BufReader::new(
+        fs::File::open(Path::new(CONFIGURATIONS_FILE_NAME))
+            .unwrap_or_else(|_| panic!("couldn't read file {}", CONFIGURATIONS_FILE_NAME)),
+    )
+    .lines()
+    .map(Result::unwrap)
+    .enumerate();
+
+    for (idx, line) in lines {
+        if let Some(capture) = tracking_issue.captures(&line) {
+            let number = capture.name("number").unwrap().as_str();
+            let link = capture.name("link").unwrap().as_str();
+            assert!(
+                link.ends_with(number),
+                "{} on line {} does not point to issue #{}",
+                link,
+                idx + 1,
+                number,
+            );
+        }
+    }
 }

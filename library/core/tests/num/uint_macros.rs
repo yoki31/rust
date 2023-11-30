@@ -1,9 +1,9 @@
 macro_rules! uint_module {
-    ($T:ident, $T_i:ident) => {
+    ($T:ident) => {
         #[cfg(test)]
         mod tests {
             use core::ops::{BitAnd, BitOr, BitXor, Not, Shl, Shr};
-            use core::$T_i::*;
+            use core::$T::*;
             use std::str::FromStr;
 
             use crate::num;
@@ -207,20 +207,49 @@ macro_rules! uint_module {
             }
 
             #[test]
+            fn test_isqrt() {
+                assert_eq!((0 as $T).isqrt(), 0 as $T);
+                assert_eq!((1 as $T).isqrt(), 1 as $T);
+                assert_eq!((2 as $T).isqrt(), 1 as $T);
+                assert_eq!((99 as $T).isqrt(), 9 as $T);
+                assert_eq!((100 as $T).isqrt(), 10 as $T);
+                assert_eq!($T::MAX.isqrt(), (1 << ($T::BITS / 2)) - 1);
+            }
+
+            #[cfg(not(miri))] // Miri is too slow
+            #[test]
+            fn test_lots_of_isqrt() {
+                let n_max: $T = (1024 * 1024).min($T::MAX as u128) as $T;
+                for n in 0..=n_max {
+                    let isqrt: $T = n.isqrt();
+
+                    assert!(isqrt.pow(2) <= n);
+                    assert!(isqrt + 1 == (1 as $T) << ($T::BITS / 2) || (isqrt + 1).pow(2) > n);
+                }
+
+                for n in ($T::MAX - 255)..=$T::MAX {
+                    let isqrt: $T = n.isqrt();
+
+                    assert!(isqrt.pow(2) <= n);
+                    assert!(isqrt + 1 == (1 as $T) << ($T::BITS / 2) || (isqrt + 1).pow(2) > n);
+                }
+            }
+
+            #[test]
             fn test_div_floor() {
-                assert_eq!((8 as $T).unstable_div_floor(3), 2);
+                assert_eq!((8 as $T).div_floor(3), 2);
             }
 
             #[test]
             fn test_div_ceil() {
-                assert_eq!((8 as $T).unstable_div_ceil(3), 3);
+                assert_eq!((8 as $T).div_ceil(3), 3);
             }
 
             #[test]
             fn test_next_multiple_of() {
-                assert_eq!((16 as $T).unstable_next_multiple_of(8), 16);
-                assert_eq!((23 as $T).unstable_next_multiple_of(8), 24);
-                assert_eq!(MAX.unstable_next_multiple_of(1), MAX);
+                assert_eq!((16 as $T).next_multiple_of(8), 16);
+                assert_eq!((23 as $T).next_multiple_of(8), 24);
+                assert_eq!(MAX.next_multiple_of(1), MAX);
             }
 
             #[test]
@@ -229,6 +258,54 @@ macro_rules! uint_module {
                 assert_eq!((23 as $T).checked_next_multiple_of(8), Some(24));
                 assert_eq!((1 as $T).checked_next_multiple_of(0), None);
                 assert_eq!(MAX.checked_next_multiple_of(2), None);
+            }
+
+            #[test]
+            fn test_carrying_add() {
+                assert_eq!($T::MAX.carrying_add(1, false), (0, true));
+                assert_eq!($T::MAX.carrying_add(0, true), (0, true));
+                assert_eq!($T::MAX.carrying_add(1, true), (1, true));
+
+                assert_eq!($T::MIN.carrying_add($T::MAX, false), ($T::MAX, false));
+                assert_eq!($T::MIN.carrying_add(0, true), (1, false));
+                assert_eq!($T::MIN.carrying_add($T::MAX, true), (0, true));
+            }
+
+            #[test]
+            fn test_borrowing_sub() {
+                assert_eq!($T::MIN.borrowing_sub(1, false), ($T::MAX, true));
+                assert_eq!($T::MIN.borrowing_sub(0, true), ($T::MAX, true));
+                assert_eq!($T::MIN.borrowing_sub(1, true), ($T::MAX - 1, true));
+
+                assert_eq!($T::MAX.borrowing_sub($T::MAX, false), (0, false));
+                assert_eq!($T::MAX.borrowing_sub(0, true), ($T::MAX - 1, false));
+                assert_eq!($T::MAX.borrowing_sub($T::MAX, true), ($T::MAX, true));
+            }
+
+            #[test]
+            fn test_midpoint() {
+                assert_eq!(<$T>::midpoint(1, 3), 2);
+                assert_eq!(<$T>::midpoint(3, 1), 2);
+
+                assert_eq!(<$T>::midpoint(0, 0), 0);
+                assert_eq!(<$T>::midpoint(0, 2), 1);
+                assert_eq!(<$T>::midpoint(2, 0), 1);
+                assert_eq!(<$T>::midpoint(2, 2), 2);
+
+                assert_eq!(<$T>::midpoint(1, 4), 2);
+                assert_eq!(<$T>::midpoint(4, 1), 2);
+                assert_eq!(<$T>::midpoint(3, 4), 3);
+                assert_eq!(<$T>::midpoint(4, 3), 3);
+
+                assert_eq!(<$T>::midpoint(<$T>::MIN, <$T>::MAX), (<$T>::MAX - <$T>::MIN) / 2);
+                assert_eq!(<$T>::midpoint(<$T>::MAX, <$T>::MIN), (<$T>::MAX - <$T>::MIN) / 2);
+                assert_eq!(<$T>::midpoint(<$T>::MIN, <$T>::MIN), <$T>::MIN);
+                assert_eq!(<$T>::midpoint(<$T>::MAX, <$T>::MAX), <$T>::MAX);
+
+                assert_eq!(<$T>::midpoint(<$T>::MIN, 6), <$T>::MIN / 2 + 3);
+                assert_eq!(<$T>::midpoint(6, <$T>::MIN), <$T>::MIN / 2 + 3);
+                assert_eq!(<$T>::midpoint(<$T>::MAX, 6), (<$T>::MAX - <$T>::MIN) / 2 + 3);
+                assert_eq!(<$T>::midpoint(6, <$T>::MAX), (<$T>::MAX - <$T>::MIN) / 2 + 3);
             }
         }
     };

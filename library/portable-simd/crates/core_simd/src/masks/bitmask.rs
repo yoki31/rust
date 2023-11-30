@@ -1,6 +1,7 @@
+#![allow(unused_imports)]
 use super::MaskElement;
 use crate::simd::intrinsics;
-use crate::simd::{LaneCount, Simd, SupportedLaneCount};
+use crate::simd::{LaneCount, Simd, SupportedLaneCount, ToBitMask};
 use core::marker::PhantomData;
 
 /// A mask where each lane is represented by a single bit.
@@ -25,6 +26,7 @@ where
     T: MaskElement,
     LaneCount<LANES>: SupportedLaneCount,
 {
+    #[inline]
     fn clone(&self) -> Self {
         *self
     }
@@ -35,6 +37,7 @@ where
     T: MaskElement,
     LaneCount<LANES>: SupportedLaneCount,
 {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0.as_ref() == other.0.as_ref()
     }
@@ -45,6 +48,7 @@ where
     T: MaskElement,
     LaneCount<LANES>: SupportedLaneCount,
 {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         self.0.as_ref().partial_cmp(other.0.as_ref())
     }
@@ -62,6 +66,7 @@ where
     T: MaskElement,
     LaneCount<LANES>: SupportedLaneCount,
 {
+    #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.0.as_ref().cmp(other.0.as_ref())
     }
@@ -73,6 +78,7 @@ where
     LaneCount<LANES>: SupportedLaneCount,
 {
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     pub fn splat(value: bool) -> Self {
         let mut mask = <LaneCount<LANES> as SupportedLaneCount>::BitMask::default();
         if value {
@@ -87,6 +93,7 @@ where
     }
 
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub unsafe fn test_unchecked(&self, lane: usize) -> bool {
         (self.0.as_ref()[lane / 8] >> (lane % 8)) & 0x1 > 0
     }
@@ -99,56 +106,75 @@ where
     }
 
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original value"]
     pub fn to_int(self) -> Simd<T, LANES> {
         unsafe {
-            let mask: <LaneCount<LANES> as SupportedLaneCount>::IntBitMask =
-                core::mem::transmute_copy(&self);
-            intrinsics::simd_select_bitmask(mask, Simd::splat(T::TRUE), Simd::splat(T::FALSE))
+            intrinsics::simd_select_bitmask(self.0, Simd::splat(T::TRUE), Simd::splat(T::FALSE))
         }
     }
 
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     pub unsafe fn from_int_unchecked(value: Simd<T, LANES>) -> Self {
-        // TODO remove the transmute when rustc is more flexible
-        assert_eq!(
-            core::mem::size_of::<<LaneCount::<LANES> as SupportedLaneCount>::BitMask>(),
-            core::mem::size_of::<<LaneCount::<LANES> as SupportedLaneCount>::IntBitMask>(),
-        );
-        unsafe {
-            let mask: <LaneCount<LANES> as SupportedLaneCount>::IntBitMask =
-                intrinsics::simd_bitmask(value);
-            Self(core::mem::transmute_copy(&mask), PhantomData)
-        }
+        unsafe { Self(intrinsics::simd_bitmask(value), PhantomData) }
     }
 
     #[cfg(feature = "generic_const_exprs")]
     #[inline]
-    pub fn to_bitmask(self) -> [u8; LaneCount::<LANES>::BITMASK_LEN] {
-        // Safety: these are the same type and we are laundering the generic
+    #[must_use = "method returns a new array and does not mutate the original value"]
+    pub fn to_bitmask_array<const N: usize>(self) -> [u8; N] {
+        assert!(core::mem::size_of::<Self>() == N);
+
+        // Safety: converting an integer to an array of bytes of the same size is safe
         unsafe { core::mem::transmute_copy(&self.0) }
     }
 
     #[cfg(feature = "generic_const_exprs")]
     #[inline]
-    pub fn from_bitmask(bitmask: [u8; LaneCount::<LANES>::BITMASK_LEN]) -> Self {
-        // Safety: these are the same type and we are laundering the generic
+    #[must_use = "method returns a new mask and does not mutate the original value"]
+    pub fn from_bitmask_array<const N: usize>(bitmask: [u8; N]) -> Self {
+        assert!(core::mem::size_of::<Self>() == N);
+
+        // Safety: converting an array of bytes to an integer of the same size is safe
         Self(unsafe { core::mem::transmute_copy(&bitmask) }, PhantomData)
     }
 
     #[inline]
+    pub fn to_bitmask_integer<U>(self) -> U
+    where
+        super::Mask<T, LANES>: ToBitMask<BitMask = U>,
+    {
+        // Safety: these are the same types
+        unsafe { core::mem::transmute_copy(&self.0) }
+    }
+
+    #[inline]
+    pub fn from_bitmask_integer<U>(bitmask: U) -> Self
+    where
+        super::Mask<T, LANES>: ToBitMask<BitMask = U>,
+    {
+        // Safety: these are the same types
+        unsafe { Self(core::mem::transmute_copy(&bitmask), PhantomData) }
+    }
+
+    #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     pub fn convert<U>(self) -> Mask<U, LANES>
     where
         U: MaskElement,
     {
+        // Safety: bitmask layout does not depend on the element width
         unsafe { core::mem::transmute_copy(&self) }
     }
 
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn any(self) -> bool {
         self != Self::splat(false)
     }
 
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn all(self) -> bool {
         self == Self::splat(true)
     }
@@ -162,6 +188,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitand(mut self, rhs: Self) -> Self {
         for (l, r) in self.0.as_mut().iter_mut().zip(rhs.0.as_ref().iter()) {
             *l &= r;
@@ -178,6 +205,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitor(mut self, rhs: Self) -> Self {
         for (l, r) in self.0.as_mut().iter_mut().zip(rhs.0.as_ref().iter()) {
             *l |= r;
@@ -193,6 +221,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitxor(mut self, rhs: Self) -> Self::Output {
         for (l, r) in self.0.as_mut().iter_mut().zip(rhs.0.as_ref().iter()) {
             *l ^= r;
@@ -208,6 +237,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn not(mut self) -> Self::Output {
         for x in self.0.as_mut() {
             *x = !*x;

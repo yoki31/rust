@@ -2,6 +2,7 @@
 //! systems: just a `Vec<u8>`/`[u8]`.
 
 use crate::borrow::Cow;
+use crate::collections::TryReserveError;
 use crate::fmt;
 use crate::fmt::Write;
 use crate::mem;
@@ -10,7 +11,7 @@ use crate::str;
 use crate::sync::Arc;
 use crate::sys_common::{AsInner, IntoInner};
 
-use core::str::lossy::{Utf8Lossy, Utf8LossyChunk};
+use core::str::Utf8Chunks;
 
 #[cfg(test)]
 #[path = "../unix/os_str/tests.rs"]
@@ -28,26 +29,32 @@ pub struct Slice {
 }
 
 impl fmt::Debug for Slice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Writes out a valid unicode string with the correct escape sequences
-
-        formatter.write_str("\"")?;
-        for Utf8LossyChunk { valid, broken } in Utf8Lossy::from_bytes(&self.inner).chunks() {
-            for c in valid.chars().flat_map(|c| c.escape_debug()) {
-                formatter.write_char(c)?
-            }
-
-            for b in broken {
-                write!(formatter, "\\x{:02X}", b)?;
-            }
-        }
-        formatter.write_str("\"")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&Utf8Chunks::new(&self.inner).debug(), f)
     }
 }
 
 impl fmt::Display for Slice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&Utf8Lossy::from_bytes(&self.inner), formatter)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // If we're the empty string then our iterator won't actually yield
+        // anything, so perform the formatting manually
+        if self.inner.is_empty() {
+            return "".fmt(f);
+        }
+
+        for chunk in Utf8Chunks::new(&self.inner) {
+            let valid = chunk.valid();
+            // If we successfully decoded the whole chunk as a valid string then
+            // we can return a direct formatting of the string which will also
+            // respect various formatting flags if possible.
+            if chunk.invalid().is_empty() {
+                return valid.fmt(f);
+            }
+
+            f.write_str(valid)?;
+            f.write_char(char::REPLACEMENT_CHARACTER)?;
+        }
+        Ok(())
     }
 }
 
@@ -82,12 +89,23 @@ impl IntoInner<Vec<u8>> for Buf {
 }
 
 impl AsInner<[u8]> for Buf {
+    #[inline]
     fn as_inner(&self) -> &[u8] {
         &self.inner
     }
 }
 
 impl Buf {
+    #[inline]
+    pub fn into_encoded_bytes(self) -> Vec<u8> {
+        self.inner
+    }
+
+    #[inline]
+    pub unsafe fn from_encoded_bytes_unchecked(s: Vec<u8>) -> Self {
+        Self { inner: s }
+    }
+
     pub fn from_string(s: String) -> Buf {
         Buf { inner: s.into_bytes() }
     }
@@ -113,8 +131,18 @@ impl Buf {
     }
 
     #[inline]
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.inner.try_reserve(additional)
+    }
+
+    #[inline]
     pub fn reserve_exact(&mut self, additional: usize) {
         self.inner.reserve_exact(additional)
+    }
+
+    #[inline]
+    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.inner.try_reserve_exact(additional)
     }
 
     #[inline]
@@ -175,17 +203,22 @@ impl Buf {
 
 impl Slice {
     #[inline]
-    fn from_u8_slice(s: &[u8]) -> &Slice {
+    pub fn as_encoded_bytes(&self) -> &[u8] {
+        &self.inner
+    }
+
+    #[inline]
+    pub unsafe fn from_encoded_bytes_unchecked(s: &[u8]) -> &Slice {
         unsafe { mem::transmute(s) }
     }
 
     #[inline]
     pub fn from_str(s: &str) -> &Slice {
-        Slice::from_u8_slice(s.as_bytes())
+        unsafe { Slice::from_encoded_bytes_unchecked(s.as_bytes()) }
     }
 
-    pub fn to_str(&self) -> Option<&str> {
-        str::from_utf8(&self.inner).ok()
+    pub fn to_str(&self) -> Result<&str, crate::str::Utf8Error> {
+        str::from_utf8(&self.inner)
     }
 
     pub fn to_string_lossy(&self) -> Cow<'_, str> {

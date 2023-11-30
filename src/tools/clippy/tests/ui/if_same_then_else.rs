@@ -1,12 +1,14 @@
 #![warn(clippy::if_same_then_else)]
 #![allow(
-    clippy::blacklisted_name,
+    clippy::disallowed_names,
     clippy::eq_op,
     clippy::never_loop,
     clippy::no_effect,
     clippy::unused_unit,
     clippy::zero_divided_by_zero,
-    clippy::branches_sharing_code
+    clippy::branches_sharing_code,
+    dead_code,
+    unreachable_code
 )]
 
 struct Foo {
@@ -19,6 +21,7 @@ fn foo() -> bool {
 
 fn if_same_then_else() {
     if true {
+        //~^ ERROR: this `if` has identical blocks
         Foo { bar: 42 };
         0..10;
         ..;
@@ -27,7 +30,6 @@ fn if_same_then_else() {
         0..=10;
         foo();
     } else {
-        //~ ERROR same body as `if` block
         Foo { bar: 42 };
         0..10;
         ..;
@@ -63,16 +65,16 @@ fn if_same_then_else() {
     }
 
     let _ = if true {
+        //~^ ERROR: this `if` has identical blocks
         0.0
     } else {
-        //~ ERROR same body as `if` block
         0.0
     };
 
     let _ = if true {
+        //~^ ERROR: this `if` has identical blocks
         -0.0
     } else {
-        //~ ERROR same body as `if` block
         -0.0
     };
 
@@ -86,13 +88,14 @@ fn if_same_then_else() {
     }
 
     let _ = if true {
+        //~^ ERROR: this `if` has identical blocks
         42
     } else {
-        //~ ERROR same body as `if` block
         42
     };
 
     if true {
+        //~^ ERROR: this `if` has identical blocks
         let bar = if true { 42 } else { 43 };
 
         while foo() {
@@ -100,7 +103,6 @@ fn if_same_then_else() {
         }
         bar + 1;
     } else {
-        //~ ERROR same body as `if` block
         let bar = if true { 42 } else { 43 };
 
         while foo() {
@@ -151,6 +153,104 @@ mod issue_5698 {
             y * x
         } else {
             0
+        }
+    }
+}
+
+mod issue_8836 {
+    fn do_not_lint() {
+        if true {
+            todo!()
+        } else {
+            todo!()
+        }
+        if true {
+            todo!();
+        } else {
+            todo!();
+        }
+        if true {
+            unimplemented!()
+        } else {
+            unimplemented!()
+        }
+        if true {
+            unimplemented!();
+        } else {
+            unimplemented!();
+        }
+
+        if true {
+            println!("FOO");
+            todo!();
+        } else {
+            println!("FOO");
+            todo!();
+        }
+
+        if true {
+            println!("FOO");
+            unimplemented!();
+        } else {
+            println!("FOO");
+            unimplemented!();
+        }
+
+        if true {
+            println!("FOO");
+            todo!()
+        } else {
+            println!("FOO");
+            todo!()
+        }
+
+        if true {
+            println!("FOO");
+            unimplemented!()
+        } else {
+            println!("FOO");
+            unimplemented!()
+        }
+    }
+}
+
+mod issue_11213 {
+    fn reproducer(x: bool) -> bool {
+        if x {
+            0_u8.is_power_of_two()
+        } else {
+            0_u16.is_power_of_two()
+        }
+    }
+
+    // a more obvious reproducer that shows
+    // why the code above is problematic:
+    fn v2(x: bool) -> bool {
+        trait Helper {
+            fn is_u8(&self) -> bool;
+        }
+        impl Helper for u8 {
+            fn is_u8(&self) -> bool {
+                true
+            }
+        }
+        impl Helper for u16 {
+            fn is_u8(&self) -> bool {
+                false
+            }
+        }
+
+        // this is certainly not the same code in both branches
+        // it returns a different bool depending on the branch.
+        if x { 0_u8.is_u8() } else { 0_u16.is_u8() }
+    }
+
+    fn do_lint(x: bool) -> bool {
+        // but do lint if the type of the literal is the same
+        if x {
+            0_u8.is_power_of_two()
+        } else {
+            0_u8.is_power_of_two()
         }
     }
 }

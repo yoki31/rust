@@ -2,11 +2,12 @@
     unused_variables,
     unused_assignments,
     clippy::similar_names,
-    clippy::blacklisted_name,
-    clippy::branches_sharing_code
+    clippy::disallowed_names,
+    clippy::branches_sharing_code,
+    clippy::needless_late_init
 )]
 #![warn(clippy::useless_let_if_seq)]
-
+//@no-rustfix
 fn f() -> bool {
     true
 }
@@ -63,11 +64,15 @@ fn main() {
     issue985_alt();
 
     let mut foo = 0;
+    //~^ ERROR: `if _ { .. } else { .. }` is an expression
+    //~| NOTE: you might not need `mut` at all
     if f() {
         foo = 42;
     }
 
     let mut bar = 0;
+    //~^ ERROR: `if _ { .. } else { .. }` is an expression
+    //~| NOTE: you might not need `mut` at all
     if f() {
         f();
         bar = 42;
@@ -76,6 +81,7 @@ fn main() {
     }
 
     let quz;
+    //~^ ERROR: `if _ { .. } else { .. }` is an expression
     if f() {
         quz = 42;
     } else {
@@ -105,6 +111,8 @@ fn main() {
 
     // baz needs to be mut
     let mut baz = 0;
+    //~^ ERROR: `if _ { .. } else { .. }` is an expression
+    //~| NOTE: you might not need `mut` at all
     if f() {
         baz = 42;
     }

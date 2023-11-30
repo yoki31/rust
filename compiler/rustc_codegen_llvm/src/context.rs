@@ -9,11 +9,13 @@ use crate::type_::Type;
 use crate::value::Value;
 
 use cstr::cstr;
-use rustc_codegen_ssa::base::wants_msvc_seh;
+use rustc_codegen_ssa::base::{wants_msvc_seh, wants_wasm_eh};
+use rustc_codegen_ssa::errors as ssa_errors;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::base_n;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::small_c_str::SmallCStr;
+use rustc_hir::def_id::DefId;
 use rustc_middle::mir::mono::CodegenUnit;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasParamEnv, LayoutError, LayoutOfHelpers,
@@ -21,16 +23,18 @@ use rustc_middle::ty::layout::{
 };
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
-use rustc_session::config::{CFGuard, CrateType, DebugInfo};
+use rustc_session::config::{BranchProtection, CFGuard, CFProtection};
+use rustc_session::config::{CrateType, DebugInfo, PAuthKey, PacRet};
 use rustc_session::Session;
-use rustc_span::source_map::Span;
-use rustc_span::symbol::Symbol;
+use rustc_span::source_map::Spanned;
+use rustc_span::Span;
 use rustc_target::abi::{
     call::FnAbi, HasDataLayout, PointeeInfo, Size, TargetDataLayout, VariantIdx,
 };
 use rustc_target::spec::{HasTargetSpec, RelocModel, Target, TlsModel};
 use smallvec::SmallVec;
 
+use libc::c_uint;
 use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::str;
@@ -54,18 +58,7 @@ pub struct CodegenCx<'ll, 'tcx> {
     pub vtables:
         RefCell<FxHashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), &'ll Value>>,
     /// Cache of constant strings,
-    pub const_cstr_cache: RefCell<FxHashMap<Symbol, &'ll Value>>,
-
-    /// Reverse-direction for const ptrs cast from globals.
-    ///
-    /// Key is a Value holding a `*T`,
-    /// Val is a Value holding a `*[T]`.
-    ///
-    /// Needed because LLVM loses pointer->pointee association
-    /// when we ptrcast, and we have to ptrcast during codegen
-    /// of a `[T]` const because we form a slice, a `(*T,usize)` pair, not
-    /// a pointer to an LLVM array type. Similar for trait objects.
-    pub const_unsized: RefCell<FxHashMap<&'ll Value, &'ll Value>>,
+    pub const_str_cache: RefCell<FxHashMap<String, &'ll Value>>,
 
     /// Cache of emitted const globals (value -> global)
     pub const_globals: RefCell<FxHashMap<&'ll Value, &'ll Value>>,
@@ -94,7 +87,7 @@ pub struct CodegenCx<'ll, 'tcx> {
     pub isize_ty: &'ll Type,
 
     pub coverage_cx: Option<coverageinfo::CrateCoverageContext<'ll, 'tcx>>,
-    pub dbg_cx: Option<debuginfo::CrateDebugContext<'ll, 'tcx>>,
+    pub dbg_cx: Option<debuginfo::CodegenUnitDebugContext<'ll, 'tcx>>,
 
     eh_personality: Cell<Option<&'ll Value>>,
     eh_catch_typeinfo: Cell<Option<&'ll Value>>,
@@ -104,6 +97,12 @@ pub struct CodegenCx<'ll, 'tcx> {
 
     /// A counter that is used for generating local symbol names
     local_gen_sym_counter: Cell<usize>,
+
+    /// `codegen_static` will sometimes create a second global variable with a
+    /// different type and clear the symbol name of the original global.
+    /// `global_asm!` needs to be able to find this new global so that it can
+    /// compute the correct mangled symbol name to insert into the asm.
+    pub renamed_statics: RefCell<FxHashMap<DefId, &'ll Value>>,
 }
 
 pub struct TypeLowering<'ll> {
@@ -124,7 +123,7 @@ fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
     }
 }
 
-pub unsafe fn create_module(
+pub unsafe fn create_module<'ll>(
     tcx: TyCtxt<'_>,
     llcx: &'ll llvm::Context,
     mod_name: &str,
@@ -133,24 +132,25 @@ pub unsafe fn create_module(
     let mod_name = SmallCStr::new(mod_name);
     let llmod = llvm::LLVMModuleCreateWithNameInContext(mod_name.as_ptr(), llcx);
 
-    let mut target_data_layout = sess.target.data_layout.clone();
-    if llvm_util::get_version() < (13, 0, 0) {
-        if sess.target.arch == "powerpc64" {
-            target_data_layout = target_data_layout.replace("-S128", "");
-        }
-        if sess.target.arch == "wasm32" {
-            target_data_layout = "e-m:e-p:32:32-i64:64-n32:64-S128".to_string();
-        }
-        if sess.target.arch == "wasm64" {
-            target_data_layout = "e-m:e-p:64:64-i64:64-n32:64-S128".to_string();
+    let mut target_data_layout = sess.target.data_layout.to_string();
+    let llvm_version = llvm_util::get_version();
+    if llvm_version < (17, 0, 0) {
+        if sess.target.arch.starts_with("powerpc") {
+            // LLVM 17 specifies function pointer alignment for ppc:
+            // https://reviews.llvm.org/D147016
+            target_data_layout = target_data_layout
+                .replace("-Fn32", "")
+                .replace("-Fi32", "")
+                .replace("-Fn64", "")
+                .replace("-Fi64", "");
         }
     }
 
     // Ensure the data-layout values hardcoded remain the defaults.
     if sess.target.is_builtin {
+        // tm is disposed by its drop impl
         let tm = crate::back::write::create_informational_target_machine(tcx.sess);
-        llvm::LLVMRustSetDataLayoutFromTargetMachine(llmod, tm);
-        llvm::LLVMRustDisposeTargetMachine(tm);
+        llvm::LLVMRustSetDataLayoutFromTargetMachine(llmod, &tm);
 
         let llvm_data_layout = llvm::LLVMGetDataLayoutStr(llmod);
         let llvm_data_layout = str::from_utf8(CStr::from_ptr(llvm_data_layout).to_bytes())
@@ -172,7 +172,7 @@ pub unsafe fn create_module(
         //
         // FIXME(#34960)
         let cfg_llvm_root = option_env!("CFG_LLVM_ROOT").unwrap_or("");
-        let custom_llvm_used = cfg_llvm_root.trim() != "";
+        let custom_llvm_used = !cfg_llvm_root.trim().is_empty();
 
         if !custom_llvm_used && target_data_layout != llvm_data_layout {
             bug!(
@@ -198,7 +198,7 @@ pub unsafe fn create_module(
         // PIE is potentially more effective than PIC, but can only be used in executables.
         // If all our outputs are executables, then we can relax PIC to PIE.
         if reloc_model == RelocModel::Pie
-            || sess.crate_types().iter().all(|ty| *ty == CrateType::Executable)
+            || tcx.crate_types().iter().all(|ty| *ty == CrateType::Executable)
         {
             llvm::LLVMRustSetModulePIELevel(llmod);
         }
@@ -215,16 +215,35 @@ pub unsafe fn create_module(
     // to ensure intrinsic calls don't use it.
     if !sess.needs_plt() {
         let avoid_plt = "RtLibUseGOT\0".as_ptr().cast();
-        llvm::LLVMRustAddModuleFlag(llmod, avoid_plt, 1);
+        llvm::LLVMRustAddModuleFlag(llmod, llvm::LLVMModFlagBehavior::Warning, avoid_plt, 1);
     }
 
-    if sess.is_sanitizer_cfi_enabled() {
-        // FIXME(rcvalle): Add support for non canonical jump tables.
+    // Enable canonical jump tables if CFI is enabled. (See https://reviews.llvm.org/D65629.)
+    if sess.is_sanitizer_cfi_canonical_jump_tables_enabled() && sess.is_sanitizer_cfi_enabled() {
         let canonical_jump_tables = "CFI Canonical Jump Tables\0".as_ptr().cast();
-        // FIXME(rcvalle): Add it with Override behavior flag--LLVMRustAddModuleFlag adds it with
-        // Warning behavior flag. Add support for specifying the behavior flag to
-        // LLVMRustAddModuleFlag.
-        llvm::LLVMRustAddModuleFlag(llmod, canonical_jump_tables, 1);
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Override,
+            canonical_jump_tables,
+            1,
+        );
+    }
+
+    // Enable LTO unit splitting if specified or if CFI is enabled. (See https://reviews.llvm.org/D53891.)
+    if sess.is_split_lto_unit_enabled() || sess.is_sanitizer_cfi_enabled() {
+        let enable_split_lto_unit = "EnableSplitLTOUnit\0".as_ptr().cast();
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Override,
+            enable_split_lto_unit,
+            1,
+        );
+    }
+
+    // Add "kcfi" module flag if KCFI is enabled. (See https://reviews.llvm.org/D119296.)
+    if sess.is_sanitizer_kcfi_enabled() {
+        let kcfi = "kcfi\0".as_ptr().cast();
+        llvm::LLVMRustAddModuleFlag(llmod, llvm::LLVMModFlagBehavior::Override, kcfi, 1);
     }
 
     // Control Flow Guard is currently only supported by the MSVC linker on Windows.
@@ -233,20 +252,143 @@ pub unsafe fn create_module(
             CFGuard::Disabled => {}
             CFGuard::NoChecks => {
                 // Set `cfguard=1` module flag to emit metadata only.
-                llvm::LLVMRustAddModuleFlag(llmod, "cfguard\0".as_ptr() as *const _, 1)
+                llvm::LLVMRustAddModuleFlag(
+                    llmod,
+                    llvm::LLVMModFlagBehavior::Warning,
+                    "cfguard\0".as_ptr() as *const _,
+                    1,
+                )
             }
             CFGuard::Checks => {
                 // Set `cfguard=2` module flag to emit metadata and checks.
-                llvm::LLVMRustAddModuleFlag(llmod, "cfguard\0".as_ptr() as *const _, 2)
+                llvm::LLVMRustAddModuleFlag(
+                    llmod,
+                    llvm::LLVMModFlagBehavior::Warning,
+                    "cfguard\0".as_ptr() as *const _,
+                    2,
+                )
             }
         }
+    }
+
+    if let Some(BranchProtection { bti, pac_ret }) = sess.opts.unstable_opts.branch_protection {
+        let behavior = if llvm_version >= (15, 0, 0) {
+            llvm::LLVMModFlagBehavior::Min
+        } else {
+            llvm::LLVMModFlagBehavior::Error
+        };
+
+        if sess.target.arch == "aarch64" {
+            llvm::LLVMRustAddModuleFlag(
+                llmod,
+                behavior,
+                "branch-target-enforcement\0".as_ptr().cast(),
+                bti.into(),
+            );
+            llvm::LLVMRustAddModuleFlag(
+                llmod,
+                behavior,
+                "sign-return-address\0".as_ptr().cast(),
+                pac_ret.is_some().into(),
+            );
+            let pac_opts = pac_ret.unwrap_or(PacRet { leaf: false, key: PAuthKey::A });
+            llvm::LLVMRustAddModuleFlag(
+                llmod,
+                behavior,
+                "sign-return-address-all\0".as_ptr().cast(),
+                pac_opts.leaf.into(),
+            );
+            llvm::LLVMRustAddModuleFlag(
+                llmod,
+                behavior,
+                "sign-return-address-with-bkey\0".as_ptr().cast(),
+                u32::from(pac_opts.key == PAuthKey::B),
+            );
+        } else {
+            bug!(
+                "branch-protection used on non-AArch64 target; \
+                  this should be checked in rustc_session."
+            );
+        }
+    }
+
+    // Pass on the control-flow protection flags to LLVM (equivalent to `-fcf-protection` in Clang).
+    if let CFProtection::Branch | CFProtection::Full = sess.opts.unstable_opts.cf_protection {
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Override,
+            "cf-protection-branch\0".as_ptr().cast(),
+            1,
+        )
+    }
+    if let CFProtection::Return | CFProtection::Full = sess.opts.unstable_opts.cf_protection {
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Override,
+            "cf-protection-return\0".as_ptr().cast(),
+            1,
+        )
+    }
+
+    if sess.opts.unstable_opts.virtual_function_elimination {
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Error,
+            "Virtual Function Elim\0".as_ptr().cast(),
+            1,
+        );
+    }
+
+    // Set module flag to enable Windows EHCont Guard (/guard:ehcont).
+    if sess.opts.unstable_opts.ehcont_guard {
+        llvm::LLVMRustAddModuleFlag(
+            llmod,
+            llvm::LLVMModFlagBehavior::Warning,
+            "ehcontguard\0".as_ptr() as *const _,
+            1,
+        )
+    }
+
+    // Insert `llvm.ident` metadata.
+    //
+    // On the wasm targets it will get hooked up to the "producer" sections
+    // `processed-by` information.
+    let rustc_producer =
+        format!("rustc version {}", option_env!("CFG_VERSION").expect("CFG_VERSION"));
+    let name_metadata = llvm::LLVMMDStringInContext(
+        llcx,
+        rustc_producer.as_ptr().cast(),
+        rustc_producer.as_bytes().len() as c_uint,
+    );
+    llvm::LLVMAddNamedMetadataOperand(
+        llmod,
+        cstr!("llvm.ident").as_ptr(),
+        llvm::LLVMMDNodeInContext(llcx, &name_metadata, 1),
+    );
+
+    // Add module flags specified via -Z llvm_module_flag
+    for (key, value, behavior) in &sess.opts.unstable_opts.llvm_module_flag {
+        let key = format!("{key}\0");
+        let behavior = match behavior.as_str() {
+            "error" => llvm::LLVMModFlagBehavior::Error,
+            "warning" => llvm::LLVMModFlagBehavior::Warning,
+            "require" => llvm::LLVMModFlagBehavior::Require,
+            "override" => llvm::LLVMModFlagBehavior::Override,
+            "append" => llvm::LLVMModFlagBehavior::Append,
+            "appendunique" => llvm::LLVMModFlagBehavior::AppendUnique,
+            "max" => llvm::LLVMModFlagBehavior::Max,
+            "min" => llvm::LLVMModFlagBehavior::Min,
+            // We already checked this during option parsing
+            _ => unreachable!(),
+        };
+        llvm::LLVMRustAddModuleFlag(llmod, behavior, key.as_ptr().cast(), *value)
     }
 
     llmod
 }
 
 impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
-    crate fn new(
+    pub(crate) fn new(
         tcx: TyCtxt<'tcx>,
         codegen_unit: &'tcx CodegenUnit<'tcx>,
         llvm_module: &'ll crate::ModuleLlvm,
@@ -283,7 +425,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         //   feasible. The compiler may be able to get around this, but it may
         //   involve some invasive changes to deal with this.
         //
-        // The flipside of this situation is that whenever you link to a dll and
+        // The flip side of this situation is that whenever you link to a dll and
         // you import a function from it, the import should be tagged with
         // `dllimport`. At this time, however, the compiler does not emit
         // `dllimport` for any declarations other than constants (where it is
@@ -311,16 +453,16 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
 
         let (llcx, llmod) = (&*llvm_module.llcx, llvm_module.llmod());
 
-        let coverage_cx = if tcx.sess.instrument_coverage() {
-            let covctx = coverageinfo::CrateCoverageContext::new();
-            Some(covctx)
-        } else {
-            None
-        };
+        let coverage_cx =
+            tcx.sess.instrument_coverage().then(coverageinfo::CrateCoverageContext::new);
 
         let dbg_cx = if tcx.sess.opts.debuginfo != DebugInfo::None {
-            let dctx = debuginfo::CrateDebugContext::new(llmod);
-            debuginfo::metadata::compile_unit_metadata(tcx, &codegen_unit.name().as_str(), &dctx);
+            let dctx = debuginfo::CodegenUnitDebugContext::new(llmod);
+            debuginfo::metadata::build_compile_unit_di_node(
+                tcx,
+                codegen_unit.name().as_str(),
+                &dctx,
+            );
             Some(dctx)
         } else {
             None
@@ -338,8 +480,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             codegen_unit,
             instances: Default::default(),
             vtables: Default::default(),
-            const_cstr_cache: Default::default(),
-            const_unsized: Default::default(),
+            const_str_cache: Default::default(),
             const_globals: Default::default(),
             statics_to_rauw: RefCell::new(Vec::new()),
             used_statics: RefCell::new(Vec::new()),
@@ -355,21 +496,22 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             rust_try_fn: Cell::new(None),
             intrinsics: Default::default(),
             local_gen_sym_counter: Cell::new(0),
+            renamed_statics: Default::default(),
         }
     }
 
-    crate fn statics_to_rauw(&self) -> &RefCell<Vec<(&'ll Value, &'ll Value)>> {
+    pub(crate) fn statics_to_rauw(&self) -> &RefCell<Vec<(&'ll Value, &'ll Value)>> {
         &self.statics_to_rauw
     }
 
     #[inline]
-    pub fn coverage_context(&'a self) -> Option<&'a coverageinfo::CrateCoverageContext<'ll, 'tcx>> {
+    pub fn coverage_context(&self) -> Option<&coverageinfo::CrateCoverageContext<'ll, 'tcx>> {
         self.coverage_cx.as_ref()
     }
 
-    fn create_used_variable_impl(&self, name: &'static CStr, values: &[&'ll Value]) {
+    pub(crate) fn create_used_variable_impl(&self, name: &'static CStr, values: &[&'ll Value]) {
         let section = cstr!("llvm.metadata");
-        let array = self.const_array(self.type_ptr_to(self.type_i8()), values);
+        let array = self.const_array(self.type_ptr(), values);
 
         unsafe {
             let g = llvm::LLVMAddGlobal(self.llmod, self.val_ty(array), name.as_ptr());
@@ -380,7 +522,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     }
 }
 
-impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'ll, 'tcx> MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn vtables(
         &self,
     ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), &'ll Value>>
@@ -420,30 +562,35 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         if let Some(llpersonality) = self.eh_personality.get() {
             return llpersonality;
         }
+
+        let name = if wants_msvc_seh(self.sess()) {
+            Some("__CxxFrameHandler3")
+        } else if wants_wasm_eh(self.sess()) {
+            // LLVM specifically tests for the name of the personality function
+            // There is no need for this function to exist anywhere, it will
+            // not be called. However, its name has to be "__gxx_wasm_personality_v0"
+            // for native wasm exceptions.
+            Some("__gxx_wasm_personality_v0")
+        } else {
+            None
+        };
+
         let tcx = self.tcx;
         let llfn = match tcx.lang_items().eh_personality() {
-            Some(def_id) if !wants_msvc_seh(self.sess()) => self.get_fn_addr(
-                ty::Instance::resolve(
-                    tcx,
-                    ty::ParamEnv::reveal_all(),
-                    def_id,
-                    tcx.intern_substs(&[]),
-                )
-                .unwrap()
-                .unwrap(),
+            Some(def_id) if name.is_none() => self.get_fn_addr(
+                ty::Instance::resolve(tcx, ty::ParamEnv::reveal_all(), def_id, ty::List::empty())
+                    .unwrap()
+                    .unwrap(),
             ),
             _ => {
-                let name = if wants_msvc_seh(self.sess()) {
-                    "__CxxFrameHandler3"
-                } else {
-                    "rust_eh_personality"
-                };
+                let name = name.unwrap_or("rust_eh_personality");
                 if let Some(llfn) = self.get_declared_value(name) {
                     llfn
                 } else {
                     let fty = self.type_variadic_func(&[], self.type_i32());
                     let llfn = self.declare_cfn(name, llvm::UnnamedAddr::Global, fty);
-                    attributes::apply_target_cpu_attr(self, llfn);
+                    let target_cpu = attributes::target_cpu_attr(self);
+                    attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[target_cpu]);
                     llfn
                 }
             }
@@ -464,37 +611,28 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         self.codegen_unit
     }
 
-    fn used_statics(&self) -> &RefCell<Vec<&'ll Value>> {
-        &self.used_statics
-    }
-
-    fn compiler_used_statics(&self) -> &RefCell<Vec<&'ll Value>> {
-        &self.compiler_used_statics
-    }
-
     fn set_frame_pointer_type(&self, llfn: &'ll Value) {
-        attributes::set_frame_pointer_type(self, llfn)
+        if let Some(attr) = attributes::frame_pointer_type_attr(self) {
+            attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[attr]);
+        }
     }
 
     fn apply_target_cpu_attr(&self, llfn: &'ll Value) {
-        attributes::apply_target_cpu_attr(self, llfn);
-        attributes::apply_tune_cpu_attr(self, llfn);
-    }
-
-    fn create_used_variable(&self) {
-        self.create_used_variable_impl(cstr!("llvm.used"), &*self.used_statics.borrow());
-    }
-
-    fn create_compiler_used_variable(&self) {
-        self.create_used_variable_impl(
-            cstr!("llvm.compiler.used"),
-            &*self.compiler_used_statics.borrow(),
-        );
+        let mut attrs = SmallVec::<[_; 2]>::new();
+        attrs.push(attributes::target_cpu_attr(self));
+        attrs.extend(attributes::tune_cpu_attr(self));
+        attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
     }
 
     fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function> {
-        if self.get_declared_value("main").is_none() {
-            Some(self.declare_cfn("main", llvm::UnnamedAddr::Global, fn_type))
+        let entry_name = self.sess().target.entry_name.as_ref();
+        if self.get_declared_value(entry_name).is_none() {
+            Some(self.declare_entry_fn(
+                entry_name,
+                self.sess().target.entry_abi.into(),
+                llvm::UnnamedAddr::Global,
+                fn_type,
+            ))
         } else {
             // If the symbol already exists, it is an error: for example, the user wrote
             // #[no_mangle] extern "C" fn main(..) {..}
@@ -504,8 +642,8 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 }
 
-impl CodegenCx<'b, 'tcx> {
-    crate fn get_intrinsic(&self, key: &str) -> (&'b Type, &'b Value) {
+impl<'ll> CodegenCx<'ll, '_> {
+    pub(crate) fn get_intrinsic(&self, key: &str) -> (&'ll Type, &'ll Value) {
         if let Some(v) = self.intrinsics.borrow().get(key).cloned() {
             return v;
         }
@@ -516,9 +654,9 @@ impl CodegenCx<'b, 'tcx> {
     fn insert_intrinsic(
         &self,
         name: &'static str,
-        args: Option<&[&'b llvm::Type]>,
-        ret: &'b llvm::Type,
-    ) -> (&'b llvm::Type, &'b llvm::Value) {
+        args: Option<&[&'ll llvm::Type]>,
+        ret: &'ll llvm::Type,
+    ) -> (&'ll llvm::Type, &'ll llvm::Value) {
         let fn_ty = if let Some(args) = args {
             self.type_func(args, ret)
         } else {
@@ -529,7 +667,7 @@ impl CodegenCx<'b, 'tcx> {
         (fn_ty, f)
     }
 
-    fn declare_intrinsic(&self, key: &str) -> Option<(&'b Type, &'b Value)> {
+    fn declare_intrinsic(&self, key: &str) -> Option<(&'ll Type, &'ll Value)> {
         macro_rules! ifn {
             ($name:expr, fn() -> $ret:expr) => (
                 if key == $name {
@@ -551,7 +689,7 @@ impl CodegenCx<'b, 'tcx> {
             ($($field_ty:expr),*) => (self.type_struct( &[$($field_ty),*], false))
         }
 
-        let i8p = self.type_i8p();
+        let ptr = self.type_ptr();
         let void = self.type_void();
         let i1 = self.type_i1();
         let t_i8 = self.type_i8();
@@ -562,6 +700,11 @@ impl CodegenCx<'b, 'tcx> {
         let t_isize = self.type_isize();
         let t_f32 = self.type_f32();
         let t_f64 = self.type_f64();
+        let t_metadata = self.type_metadata();
+        let t_token = self.type_token();
+
+        ifn!("llvm.wasm.get.exception", fn(t_token) -> ptr);
+        ifn!("llvm.wasm.get.ehselector", fn(t_token) -> t_i32);
 
         ifn!("llvm.wasm.trunc.unsigned.i32.f32", fn(t_f32) -> t_i32);
         ifn!("llvm.wasm.trunc.unsigned.i32.f64", fn(t_f64) -> t_i32);
@@ -596,7 +739,7 @@ impl CodegenCx<'b, 'tcx> {
 
         ifn!("llvm.trap", fn() -> void);
         ifn!("llvm.debugtrap", fn() -> void);
-        ifn!("llvm.frameaddress", fn(t_i32) -> i8p);
+        ifn!("llvm.frameaddress", fn(t_i32) -> ptr);
 
         ifn!("llvm.powi.f32", fn(t_f32, t_i32) -> t_f32);
         ifn!("llvm.powi.f64", fn(t_f64, t_i32) -> t_f64);
@@ -650,8 +793,12 @@ impl CodegenCx<'b, 'tcx> {
 
         ifn!("llvm.copysign.f32", fn(t_f32, t_f32) -> t_f32);
         ifn!("llvm.copysign.f64", fn(t_f64, t_f64) -> t_f64);
+
         ifn!("llvm.round.f32", fn(t_f32) -> t_f32);
         ifn!("llvm.round.f64", fn(t_f64) -> t_f64);
+
+        ifn!("llvm.roundeven.f32", fn(t_f32) -> t_f32);
+        ifn!("llvm.roundeven.f64", fn(t_f64) -> t_f64);
 
         ifn!("llvm.rint.f32", fn(t_f32) -> t_f32);
         ifn!("llvm.rint.f64", fn(t_f64) -> t_f64);
@@ -759,61 +906,67 @@ impl CodegenCx<'b, 'tcx> {
         ifn!("llvm.usub.sat.i64", fn(t_i64, t_i64) -> t_i64);
         ifn!("llvm.usub.sat.i128", fn(t_i128, t_i128) -> t_i128);
 
-        ifn!("llvm.lifetime.start.p0i8", fn(t_i64, i8p) -> void);
-        ifn!("llvm.lifetime.end.p0i8", fn(t_i64, i8p) -> void);
+        ifn!("llvm.lifetime.start.p0i8", fn(t_i64, ptr) -> void);
+        ifn!("llvm.lifetime.end.p0i8", fn(t_i64, ptr) -> void);
 
         ifn!("llvm.expect.i1", fn(i1, i1) -> i1);
-        ifn!("llvm.eh.typeid.for", fn(i8p) -> t_i32);
+        ifn!("llvm.eh.typeid.for", fn(ptr) -> t_i32);
         ifn!("llvm.localescape", fn(...) -> void);
-        ifn!("llvm.localrecover", fn(i8p, i8p, t_i32) -> i8p);
-        ifn!("llvm.x86.seh.recoverfp", fn(i8p, i8p) -> i8p);
+        ifn!("llvm.localrecover", fn(ptr, ptr, t_i32) -> ptr);
+        ifn!("llvm.x86.seh.recoverfp", fn(ptr, ptr) -> ptr);
 
         ifn!("llvm.assume", fn(i1) -> void);
-        ifn!("llvm.prefetch", fn(i8p, t_i32, t_i32, t_i32) -> void);
+        ifn!("llvm.prefetch", fn(ptr, t_i32, t_i32, t_i32) -> void);
 
         // This isn't an "LLVM intrinsic", but LLVM's optimization passes
-        // recognize it like one and we assume it exists in `core::slice::cmp`
-        ifn!("memcmp", fn(i8p, i8p, t_isize) -> t_i32);
+        // recognize it like one (including turning it into `bcmp` sometimes)
+        // and we use it to implement intrinsics like `raw_eq` and `compare_bytes`
+        match self.sess().target.arch.as_ref() {
+            "avr" | "msp430" => ifn!("memcmp", fn(ptr, ptr, t_isize) -> t_i16),
+            _ => ifn!("memcmp", fn(ptr, ptr, t_isize) -> t_i32),
+        }
 
         // variadic intrinsics
-        ifn!("llvm.va_start", fn(i8p) -> void);
-        ifn!("llvm.va_end", fn(i8p) -> void);
-        ifn!("llvm.va_copy", fn(i8p, i8p) -> void);
+        ifn!("llvm.va_start", fn(ptr) -> void);
+        ifn!("llvm.va_end", fn(ptr) -> void);
+        ifn!("llvm.va_copy", fn(ptr, ptr) -> void);
 
         if self.sess().instrument_coverage() {
-            ifn!("llvm.instrprof.increment", fn(i8p, t_i64, t_i32, t_i32) -> void);
+            ifn!("llvm.instrprof.increment", fn(ptr, t_i64, t_i32, t_i32) -> void);
         }
 
-        ifn!("llvm.type.test", fn(i8p, self.type_metadata()) -> i1);
+        ifn!("llvm.type.test", fn(ptr, t_metadata) -> i1);
+        ifn!("llvm.type.checked.load", fn(ptr, t_i32, t_metadata) -> mk_struct! {ptr, i1});
 
         if self.sess().opts.debuginfo != DebugInfo::None {
-            ifn!("llvm.dbg.declare", fn(self.type_metadata(), self.type_metadata()) -> void);
-            ifn!("llvm.dbg.value", fn(self.type_metadata(), t_i64, self.type_metadata()) -> void);
+            ifn!("llvm.dbg.declare", fn(t_metadata, t_metadata) -> void);
+            ifn!("llvm.dbg.value", fn(t_metadata, t_i64, t_metadata) -> void);
         }
+
+        ifn!("llvm.ptrmask", fn(ptr, t_isize) -> ptr);
+
         None
     }
 
-    crate fn eh_catch_typeinfo(&self) -> &'b Value {
+    pub(crate) fn eh_catch_typeinfo(&self) -> &'ll Value {
         if let Some(eh_catch_typeinfo) = self.eh_catch_typeinfo.get() {
             return eh_catch_typeinfo;
         }
         let tcx = self.tcx;
-        assert!(self.sess().target.is_like_emscripten);
+        assert!(self.sess().target.os == "emscripten");
         let eh_catch_typeinfo = match tcx.lang_items().eh_catch_typeinfo() {
             Some(def_id) => self.get_static(def_id),
             _ => {
-                let ty = self
-                    .type_struct(&[self.type_ptr_to(self.type_isize()), self.type_i8p()], false);
+                let ty = self.type_struct(&[self.type_ptr(), self.type_ptr()], false);
                 self.declare_global("rust_eh_catch_typeinfo", ty)
             }
         };
-        let eh_catch_typeinfo = self.const_bitcast(eh_catch_typeinfo, self.type_i8p());
         self.eh_catch_typeinfo.set(Some(eh_catch_typeinfo));
         eh_catch_typeinfo
     }
 }
 
-impl<'b, 'tcx> CodegenCx<'b, 'tcx> {
+impl CodegenCx<'_, '_> {
     /// Generates a new symbol name with the given prefix. This symbol name must
     /// only be used for definitions with `internal` or `private` linkage.
     pub fn generate_local_symbol_name(&self, prefix: &str) -> String {
@@ -829,21 +982,21 @@ impl<'b, 'tcx> CodegenCx<'b, 'tcx> {
     }
 }
 
-impl HasDataLayout for CodegenCx<'ll, 'tcx> {
+impl HasDataLayout for CodegenCx<'_, '_> {
     #[inline]
     fn data_layout(&self) -> &TargetDataLayout {
         &self.tcx.data_layout
     }
 }
 
-impl HasTargetSpec for CodegenCx<'ll, 'tcx> {
+impl HasTargetSpec for CodegenCx<'_, '_> {
     #[inline]
     fn target_spec(&self) -> &Target {
         &self.tcx.sess.target
     }
 }
 
-impl ty::layout::HasTyCtxt<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'tcx> ty::layout::HasTyCtxt<'tcx> for CodegenCx<'_, 'tcx> {
     #[inline]
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
@@ -856,20 +1009,20 @@ impl<'tcx, 'll> HasParamEnv<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 }
 
-impl LayoutOfHelpers<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'_, 'tcx> {
     type LayoutOfResult = TyAndLayout<'tcx>;
 
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        if let LayoutError::SizeOverflow(_) = err {
-            self.sess().span_fatal(span, &err.to_string())
+        if let LayoutError::SizeOverflow(_) | LayoutError::ReferencesError(_) = err {
+            self.sess().emit_fatal(Spanned { span, node: err.into_diagnostic() })
         } else {
-            span_bug!(span, "failed to get layout for `{}`: {}", ty, err)
+            self.tcx.sess.emit_fatal(ssa_errors::FailedToGetLayout { span, ty, err })
         }
     }
 }
 
-impl FnAbiOfHelpers<'tcx> for CodegenCx<'ll, 'tcx> {
+impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'_, 'tcx> {
     type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
 
     #[inline]
@@ -880,25 +1033,16 @@ impl FnAbiOfHelpers<'tcx> for CodegenCx<'ll, 'tcx> {
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> ! {
         if let FnAbiError::Layout(LayoutError::SizeOverflow(_)) = err {
-            self.sess().span_fatal(span, &err.to_string())
+            self.sess().emit_fatal(Spanned { span, node: err })
         } else {
             match fn_abi_request {
                 FnAbiRequest::OfFnPtr { sig, extra_args } => {
-                    span_bug!(
-                        span,
-                        "`fn_abi_of_fn_ptr({}, {:?})` failed: {}",
-                        sig,
-                        extra_args,
-                        err
-                    );
+                    span_bug!(span, "`fn_abi_of_fn_ptr({sig}, {extra_args:?})` failed: {err:?}",);
                 }
                 FnAbiRequest::OfInstance { instance, extra_args } => {
                     span_bug!(
                         span,
-                        "`fn_abi_of_instance({}, {:?})` failed: {}",
-                        instance,
-                        extra_args,
-                        err
+                        "`fn_abi_of_instance({instance}, {extra_args:?})` failed: {err:?}",
                     );
                 }
             }

@@ -297,9 +297,9 @@ where
         } else {
             inner_item.as_ref()
         };
-        let mut item_last_line_width = item_last_line.len() + item_sep_len;
+        let mut item_last_line_width = unicode_str_width(item_last_line) + item_sep_len;
         if item_last_line.starts_with(&**indent_str) {
-            item_last_line_width -= indent_str.len();
+            item_last_line_width -= unicode_str_width(indent_str);
         }
 
         if !item.is_substantial() {
@@ -444,10 +444,13 @@ where
                 let offset = formatting.shape.indent + overhead;
                 let comment_shape = Shape::legacy(width, offset);
 
-                // Use block-style only for the last item or multiline comments.
-                let block_style = !formatting.ends_with_newline && last
-                    || comment.trim().contains('\n')
-                    || comment.trim().len() > width;
+                let block_style = if !formatting.ends_with_newline && last {
+                    true
+                } else if starts_with_newline(comment) {
+                    false
+                } else {
+                    comment.trim().contains('\n') || unicode_str_width(comment.trim()) > width
+                };
 
                 rewrite_comment(
                     comment.trim_start(),
@@ -462,7 +465,7 @@ where
             if !starts_with_newline(comment) {
                 if formatting.align_comments {
                     let mut comment_alignment =
-                        post_comment_alignment(item_max_width, inner_item.len());
+                        post_comment_alignment(item_max_width, unicode_str_width(inner_item));
                     if first_line_width(&formatted_comment)
                         + last_line_width(&result)
                         + comment_alignment
@@ -472,7 +475,7 @@ where
                         item_max_width = None;
                         formatted_comment = rewrite_post_comment(&mut item_max_width)?;
                         comment_alignment =
-                            post_comment_alignment(item_max_width, inner_item.len());
+                            post_comment_alignment(item_max_width, unicode_str_width(inner_item));
                     }
                     for _ in 0..=comment_alignment {
                         result.push(' ');
@@ -530,7 +533,7 @@ where
     let mut first = true;
     for item in items.clone().into_iter().skip(i) {
         let item = item.as_ref();
-        let inner_item_width = item.inner_as_ref().len();
+        let inner_item_width = unicode_str_width(item.inner_as_ref());
         if !first
             && (item.is_different_group()
                 || item.post_comment.is_none()
@@ -549,8 +552,8 @@ where
     max_width
 }
 
-fn post_comment_alignment(item_max_width: Option<usize>, inner_item_len: usize) -> usize {
-    item_max_width.unwrap_or(0).saturating_sub(inner_item_len)
+fn post_comment_alignment(item_max_width: Option<usize>, inner_item_width: usize) -> usize {
+    item_max_width.unwrap_or(0).saturating_sub(inner_item_width)
 }
 
 pub(crate) struct ListItems<'a, I, F1, F2, F3>
@@ -572,7 +575,7 @@ where
 pub(crate) fn extract_pre_comment(pre_snippet: &str) -> (Option<String>, ListItemCommentStyle) {
     let trimmed_pre_snippet = pre_snippet.trim();
     // Both start and end are checked to support keeping a block comment inline with
-    // the item, even if there are preceeding line comments, while still supporting
+    // the item, even if there are preceding line comments, while still supporting
     // a snippet that starts with a block comment but also contains one or more
     // trailing single line comments.
     // https://github.com/rust-lang/rustfmt/issues/3025
@@ -608,18 +611,33 @@ pub(crate) fn extract_post_comment(
     post_snippet: &str,
     comment_end: usize,
     separator: &str,
+    is_last: bool,
 ) -> Option<String> {
     let white_space: &[_] = &[' ', '\t'];
 
     // Cleanup post-comment: strip separators and whitespace.
     let post_snippet = post_snippet[..comment_end].trim();
+
+    let last_inline_comment_ends_with_separator = if is_last {
+        if let Some(line) = post_snippet.lines().last() {
+            line.ends_with(separator) && line.trim().starts_with("//")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     let post_snippet_trimmed = if post_snippet.starts_with(|c| c == ',' || c == ':') {
         post_snippet[1..].trim_matches(white_space)
     } else if let Some(stripped) = post_snippet.strip_prefix(separator) {
         stripped.trim_matches(white_space)
+    } else if last_inline_comment_ends_with_separator {
+        // since we're on the last item it's fine to keep any trailing separators in comments
+        post_snippet.trim_matches(white_space)
     }
     // not comment or over two lines
-    else if post_snippet.ends_with(',')
+    else if post_snippet.ends_with(separator)
         && (!post_snippet.trim().starts_with("//") || post_snippet.trim().contains('\n'))
     {
         post_snippet[..(post_snippet.len() - 1)].trim_matches(white_space)
@@ -745,14 +763,12 @@ where
                 .snippet_provider
                 .span_to_snippet(mk_sp((self.get_hi)(&item), next_start))
                 .unwrap_or("");
-            let comment_end = get_comment_end(
-                post_snippet,
-                self.separator,
-                self.terminator,
-                self.inner.peek().is_none(),
-            );
+            let is_last = self.inner.peek().is_none();
+            let comment_end =
+                get_comment_end(post_snippet, self.separator, self.terminator, is_last);
             let new_lines = has_extra_newline(post_snippet, comment_end);
-            let post_comment = extract_post_comment(post_snippet, comment_end, self.separator);
+            let post_comment =
+                extract_post_comment(post_snippet, comment_end, self.separator, is_last);
 
             self.prev_span_end = (self.get_hi)(&item) + BytePos(comment_end as u32);
 

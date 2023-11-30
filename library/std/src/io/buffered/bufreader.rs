@@ -1,8 +1,11 @@
-use crate::cmp;
+mod buffer;
+
 use crate::fmt;
 use crate::io::{
-    self, BufRead, Initializer, IoSliceMut, Read, Seek, SeekFrom, SizeHint, DEFAULT_BUF_SIZE,
+    self, uninlined_slow_read_byte, BorrowedCursor, BufRead, IoSliceMut, Read, Seek, SeekFrom,
+    SizeHint, SpecReadByte, DEFAULT_BUF_SIZE,
 };
+use buffer::Buffer;
 
 /// The `BufReader<R>` struct adds buffering to any reader.
 ///
@@ -40,20 +43,18 @@ use crate::io::{
 ///
 ///     let mut line = String::new();
 ///     let len = reader.read_line(&mut line)?;
-///     println!("First line is {} bytes long", len);
+///     println!("First line is {len} bytes long");
 ///     Ok(())
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct BufReader<R> {
+pub struct BufReader<R: ?Sized> {
+    buf: Buffer,
     inner: R,
-    buf: Box<[u8]>,
-    pos: usize,
-    cap: usize,
 }
 
 impl<R: Read> BufReader<R> {
-    /// Creates a new `BufReader<R>` with a default buffer capacity. The default is currently 8 KB,
+    /// Creates a new `BufReader<R>` with a default buffer capacity. The default is currently 8 KiB,
     /// but may change in the future.
     ///
     /// # Examples
@@ -91,15 +92,11 @@ impl<R: Read> BufReader<R> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(capacity: usize, inner: R) -> BufReader<R> {
-        unsafe {
-            let mut buf = Box::new_uninit_slice(capacity).assume_init();
-            inner.initializer().initialize(&mut buf);
-            BufReader { inner, buf, pos: 0, cap: 0 }
-        }
+        BufReader { inner, buf: Buffer::with_capacity(capacity) }
     }
 }
 
-impl<R> BufReader<R> {
+impl<R: ?Sized> BufReader<R> {
     /// Gets a reference to the underlying reader.
     ///
     /// It is inadvisable to directly read from the underlying reader.
@@ -171,7 +168,7 @@ impl<R> BufReader<R> {
     /// ```
     #[stable(feature = "bufreader_buffer", since = "1.37.0")]
     pub fn buffer(&self) -> &[u8] {
-        &self.buf[self.pos..self.cap]
+        self.buf.buffer()
     }
 
     /// Returns the number of bytes the internal buffer can hold at once.
@@ -194,7 +191,7 @@ impl<R> BufReader<R> {
     /// ```
     #[stable(feature = "buffered_io_capacity", since = "1.46.0")]
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.buf.capacity()
     }
 
     /// Unwraps this `BufReader<R>`, returning the underlying reader.
@@ -217,34 +214,44 @@ impl<R> BufReader<R> {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn into_inner(self) -> R {
+    pub fn into_inner(self) -> R
+    where
+        R: Sized,
+    {
         self.inner
     }
 
     /// Invalidates all data in the internal buffer.
     #[inline]
-    fn discard_buffer(&mut self) {
-        self.pos = 0;
-        self.cap = 0;
+    pub(in crate::io) fn discard_buffer(&mut self) {
+        self.buf.discard_buffer()
     }
 }
 
-impl<R: Seek> BufReader<R> {
+// This is only used by a test which asserts that the initialization-tracking is correct.
+#[cfg(test)]
+impl<R: ?Sized> BufReader<R> {
+    pub fn initialized(&self) -> usize {
+        self.buf.initialized()
+    }
+}
+
+impl<R: ?Sized + Seek> BufReader<R> {
     /// Seeks relative to the current position. If the new position lies within the buffer,
     /// the buffer will not be flushed, allowing for more efficient seeks.
     /// This method does not return the location of the underlying reader, so the caller
     /// must track this information themselves if it is required.
     #[stable(feature = "bufreader_seek_relative", since = "1.53.0")]
     pub fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
-        let pos = self.pos as u64;
+        let pos = self.buf.pos() as u64;
         if offset < 0 {
-            if let Some(new_pos) = pos.checked_sub((-offset) as u64) {
-                self.pos = new_pos as usize;
+            if let Some(_) = pos.checked_sub((-offset) as u64) {
+                self.buf.unconsume((-offset) as usize);
                 return Ok(());
             }
         } else if let Some(new_pos) = pos.checked_add(offset as u64) {
-            if new_pos <= self.cap as u64 {
-                self.pos = new_pos as usize;
+            if new_pos <= self.buf.filled() as u64 {
+                self.buf.consume(offset as usize);
                 return Ok(());
             }
         }
@@ -253,22 +260,55 @@ impl<R: Seek> BufReader<R> {
     }
 }
 
+impl<R> SpecReadByte for BufReader<R>
+where
+    Self: Read,
+{
+    #[inline]
+    fn spec_read_byte(&mut self) -> Option<io::Result<u8>> {
+        let mut byte = 0;
+        if self.buf.consume_with(1, |claimed| byte = claimed[0]) {
+            return Some(Ok(byte));
+        }
+
+        // Fallback case, only reached once per buffer refill.
+        uninlined_slow_read_byte(self)
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<R: Read> Read for BufReader<R> {
+impl<R: ?Sized + Read> Read for BufReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // If we don't have any buffered data and we're doing a massive read
         // (larger than our internal buffer), bypass our internal buffer
         // entirely.
-        if self.pos == self.cap && buf.len() >= self.buf.len() {
+        if self.buf.pos() == self.buf.filled() && buf.len() >= self.capacity() {
             self.discard_buffer();
             return self.inner.read(buf);
         }
-        let nread = {
-            let mut rem = self.fill_buf()?;
-            rem.read(buf)?
-        };
+        let mut rem = self.fill_buf()?;
+        let nread = rem.read(buf)?;
         self.consume(nread);
         Ok(nread)
+    }
+
+    fn read_buf(&mut self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        // If we don't have any buffered data and we're doing a massive read
+        // (larger than our internal buffer), bypass our internal buffer
+        // entirely.
+        if self.buf.pos() == self.buf.filled() && cursor.capacity() >= self.capacity() {
+            self.discard_buffer();
+            return self.inner.read_buf(cursor);
+        }
+
+        let prev = cursor.written();
+
+        let mut rem = self.fill_buf()?;
+        rem.read_buf(cursor.reborrow())?;
+
+        self.consume(cursor.written() - prev); //slice impl of read_buf known to never unfill buf
+
+        Ok(())
     }
 
     // Small read_exacts from a BufReader are extremely common when used with a deserializer.
@@ -276,9 +316,7 @@ impl<R: Read> Read for BufReader<R> {
     // generation for the common path where the buffer has enough bytes to fill the passed-in
     // buffer.
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        if self.buffer().len() >= buf.len() {
-            buf.copy_from_slice(&self.buffer()[..buf.len()]);
-            self.consume(buf.len());
+        if self.buf.consume_with(buf.len(), |claimed| buf.copy_from_slice(claimed)) {
             return Ok(());
         }
 
@@ -287,7 +325,7 @@ impl<R: Read> Read for BufReader<R> {
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        if self.pos == self.cap && total_len >= self.buf.len() {
+        if self.buf.pos() == self.buf.filled() && total_len >= self.capacity() {
             self.discard_buffer();
             return self.inner.read_vectored(bufs);
         }
@@ -303,16 +341,12 @@ impl<R: Read> Read for BufReader<R> {
         self.inner.is_read_vectored()
     }
 
-    // we can't skip unconditionally because of the large buffer case in read.
-    unsafe fn initializer(&self) -> Initializer {
-        self.inner.initializer()
-    }
-
     // The inner reader might have an optimized `read_to_end`. Drain our buffer and then
     // delegate to the inner implementation.
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        let nread = self.cap - self.pos;
-        buf.extend_from_slice(&self.buf[self.pos..self.cap]);
+        let inner_buf = self.buffer();
+        buf.extend_from_slice(inner_buf);
+        let nread = inner_buf.len();
         self.discard_buffer();
         Ok(nread + self.inner.read_to_end(buf)?)
     }
@@ -343,9 +377,9 @@ impl<R: Read> Read for BufReader<R> {
             let mut bytes = Vec::new();
             self.read_to_end(&mut bytes)?;
             let string = crate::str::from_utf8(&bytes).map_err(|_| {
-                io::Error::new_const(
+                io::const_io_error!(
                     io::ErrorKind::InvalidData,
-                    &"stream did not contain valid UTF-8",
+                    "stream did not contain valid UTF-8",
                 )
             })?;
             *buf += string;
@@ -355,40 +389,34 @@ impl<R: Read> Read for BufReader<R> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<R: Read> BufRead for BufReader<R> {
+impl<R: ?Sized + Read> BufRead for BufReader<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        // If we've reached the end of our internal buffer then we need to fetch
-        // some more data from the underlying reader.
-        // Branch using `>=` instead of the more correct `==`
-        // to tell the compiler that the pos..cap slice is always valid.
-        if self.pos >= self.cap {
-            debug_assert!(self.pos == self.cap);
-            self.cap = self.inner.read(&mut self.buf)?;
-            self.pos = 0;
-        }
-        Ok(&self.buf[self.pos..self.cap])
+        self.buf.fill_buf(&mut self.inner)
     }
 
     fn consume(&mut self, amt: usize) {
-        self.pos = cmp::min(self.pos + amt, self.cap);
+        self.buf.consume(amt)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<R> fmt::Debug for BufReader<R>
 where
-    R: fmt::Debug,
+    R: ?Sized + fmt::Debug,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("BufReader")
-            .field("reader", &self.inner)
-            .field("buffer", &format_args!("{}/{}", self.cap - self.pos, self.buf.len()))
+            .field("reader", &&self.inner)
+            .field(
+                "buffer",
+                &format_args!("{}/{}", self.buf.filled() - self.buf.pos(), self.capacity()),
+            )
             .finish()
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<R: Seek> Seek for BufReader<R> {
+impl<R: ?Sized + Seek> Seek for BufReader<R> {
     /// Seek to an offset, in bytes, in the underlying reader.
     ///
     /// The position used for seeking with <code>[SeekFrom::Current]\(_)</code> is the
@@ -414,7 +442,7 @@ impl<R: Seek> Seek for BufReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let result: u64;
         if let SeekFrom::Current(n) = pos {
-            let remainder = (self.cap - self.pos) as i64;
+            let remainder = (self.buf.filled() - self.buf.pos()) as i64;
             // it should be safe to assume that remainder fits within an i64 as the alternative
             // means we managed to allocate 8 exbibytes and that's absurd.
             // But it's not out of the realm of possibility for some weird underlying reader to
@@ -472,16 +500,26 @@ impl<R: Seek> Seek for BufReader<R> {
     /// }
     /// ```
     fn stream_position(&mut self) -> io::Result<u64> {
-        let remainder = (self.cap - self.pos) as u64;
+        let remainder = (self.buf.filled() - self.buf.pos()) as u64;
         self.inner.stream_position().map(|pos| {
             pos.checked_sub(remainder).expect(
                 "overflow when subtracting remaining buffer size from inner stream position",
             )
         })
     }
+
+    /// Seeks relative to the current position.
+    ///
+    /// If the new position lies within the buffer, the buffer will not be
+    /// flushed, allowing for more efficient seeks. This method does not return
+    /// the location of the underlying reader, so the caller must track this
+    /// information themselves if it is required.
+    fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
+        self.seek_relative(offset)
+    }
 }
 
-impl<T> SizeHint for BufReader<T> {
+impl<T: ?Sized> SizeHint for BufReader<T> {
     #[inline]
     fn lower_bound(&self) -> usize {
         SizeHint::lower_bound(self.get_ref()) + self.buffer().len()

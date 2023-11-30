@@ -4,13 +4,12 @@
 //! types or regions but can be other things. Examples of type relations are
 //! subtyping, type equality, etc.
 
-use crate::mir::interpret::{get_slice_bytes, ConstValue, GlobalAlloc, Scalar};
 use crate::ty::error::{ExpectedFound, TypeError};
-use crate::ty::subst::{GenericArg, GenericArgKind, SubstsRef};
-use crate::ty::{self, Ty, TyCtxt, TypeFoldable};
-use rustc_hir as ast;
+use crate::ty::{self, Expr, ImplSubject, Term, TermKind, Ty, TyCtxt, TypeFoldable};
+use crate::ty::{GenericArg, GenericArgKind, GenericArgsRef};
+use rustc_hir as hir;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_span::DUMMY_SP;
 use rustc_target::spec::abi;
 use std::iter;
 
@@ -45,22 +44,23 @@ pub trait TypeRelation<'tcx>: Sized {
         Relate::relate(self, a, b)
     }
 
-    /// Relate the two substitutions for the given item. The default
+    /// Relate the two args for the given item. The default
     /// is to look up the variance for the item and proceed
     /// accordingly.
-    fn relate_item_substs(
+    fn relate_item_args(
         &mut self,
         item_def_id: DefId,
-        a_subst: SubstsRef<'tcx>,
-        b_subst: SubstsRef<'tcx>,
-    ) -> RelateResult<'tcx, SubstsRef<'tcx>> {
+        a_arg: GenericArgsRef<'tcx>,
+        b_arg: GenericArgsRef<'tcx>,
+    ) -> RelateResult<'tcx, GenericArgsRef<'tcx>> {
         debug!(
-            "relate_item_substs(item_def_id={:?}, a_subst={:?}, b_subst={:?})",
-            item_def_id, a_subst, b_subst
+            "relate_item_args(item_def_id={:?}, a_arg={:?}, b_arg={:?})",
+            item_def_id, a_arg, b_arg
         );
 
-        let opt_variances = self.tcx().variances_of(item_def_id);
-        relate_substs(self, Some(opt_variances), a_subst, b_subst)
+        let tcx = self.tcx();
+        let opt_variances = tcx.variances_of(item_def_id);
+        relate_args_with_variances(self, item_def_id, opt_variances, a_arg, b_arg, true)
     }
 
     /// Switch variance for the purpose of relating `a` and `b`.
@@ -88,9 +88,9 @@ pub trait TypeRelation<'tcx>: Sized {
 
     fn consts(
         &mut self,
-        a: &'tcx ty::Const<'tcx>,
-        b: &'tcx ty::Const<'tcx>,
-    ) -> RelateResult<'tcx, &'tcx ty::Const<'tcx>>;
+        a: ty::Const<'tcx>,
+        b: ty::Const<'tcx>,
+    ) -> RelateResult<'tcx, ty::Const<'tcx>>;
 
     fn binders<T>(
         &mut self,
@@ -101,7 +101,7 @@ pub trait TypeRelation<'tcx>: Sized {
         T: Relate<'tcx>;
 }
 
-pub trait Relate<'tcx>: TypeFoldable<'tcx> + Copy {
+pub trait Relate<'tcx>: TypeFoldable<TyCtxt<'tcx>> + PartialEq + Copy {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
         a: Self,
@@ -116,7 +116,7 @@ pub fn relate_type_and_mut<'tcx, R: TypeRelation<'tcx>>(
     relation: &mut R,
     a: ty::TypeAndMut<'tcx>,
     b: ty::TypeAndMut<'tcx>,
-    kind: ty::VarianceDiagMutKind,
+    base_ty: Ty<'tcx>,
 ) -> RelateResult<'tcx, ty::TypeAndMut<'tcx>> {
     debug!("{}.mts({:?}, {:?})", relation.tag(), a, b);
     if a.mutbl != b.mutbl {
@@ -124,28 +124,51 @@ pub fn relate_type_and_mut<'tcx, R: TypeRelation<'tcx>>(
     } else {
         let mutbl = a.mutbl;
         let (variance, info) = match mutbl {
-            ast::Mutability::Not => (ty::Covariant, ty::VarianceDiagInfo::None),
-            ast::Mutability::Mut => (ty::Invariant, ty::VarianceDiagInfo::Mut { kind, ty: a.ty }),
+            hir::Mutability::Not => (ty::Covariant, ty::VarianceDiagInfo::None),
+            hir::Mutability::Mut => {
+                (ty::Invariant, ty::VarianceDiagInfo::Invariant { ty: base_ty, param_index: 0 })
+            }
         };
         let ty = relation.relate_with_variance(variance, info, a.ty, b.ty)?;
         Ok(ty::TypeAndMut { ty, mutbl })
     }
 }
 
-pub fn relate_substs<R: TypeRelation<'tcx>>(
+#[inline]
+pub fn relate_args_invariantly<'tcx, R: TypeRelation<'tcx>>(
     relation: &mut R,
-    variances: Option<&[ty::Variance]>,
-    a_subst: SubstsRef<'tcx>,
-    b_subst: SubstsRef<'tcx>,
-) -> RelateResult<'tcx, SubstsRef<'tcx>> {
+    a_arg: GenericArgsRef<'tcx>,
+    b_arg: GenericArgsRef<'tcx>,
+) -> RelateResult<'tcx, GenericArgsRef<'tcx>> {
+    relation.tcx().mk_args_from_iter(iter::zip(a_arg, b_arg).map(|(a, b)| {
+        relation.relate_with_variance(ty::Invariant, ty::VarianceDiagInfo::default(), a, b)
+    }))
+}
+
+pub fn relate_args_with_variances<'tcx, R: TypeRelation<'tcx>>(
+    relation: &mut R,
+    ty_def_id: DefId,
+    variances: &[ty::Variance],
+    a_arg: GenericArgsRef<'tcx>,
+    b_arg: GenericArgsRef<'tcx>,
+    fetch_ty_for_diag: bool,
+) -> RelateResult<'tcx, GenericArgsRef<'tcx>> {
     let tcx = relation.tcx();
 
-    let params = iter::zip(a_subst, b_subst).enumerate().map(|(i, (a, b))| {
-        let variance = variances.map_or(ty::Invariant, |v| v[i]);
-        relation.relate_with_variance(variance, ty::VarianceDiagInfo::default(), a, b)
+    let mut cached_ty = None;
+    let params = iter::zip(a_arg, b_arg).enumerate().map(|(i, (a, b))| {
+        let variance = variances[i];
+        let variance_info = if variance == ty::Invariant && fetch_ty_for_diag {
+            let ty =
+                *cached_ty.get_or_insert_with(|| tcx.type_of(ty_def_id).instantiate(tcx, a_arg));
+            ty::VarianceDiagInfo::Invariant { ty, param_index: i.try_into().unwrap() }
+        } else {
+            ty::VarianceDiagInfo::default()
+        };
+        relation.relate_with_variance(variance, variance_info, a, b)
     });
 
-    tcx.mk_substs(params)
+    tcx.mk_args_from_iter(params)
 }
 
 impl<'tcx> Relate<'tcx> for ty::FnSig<'tcx> {
@@ -196,7 +219,7 @@ impl<'tcx> Relate<'tcx> for ty::FnSig<'tcx> {
                 r => r,
             });
         Ok(ty::FnSig {
-            inputs_and_output: tcx.mk_type_list(inputs_and_output)?,
+            inputs_and_output: tcx.mk_type_list_from_iter(inputs_and_output)?,
             c_variadic: a.c_variadic,
             unsafety,
             abi,
@@ -218,25 +241,12 @@ impl<'tcx> Relate<'tcx> for ty::BoundConstness {
     }
 }
 
-impl<'tcx, T: Relate<'tcx>> Relate<'tcx> for ty::ConstnessAnd<T> {
+impl<'tcx> Relate<'tcx> for hir::Unsafety {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ty::ConstnessAnd<T>,
-        b: ty::ConstnessAnd<T>,
-    ) -> RelateResult<'tcx, ty::ConstnessAnd<T>> {
-        Ok(ty::ConstnessAnd {
-            constness: relation.relate(a.constness, b.constness)?,
-            value: relation.relate(a.value, b.value)?,
-        })
-    }
-}
-
-impl<'tcx> Relate<'tcx> for ast::Unsafety {
-    fn relate<R: TypeRelation<'tcx>>(
-        relation: &mut R,
-        a: ast::Unsafety,
-        b: ast::Unsafety,
-    ) -> RelateResult<'tcx, ast::Unsafety> {
+        a: hir::Unsafety,
+        b: hir::Unsafety,
+    ) -> RelateResult<'tcx, hir::Unsafety> {
         if a != b {
             Err(TypeError::UnsafetyMismatch(expected_found(relation, a, b)))
         } else {
@@ -255,21 +265,30 @@ impl<'tcx> Relate<'tcx> for abi::Abi {
     }
 }
 
-impl<'tcx> Relate<'tcx> for ty::ProjectionTy<'tcx> {
+impl<'tcx> Relate<'tcx> for ty::AliasTy<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ty::ProjectionTy<'tcx>,
-        b: ty::ProjectionTy<'tcx>,
-    ) -> RelateResult<'tcx, ty::ProjectionTy<'tcx>> {
-        if a.item_def_id != b.item_def_id {
-            Err(TypeError::ProjectionMismatched(expected_found(
-                relation,
-                a.item_def_id,
-                b.item_def_id,
-            )))
+        a: ty::AliasTy<'tcx>,
+        b: ty::AliasTy<'tcx>,
+    ) -> RelateResult<'tcx, ty::AliasTy<'tcx>> {
+        if a.def_id != b.def_id {
+            Err(TypeError::ProjectionMismatched(expected_found(relation, a.def_id, b.def_id)))
         } else {
-            let substs = relation.relate(a.substs, b.substs)?;
-            Ok(ty::ProjectionTy { item_def_id: a.item_def_id, substs: &substs })
+            let args = match relation.tcx().def_kind(a.def_id) {
+                DefKind::OpaqueTy => relate_args_with_variances(
+                    relation,
+                    a.def_id,
+                    relation.tcx().variances_of(a.def_id),
+                    a.args,
+                    b.args,
+                    false, // do not fetch `type_of(a_def_id)`, as it will cause a cycle
+                )?,
+                DefKind::AssocTy | DefKind::AssocConst | DefKind::TyAlias => {
+                    relate_args_invariantly(relation, a.args, b.args)?
+                }
+                def => bug!("unknown alias DefKind: {def:?}"),
+            };
+            Ok(ty::AliasTy::new(relation.tcx(), a.def_id, args))
         }
     }
 }
@@ -280,26 +299,22 @@ impl<'tcx> Relate<'tcx> for ty::ExistentialProjection<'tcx> {
         a: ty::ExistentialProjection<'tcx>,
         b: ty::ExistentialProjection<'tcx>,
     ) -> RelateResult<'tcx, ty::ExistentialProjection<'tcx>> {
-        if a.item_def_id != b.item_def_id {
-            Err(TypeError::ProjectionMismatched(expected_found(
-                relation,
-                a.item_def_id,
-                b.item_def_id,
-            )))
+        if a.def_id != b.def_id {
+            Err(TypeError::ProjectionMismatched(expected_found(relation, a.def_id, b.def_id)))
         } else {
-            let ty = relation.relate_with_variance(
+            let term = relation.relate_with_variance(
                 ty::Invariant,
                 ty::VarianceDiagInfo::default(),
-                a.ty,
-                b.ty,
+                a.term,
+                b.term,
             )?;
-            let substs = relation.relate_with_variance(
+            let args = relation.relate_with_variance(
                 ty::Invariant,
                 ty::VarianceDiagInfo::default(),
-                a.substs,
-                b.substs,
+                a.args,
+                b.args,
             )?;
-            Ok(ty::ExistentialProjection { item_def_id: a.item_def_id, substs, ty })
+            Ok(ty::ExistentialProjection { def_id: a.def_id, args, term })
         }
     }
 }
@@ -314,8 +329,8 @@ impl<'tcx> Relate<'tcx> for ty::TraitRef<'tcx> {
         if a.def_id != b.def_id {
             Err(TypeError::Traits(expected_found(relation, a.def_id, b.def_id)))
         } else {
-            let substs = relate_substs(relation, None, a.substs, b.substs)?;
-            Ok(ty::TraitRef { def_id: a.def_id, substs })
+            let args = relate_args_invariantly(relation, a.args, b.args)?;
+            Ok(ty::TraitRef::new(relation.tcx(), a.def_id, args))
         }
     }
 }
@@ -330,25 +345,50 @@ impl<'tcx> Relate<'tcx> for ty::ExistentialTraitRef<'tcx> {
         if a.def_id != b.def_id {
             Err(TypeError::Traits(expected_found(relation, a.def_id, b.def_id)))
         } else {
-            let substs = relate_substs(relation, None, a.substs, b.substs)?;
-            Ok(ty::ExistentialTraitRef { def_id: a.def_id, substs })
+            let args = relate_args_invariantly(relation, a.args, b.args)?;
+            Ok(ty::ExistentialTraitRef { def_id: a.def_id, args })
         }
     }
 }
 
-#[derive(Copy, Debug, Clone, TypeFoldable)]
-struct GeneratorWitness<'tcx>(&'tcx ty::List<Ty<'tcx>>);
+#[derive(PartialEq, Copy, Debug, Clone, TypeFoldable, TypeVisitable)]
+struct CoroutineWitness<'tcx>(&'tcx ty::List<Ty<'tcx>>);
 
-impl<'tcx> Relate<'tcx> for GeneratorWitness<'tcx> {
+impl<'tcx> Relate<'tcx> for CoroutineWitness<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: GeneratorWitness<'tcx>,
-        b: GeneratorWitness<'tcx>,
-    ) -> RelateResult<'tcx, GeneratorWitness<'tcx>> {
+        a: CoroutineWitness<'tcx>,
+        b: CoroutineWitness<'tcx>,
+    ) -> RelateResult<'tcx, CoroutineWitness<'tcx>> {
         assert_eq!(a.0.len(), b.0.len());
         let tcx = relation.tcx();
-        let types = tcx.mk_type_list(iter::zip(a.0, b.0).map(|(a, b)| relation.relate(a, b)))?;
-        Ok(GeneratorWitness(types))
+        let types =
+            tcx.mk_type_list_from_iter(iter::zip(a.0, b.0).map(|(a, b)| relation.relate(a, b)))?;
+        Ok(CoroutineWitness(types))
+    }
+}
+
+impl<'tcx> Relate<'tcx> for ImplSubject<'tcx> {
+    #[inline]
+    fn relate<R: TypeRelation<'tcx>>(
+        relation: &mut R,
+        a: ImplSubject<'tcx>,
+        b: ImplSubject<'tcx>,
+    ) -> RelateResult<'tcx, ImplSubject<'tcx>> {
+        match (a, b) {
+            (ImplSubject::Trait(trait_ref_a), ImplSubject::Trait(trait_ref_b)) => {
+                let trait_ref = ty::TraitRef::relate(relation, trait_ref_a, trait_ref_b)?;
+                Ok(ImplSubject::Trait(trait_ref))
+            }
+            (ImplSubject::Inherent(ty_a), ImplSubject::Inherent(ty_b)) => {
+                let ty = Ty::relate(relation, ty_a, ty_b)?;
+                Ok(ImplSubject::Inherent(ty))
+            }
+            (ImplSubject::Trait(_), ImplSubject::Inherent(_))
+            | (ImplSubject::Inherent(_), ImplSubject::Trait(_)) => {
+                bug!("can not relate TraitRef and Ty");
+            }
+        }
     }
 }
 
@@ -363,27 +403,27 @@ impl<'tcx> Relate<'tcx> for Ty<'tcx> {
     }
 }
 
-/// The main "type relation" routine. Note that this does not handle
-/// inference artifacts, so you should filter those out before calling
-/// it.
-pub fn super_relate_tys<R: TypeRelation<'tcx>>(
+/// Relates `a` and `b` structurally, calling the relation for all nested values.
+/// Any semantic equality, e.g. of projections, and inference variables have to be
+/// handled by the caller.
+#[instrument(level = "trace", skip(relation), ret)]
+pub fn structurally_relate_tys<'tcx, R: TypeRelation<'tcx>>(
     relation: &mut R,
     a: Ty<'tcx>,
     b: Ty<'tcx>,
 ) -> RelateResult<'tcx, Ty<'tcx>> {
     let tcx = relation.tcx();
-    debug!("super_relate_tys: a={:?} b={:?}", a, b);
     match (a.kind(), b.kind()) {
         (&ty::Infer(_), _) | (_, &ty::Infer(_)) => {
             // The caller should handle these cases!
-            bug!("var types encountered in super_relate_tys")
+            bug!("var types encountered in structurally_relate_tys")
         }
 
         (ty::Bound(..), _) | (_, ty::Bound(..)) => {
-            bug!("bound types encountered in super_relate_tys")
+            bug!("bound types encountered in structurally_relate_tys")
         }
 
-        (&ty::Error(_), _) | (_, &ty::Error(_)) => Ok(tcx.ty_error()),
+        (&ty::Error(guar), _) | (_, &ty::Error(guar)) => Ok(Ty::new_error(tcx, guar)),
 
         (&ty::Never, _)
         | (&ty::Char, _)
@@ -397,79 +437,71 @@ pub fn super_relate_tys<R: TypeRelation<'tcx>>(
             Ok(a)
         }
 
-        (&ty::Param(ref a_p), &ty::Param(ref b_p)) if a_p.index == b_p.index => Ok(a),
+        (ty::Param(a_p), ty::Param(b_p)) if a_p.index == b_p.index => Ok(a),
 
         (ty::Placeholder(p1), ty::Placeholder(p2)) if p1 == p2 => Ok(a),
 
-        (&ty::Adt(a_def, a_substs), &ty::Adt(b_def, b_substs)) if a_def == b_def => {
-            let substs = relation.relate_item_substs(a_def.did, a_substs, b_substs)?;
-            Ok(tcx.mk_adt(a_def, substs))
+        (&ty::Adt(a_def, a_args), &ty::Adt(b_def, b_args)) if a_def == b_def => {
+            let args = relation.relate_item_args(a_def.did(), a_args, b_args)?;
+            Ok(Ty::new_adt(tcx, a_def, args))
         }
 
-        (&ty::Foreign(a_id), &ty::Foreign(b_id)) if a_id == b_id => Ok(tcx.mk_foreign(a_id)),
+        (&ty::Foreign(a_id), &ty::Foreign(b_id)) if a_id == b_id => Ok(Ty::new_foreign(tcx, a_id)),
 
-        (&ty::Dynamic(a_obj, a_region), &ty::Dynamic(b_obj, b_region)) => {
+        (&ty::Dynamic(a_obj, a_region, a_repr), &ty::Dynamic(b_obj, b_region, b_repr))
+            if a_repr == b_repr =>
+        {
             let region_bound = relation.with_cause(Cause::ExistentialRegionBound, |relation| {
-                relation.relate_with_variance(
-                    ty::Contravariant,
-                    ty::VarianceDiagInfo::default(),
-                    a_region,
-                    b_region,
-                )
+                relation.relate(a_region, b_region)
             })?;
-            Ok(tcx.mk_dynamic(relation.relate(a_obj, b_obj)?, region_bound))
+            Ok(Ty::new_dynamic(tcx, relation.relate(a_obj, b_obj)?, region_bound, a_repr))
         }
 
-        (&ty::Generator(a_id, a_substs, movability), &ty::Generator(b_id, b_substs, _))
+        (&ty::Coroutine(a_id, a_args, movability), &ty::Coroutine(b_id, b_args, _))
             if a_id == b_id =>
         {
-            // All Generator types with the same id represent
-            // the (anonymous) type of the same generator expression. So
+            // All Coroutine types with the same id represent
+            // the (anonymous) type of the same coroutine expression. So
             // all of their regions should be equated.
-            let substs = relation.relate(a_substs, b_substs)?;
-            Ok(tcx.mk_generator(a_id, substs, movability))
+            let args = relate_args_invariantly(relation, a_args, b_args)?;
+            Ok(Ty::new_coroutine(tcx, a_id, args, movability))
         }
 
-        (&ty::GeneratorWitness(a_types), &ty::GeneratorWitness(b_types)) => {
-            // Wrap our types with a temporary GeneratorWitness struct
-            // inside the binder so we can related them
-            let a_types = a_types.map_bound(GeneratorWitness);
-            let b_types = b_types.map_bound(GeneratorWitness);
-            // Then remove the GeneratorWitness for the result
-            let types = relation.relate(a_types, b_types)?.map_bound(|witness| witness.0);
-            Ok(tcx.mk_generator_witness(types))
+        (&ty::CoroutineWitness(a_id, a_args), &ty::CoroutineWitness(b_id, b_args))
+            if a_id == b_id =>
+        {
+            // All CoroutineWitness types with the same id represent
+            // the (anonymous) type of the same coroutine expression. So
+            // all of their regions should be equated.
+            let args = relate_args_invariantly(relation, a_args, b_args)?;
+            Ok(Ty::new_coroutine_witness(tcx, a_id, args))
         }
 
-        (&ty::Closure(a_id, a_substs), &ty::Closure(b_id, b_substs)) if a_id == b_id => {
+        (&ty::Closure(a_id, a_args), &ty::Closure(b_id, b_args)) if a_id == b_id => {
             // All Closure types with the same id represent
             // the (anonymous) type of the same closure expression. So
             // all of their regions should be equated.
-            let substs = relation.relate(a_substs, b_substs)?;
-            Ok(tcx.mk_closure(a_id, &substs))
+            let args = relate_args_invariantly(relation, a_args, b_args)?;
+            Ok(Ty::new_closure(tcx, a_id, args))
         }
 
         (&ty::RawPtr(a_mt), &ty::RawPtr(b_mt)) => {
-            let mt = relate_type_and_mut(relation, a_mt, b_mt, ty::VarianceDiagMutKind::RawPtr)?;
-            Ok(tcx.mk_ptr(mt))
+            let mt = relate_type_and_mut(relation, a_mt, b_mt, a)?;
+            Ok(Ty::new_ptr(tcx, mt))
         }
 
         (&ty::Ref(a_r, a_ty, a_mutbl), &ty::Ref(b_r, b_ty, b_mutbl)) => {
-            let r = relation.relate_with_variance(
-                ty::Contravariant,
-                ty::VarianceDiagInfo::default(),
-                a_r,
-                b_r,
-            )?;
+            let r = relation.relate(a_r, b_r)?;
             let a_mt = ty::TypeAndMut { ty: a_ty, mutbl: a_mutbl };
             let b_mt = ty::TypeAndMut { ty: b_ty, mutbl: b_mutbl };
-            let mt = relate_type_and_mut(relation, a_mt, b_mt, ty::VarianceDiagMutKind::Ref)?;
-            Ok(tcx.mk_ref(r, mt))
+            let mt = relate_type_and_mut(relation, a_mt, b_mt, a)?;
+            Ok(Ty::new_ref(tcx, r, mt))
         }
 
         (&ty::Array(a_t, sz_a), &ty::Array(b_t, sz_b)) => {
             let t = relation.relate(a_t, b_t)?;
             match relation.relate(sz_a, sz_b) {
-                Ok(sz) => Ok(tcx.mk_ty(ty::Array(t, sz))),
+                Ok(sz) => Ok(Ty::new_array_with_const_len(tcx, t, sz)),
                 Err(err) => {
                     // Check whether the lengths are both concrete/known values,
                     // but are unequal, for better diagnostics.
@@ -478,8 +510,8 @@ pub fn super_relate_tys<R: TypeRelation<'tcx>>(
                     // we however cannot end up with errors in `Relate` during both
                     // `type_of` and `predicates_of`. This means that evaluating the
                     // constants should not cause cycle errors here.
-                    let sz_a = sz_a.try_eval_usize(tcx, relation.param_env());
-                    let sz_b = sz_b.try_eval_usize(tcx, relation.param_env());
+                    let sz_a = sz_a.try_eval_target_usize(tcx, relation.param_env());
+                    let sz_b = sz_b.try_eval_target_usize(tcx, relation.param_env());
                     match (sz_a, sz_b) {
                         (Some(sz_a_val), Some(sz_b_val)) if sz_a_val != sz_b_val => Err(
                             TypeError::FixedArraySize(expected_found(relation, sz_a_val, sz_b_val)),
@@ -492,13 +524,14 @@ pub fn super_relate_tys<R: TypeRelation<'tcx>>(
 
         (&ty::Slice(a_t), &ty::Slice(b_t)) => {
             let t = relation.relate(a_t, b_t)?;
-            Ok(tcx.mk_slice(t))
+            Ok(Ty::new_slice(tcx, t))
         }
 
         (&ty::Tuple(as_), &ty::Tuple(bs)) => {
             if as_.len() == bs.len() {
-                Ok(tcx.mk_tup(
-                    iter::zip(as_, bs).map(|(a, b)| relation.relate(a.expect_ty(), b.expect_ty())),
+                Ok(Ty::new_tup_from_iter(
+                    tcx,
+                    iter::zip(as_, bs).map(|(a, b)| relation.relate(a, b)),
                 )?)
             } else if !(as_.is_empty() || bs.is_empty()) {
                 Err(TypeError::TupleSize(expected_found(relation, as_.len(), bs.len())))
@@ -507,68 +540,55 @@ pub fn super_relate_tys<R: TypeRelation<'tcx>>(
             }
         }
 
-        (&ty::FnDef(a_def_id, a_substs), &ty::FnDef(b_def_id, b_substs))
-            if a_def_id == b_def_id =>
-        {
-            let substs = relation.relate_item_substs(a_def_id, a_substs, b_substs)?;
-            Ok(tcx.mk_fn_def(a_def_id, substs))
+        (&ty::FnDef(a_def_id, a_args), &ty::FnDef(b_def_id, b_args)) if a_def_id == b_def_id => {
+            let args = relation.relate_item_args(a_def_id, a_args, b_args)?;
+            Ok(Ty::new_fn_def(tcx, a_def_id, args))
         }
 
         (&ty::FnPtr(a_fty), &ty::FnPtr(b_fty)) => {
             let fty = relation.relate(a_fty, b_fty)?;
-            Ok(tcx.mk_fn_ptr(fty))
+            Ok(Ty::new_fn_ptr(tcx, fty))
         }
 
-        // these two are already handled downstream in case of lazy normalization
-        (&ty::Projection(a_data), &ty::Projection(b_data)) => {
-            let projection_ty = relation.relate(a_data, b_data)?;
-            Ok(tcx.mk_projection(projection_ty.item_def_id, projection_ty.substs))
-        }
-
-        (&ty::Opaque(a_def_id, a_substs), &ty::Opaque(b_def_id, b_substs))
-            if a_def_id == b_def_id =>
-        {
-            let substs = relate_substs(relation, None, a_substs, b_substs)?;
-            Ok(tcx.mk_opaque(a_def_id, substs))
+        // Alias tend to mostly already be handled downstream due to normalization.
+        (&ty::Alias(a_kind, a_data), &ty::Alias(b_kind, b_data)) => {
+            let alias_ty = relation.relate(a_data, b_data)?;
+            assert_eq!(a_kind, b_kind);
+            Ok(Ty::new_alias(tcx, a_kind, alias_ty))
         }
 
         _ => Err(TypeError::Sorts(expected_found(relation, a, b))),
     }
 }
 
-/// The main "const relation" routine. Note that this does not handle
-/// inference artifacts, so you should filter those out before calling
-/// it.
-pub fn super_relate_consts<R: TypeRelation<'tcx>>(
+/// Relates `a` and `b` structurally, calling the relation for all nested values.
+/// Any semantic equality, e.g. of unevaluated consts, and inference variables have
+/// to be handled by the caller.
+///
+/// FIXME: This is not totally structual, which probably should be fixed.
+/// See the HACKs below.
+pub fn structurally_relate_consts<'tcx, R: TypeRelation<'tcx>>(
     relation: &mut R,
-    a: &'tcx ty::Const<'tcx>,
-    b: &'tcx ty::Const<'tcx>,
-) -> RelateResult<'tcx, &'tcx ty::Const<'tcx>> {
-    debug!("{}.super_relate_consts(a = {:?}, b = {:?})", relation.tag(), a, b);
+    mut a: ty::Const<'tcx>,
+    mut b: ty::Const<'tcx>,
+) -> RelateResult<'tcx, ty::Const<'tcx>> {
+    debug!("{}.structurally_relate_consts(a = {:?}, b = {:?})", relation.tag(), a, b);
     let tcx = relation.tcx();
 
-    // FIXME(oli-obk): once const generics can have generic types, this assertion
-    // will likely get triggered. Move to `normalize_erasing_regions` at that point.
-    let a_ty = tcx.erase_regions(a.ty);
-    let b_ty = tcx.erase_regions(b.ty);
-    if a_ty != b_ty {
-        relation.tcx().sess.delay_span_bug(
-            DUMMY_SP,
-            &format!("cannot relate constants of different types: {} != {}", a_ty, b_ty),
-        );
+    if tcx.features().generic_const_exprs {
+        a = tcx.expand_abstract_consts(a);
+        b = tcx.expand_abstract_consts(b);
     }
 
-    let eagerly_eval = |x: &'tcx ty::Const<'tcx>| x.eval(tcx, relation.param_env());
-    let a = eagerly_eval(a);
-    let b = eagerly_eval(b);
+    debug!("{}.structurally_relate_consts(normed_a = {:?}, normed_b = {:?})", relation.tag(), a, b);
 
     // Currently, the values that can be unified are primitive types,
     // and those that derive both `PartialEq` and `Eq`, corresponding
     // to structural-match types.
-    let is_match = match (a.val, b.val) {
+    let is_match = match (a.kind(), b.kind()) {
         (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => {
             // The caller should handle these cases!
-            bug!("var types encountered in super_relate_consts: {:?} {:?}", a, b)
+            bug!("var types encountered in structurally_relate_consts: {:?} {:?}", a, b)
         }
 
         (ty::ConstKind::Error(_), _) => return Ok(a),
@@ -576,103 +596,72 @@ pub fn super_relate_consts<R: TypeRelation<'tcx>>(
 
         (ty::ConstKind::Param(a_p), ty::ConstKind::Param(b_p)) => a_p.index == b_p.index,
         (ty::ConstKind::Placeholder(p1), ty::ConstKind::Placeholder(p2)) => p1 == p2,
-        (ty::ConstKind::Value(a_val), ty::ConstKind::Value(b_val)) => {
-            check_const_value_eq(relation, a_val, b_val, a, b)?
-        }
-
-        (ty::ConstKind::Unevaluated(au), ty::ConstKind::Unevaluated(bu))
-            if tcx.features().generic_const_exprs =>
-        {
-            tcx.try_unify_abstract_consts((au.shrink(), bu.shrink()))
-        }
+        (ty::ConstKind::Value(a_val), ty::ConstKind::Value(b_val)) => a_val == b_val,
 
         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
         // and is the better alternative to waiting until `generic_const_exprs` can
         // be stabilized.
-        (ty::ConstKind::Unevaluated(au), ty::ConstKind::Unevaluated(bu))
-            if au.def == bu.def && au.promoted == bu.promoted =>
-        {
-            let substs = relation.relate_with_variance(
+        (ty::ConstKind::Unevaluated(au), ty::ConstKind::Unevaluated(bu)) if au.def == bu.def => {
+            assert_eq!(a.ty(), b.ty());
+            let args = relation.relate_with_variance(
                 ty::Variance::Invariant,
                 ty::VarianceDiagInfo::default(),
-                au.substs(tcx),
-                bu.substs(tcx),
+                au.args,
+                bu.args,
             )?;
-            return Ok(tcx.mk_const(ty::Const {
-                val: ty::ConstKind::Unevaluated(ty::Unevaluated {
-                    def: au.def,
-                    substs_: Some(substs),
-                    promoted: au.promoted,
-                }),
-                ty: a.ty,
-            }));
+            return Ok(ty::Const::new_unevaluated(
+                tcx,
+                ty::UnevaluatedConst { def: au.def, args },
+                a.ty(),
+            ));
+        }
+        // Before calling relate on exprs, it is necessary to ensure that the nested consts
+        // have identical types.
+        (ty::ConstKind::Expr(ae), ty::ConstKind::Expr(be)) => {
+            let r = relation;
+
+            // FIXME(generic_const_exprs): is it possible to relate two consts which are not identical
+            // exprs? Should we care about that?
+            // FIXME(generic_const_exprs): relating the `ty()`s is a little weird since it is supposed to
+            // ICE If they mismatch. Unfortunately `ConstKind::Expr` is a little special and can be thought
+            // of as being generic over the argument types, however this is implicit so these types don't get
+            // related when we relate the args of the item this const arg is for.
+            let expr = match (ae, be) {
+                (Expr::Binop(a_op, al, ar), Expr::Binop(b_op, bl, br)) if a_op == b_op => {
+                    r.relate(al.ty(), bl.ty())?;
+                    r.relate(ar.ty(), br.ty())?;
+                    Expr::Binop(a_op, r.consts(al, bl)?, r.consts(ar, br)?)
+                }
+                (Expr::UnOp(a_op, av), Expr::UnOp(b_op, bv)) if a_op == b_op => {
+                    r.relate(av.ty(), bv.ty())?;
+                    Expr::UnOp(a_op, r.consts(av, bv)?)
+                }
+                (Expr::Cast(ak, av, at), Expr::Cast(bk, bv, bt)) if ak == bk => {
+                    r.relate(av.ty(), bv.ty())?;
+                    Expr::Cast(ak, r.consts(av, bv)?, r.tys(at, bt)?)
+                }
+                (Expr::FunctionCall(af, aa), Expr::FunctionCall(bf, ba))
+                    if aa.len() == ba.len() =>
+                {
+                    r.relate(af.ty(), bf.ty())?;
+                    let func = r.consts(af, bf)?;
+                    let mut related_args = Vec::with_capacity(aa.len());
+                    for (a_arg, b_arg) in aa.iter().zip(ba.iter()) {
+                        related_args.push(r.consts(a_arg, b_arg)?);
+                    }
+                    let related_args = tcx.mk_const_list(&related_args);
+                    Expr::FunctionCall(func, related_args)
+                }
+                _ => return Err(TypeError::ConstMismatch(expected_found(r, a, b))),
+            };
+            return Ok(ty::Const::new_expr(tcx, expr, a.ty()));
         }
         _ => false,
     };
     if is_match { Ok(a) } else { Err(TypeError::ConstMismatch(expected_found(relation, a, b))) }
 }
 
-fn check_const_value_eq<R: TypeRelation<'tcx>>(
-    relation: &mut R,
-    a_val: ConstValue<'tcx>,
-    b_val: ConstValue<'tcx>,
-    // FIXME(oli-obk): these arguments should go away with valtrees
-    a: &'tcx ty::Const<'tcx>,
-    b: &'tcx ty::Const<'tcx>,
-    // FIXME(oli-obk): this should just be `bool` with valtrees
-) -> RelateResult<'tcx, bool> {
-    let tcx = relation.tcx();
-    Ok(match (a_val, b_val) {
-        (ConstValue::Scalar(Scalar::Int(a_val)), ConstValue::Scalar(Scalar::Int(b_val))) => {
-            a_val == b_val
-        }
-        (
-            ConstValue::Scalar(Scalar::Ptr(a_val, _a_size)),
-            ConstValue::Scalar(Scalar::Ptr(b_val, _b_size)),
-        ) => {
-            a_val == b_val
-                || match (tcx.global_alloc(a_val.provenance), tcx.global_alloc(b_val.provenance)) {
-                    (GlobalAlloc::Function(a_instance), GlobalAlloc::Function(b_instance)) => {
-                        a_instance == b_instance
-                    }
-                    _ => false,
-                }
-        }
-
-        (ConstValue::Slice { .. }, ConstValue::Slice { .. }) => {
-            get_slice_bytes(&tcx, a_val) == get_slice_bytes(&tcx, b_val)
-        }
-
-        (ConstValue::ByRef { alloc: alloc_a, .. }, ConstValue::ByRef { alloc: alloc_b, .. })
-            if a.ty.is_ref() || b.ty.is_ref() =>
-        {
-            if a.ty.is_ref() && b.ty.is_ref() {
-                alloc_a == alloc_b
-            } else {
-                false
-            }
-        }
-        (ConstValue::ByRef { .. }, ConstValue::ByRef { .. }) => {
-            let a_destructured = tcx.destructure_const(relation.param_env().and(a));
-            let b_destructured = tcx.destructure_const(relation.param_env().and(b));
-
-            // Both the variant and each field have to be equal.
-            if a_destructured.variant == b_destructured.variant {
-                for (a_field, b_field) in iter::zip(a_destructured.fields, b_destructured.fields) {
-                    relation.consts(a_field, b_field)?;
-                }
-
-                true
-            } else {
-                false
-            }
-        }
-
-        _ => false,
-    })
-}
-
-impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>> {
+impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
         a: Self,
@@ -706,39 +695,39 @@ impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredi
                 _ => Err(TypeError::ExistentialMismatch(expected_found(relation, a, b))),
             }
         });
-        tcx.mk_poly_existential_predicates(v)
+        tcx.mk_poly_existential_predicates_from_iter(v)
     }
 }
 
-impl<'tcx> Relate<'tcx> for ty::ClosureSubsts<'tcx> {
+impl<'tcx> Relate<'tcx> for ty::ClosureArgs<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ty::ClosureSubsts<'tcx>,
-        b: ty::ClosureSubsts<'tcx>,
-    ) -> RelateResult<'tcx, ty::ClosureSubsts<'tcx>> {
-        let substs = relate_substs(relation, None, a.substs, b.substs)?;
-        Ok(ty::ClosureSubsts { substs })
+        a: ty::ClosureArgs<'tcx>,
+        b: ty::ClosureArgs<'tcx>,
+    ) -> RelateResult<'tcx, ty::ClosureArgs<'tcx>> {
+        let args = relate_args_invariantly(relation, a.args, b.args)?;
+        Ok(ty::ClosureArgs { args })
     }
 }
 
-impl<'tcx> Relate<'tcx> for ty::GeneratorSubsts<'tcx> {
+impl<'tcx> Relate<'tcx> for ty::CoroutineArgs<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ty::GeneratorSubsts<'tcx>,
-        b: ty::GeneratorSubsts<'tcx>,
-    ) -> RelateResult<'tcx, ty::GeneratorSubsts<'tcx>> {
-        let substs = relate_substs(relation, None, a.substs, b.substs)?;
-        Ok(ty::GeneratorSubsts { substs })
+        a: ty::CoroutineArgs<'tcx>,
+        b: ty::CoroutineArgs<'tcx>,
+    ) -> RelateResult<'tcx, ty::CoroutineArgs<'tcx>> {
+        let args = relate_args_invariantly(relation, a.args, b.args)?;
+        Ok(ty::CoroutineArgs { args })
     }
 }
 
-impl<'tcx> Relate<'tcx> for SubstsRef<'tcx> {
+impl<'tcx> Relate<'tcx> for GenericArgsRef<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: SubstsRef<'tcx>,
-        b: SubstsRef<'tcx>,
-    ) -> RelateResult<'tcx, SubstsRef<'tcx>> {
-        relate_substs(relation, None, a, b)
+        a: GenericArgsRef<'tcx>,
+        b: GenericArgsRef<'tcx>,
+    ) -> RelateResult<'tcx, GenericArgsRef<'tcx>> {
+        relate_args_invariantly(relation, a, b)
     }
 }
 
@@ -752,12 +741,12 @@ impl<'tcx> Relate<'tcx> for ty::Region<'tcx> {
     }
 }
 
-impl<'tcx> Relate<'tcx> for &'tcx ty::Const<'tcx> {
+impl<'tcx> Relate<'tcx> for ty::Const<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: &'tcx ty::Const<'tcx>,
-        b: &'tcx ty::Const<'tcx>,
-    ) -> RelateResult<'tcx, &'tcx ty::Const<'tcx>> {
+        a: ty::Const<'tcx>,
+        b: ty::Const<'tcx>,
+    ) -> RelateResult<'tcx, ty::Const<'tcx>> {
         relation.consts(a, b)
     }
 }
@@ -823,21 +812,21 @@ impl<'tcx> Relate<'tcx> for ty::TraitPredicate<'tcx> {
     ) -> RelateResult<'tcx, ty::TraitPredicate<'tcx>> {
         Ok(ty::TraitPredicate {
             trait_ref: relation.relate(a.trait_ref, b.trait_ref)?,
-            constness: relation.relate(a.constness, b.constness)?,
             polarity: relation.relate(a.polarity, b.polarity)?,
         })
     }
 }
 
-impl<'tcx> Relate<'tcx> for ty::ProjectionPredicate<'tcx> {
+impl<'tcx> Relate<'tcx> for Term<'tcx> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ty::ProjectionPredicate<'tcx>,
-        b: ty::ProjectionPredicate<'tcx>,
-    ) -> RelateResult<'tcx, ty::ProjectionPredicate<'tcx>> {
-        Ok(ty::ProjectionPredicate {
-            projection_ty: relation.relate(a.projection_ty, b.projection_ty)?,
-            ty: relation.relate(a.ty, b.ty)?,
+        a: Self,
+        b: Self,
+    ) -> RelateResult<'tcx, Self> {
+        Ok(match (a.unpack(), b.unpack()) {
+            (TermKind::Ty(a), TermKind::Ty(b)) => relation.relate(a, b)?.into(),
+            (TermKind::Const(a), TermKind::Const(b)) => relation.relate(a, b)?.into(),
+            _ => return Err(TypeError::Mismatch),
         })
     }
 }
@@ -845,17 +834,9 @@ impl<'tcx> Relate<'tcx> for ty::ProjectionPredicate<'tcx> {
 ///////////////////////////////////////////////////////////////////////////
 // Error handling
 
-pub fn expected_found<R, T>(relation: &mut R, a: T, b: T) -> ExpectedFound<T>
+pub fn expected_found<'tcx, R, T>(relation: &mut R, a: T, b: T) -> ExpectedFound<T>
 where
     R: TypeRelation<'tcx>,
 {
-    expected_found_bool(relation.a_is_expected(), a, b)
-}
-
-pub fn expected_found_bool<T>(a_is_expected: bool, a: T, b: T) -> ExpectedFound<T> {
-    if a_is_expected {
-        ExpectedFound { expected: a, found: b }
-    } else {
-        ExpectedFound { expected: b, found: a }
-    }
+    ExpectedFound::new(relation.a_is_expected(), a, b)
 }

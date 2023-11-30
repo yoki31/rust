@@ -1,19 +1,22 @@
 use crate::abi::{self, Abi, Align, FieldsShape, Size};
 use crate::abi::{HasDataLayout, TyAbiInterface, TyAndLayout};
 use crate::spec::{self, HasTargetSpec};
+use rustc_span::Symbol;
 use std::fmt;
+use std::str::FromStr;
 
 mod aarch64;
 mod amdgpu;
 mod arm;
 mod avr;
 mod bpf;
+mod csky;
 mod hexagon;
+mod loongarch;
 mod m68k;
 mod mips;
 mod mips64;
 mod msp430;
-mod nvptx;
 mod nvptx64;
 mod powerpc;
 mod powerpc64;
@@ -26,7 +29,7 @@ mod x86;
 mod x86_64;
 mod x86_win64;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {
     /// Ignore the argument.
     ///
@@ -34,22 +37,52 @@ pub enum PassMode {
     Ignore,
     /// Pass the argument directly.
     ///
-    /// The argument has a layout abi of `Scalar`, `Vector` or in rare cases `Aggregate`.
+    /// The argument has a layout abi of `Scalar` or `Vector`.
+    /// Unfortunately due to past mistakes, in rare cases on wasm, it can also be `Aggregate`.
+    /// This is bad since it leaks LLVM implementation details into the ABI.
+    /// (Also see <https://github.com/rust-lang/rust/issues/115666>.)
     Direct(ArgAttributes),
     /// Pass a pair's elements directly in two arguments.
     ///
     /// The argument has a layout abi of `ScalarPair`.
     Pair(ArgAttributes, ArgAttributes),
-    /// Pass the argument after casting it, to either
-    /// a single uniform or a pair of registers.
-    Cast(CastTarget),
+    /// Pass the argument after casting it. See the `CastTarget` docs for details. The bool
+    /// indicates if a `Reg::i32()` dummy argument is emitted before the real argument.
+    Cast { pad_i32: bool, cast: Box<CastTarget> },
     /// Pass the argument indirectly via a hidden pointer.
-    /// The `extra_attrs` value, if any, is for the extra data (vtable or length)
-    /// which indicates that it refers to an unsized rvalue.
-    /// `on_stack` defines that the the value should be passed at a fixed
-    /// stack offset in accordance to the ABI rather than passed using a
-    /// pointer. This corresponds to the `byval` LLVM argument attribute.
-    Indirect { attrs: ArgAttributes, extra_attrs: Option<ArgAttributes>, on_stack: bool },
+    /// The `meta_attrs` value, if any, is for the metadata (vtable or length) of an unsized
+    /// argument. (This is the only mode that supports unsized arguments.)
+    /// `on_stack` defines that the value should be passed at a fixed stack offset in accordance to
+    /// the ABI rather than passed using a pointer. This corresponds to the `byval` LLVM argument
+    /// attribute (using the Rust type of this argument). `on_stack` cannot be true for unsized
+    /// arguments, i.e., when `meta_attrs` is `Some`.
+    Indirect { attrs: ArgAttributes, meta_attrs: Option<ArgAttributes>, on_stack: bool },
+}
+
+impl PassMode {
+    /// Checks if these two `PassMode` are equal enough to be considered "the same for all
+    /// function call ABIs". However, the `Layout` can also impact ABI decisions,
+    /// so that needs to be compared as well!
+    pub fn eq_abi(&self, other: &Self) -> bool {
+        match (self, other) {
+            (PassMode::Ignore, PassMode::Ignore) => true,
+            (PassMode::Direct(a1), PassMode::Direct(a2)) => a1.eq_abi(a2),
+            (PassMode::Pair(a1, b1), PassMode::Pair(a2, b2)) => a1.eq_abi(a2) && b1.eq_abi(b2),
+            (
+                PassMode::Cast { cast: c1, pad_i32: pad1 },
+                PassMode::Cast { cast: c2, pad_i32: pad2 },
+            ) => c1.eq_abi(c2) && pad1 == pad2,
+            (
+                PassMode::Indirect { attrs: a1, meta_attrs: None, on_stack: s1 },
+                PassMode::Indirect { attrs: a2, meta_attrs: None, on_stack: s2 },
+            ) => a1.eq_abi(a2) && s1 == s2,
+            (
+                PassMode::Indirect { attrs: a1, meta_attrs: Some(e1), on_stack: s1 },
+                PassMode::Indirect { attrs: a2, meta_attrs: Some(e2), on_stack: s2 },
+            ) => a1.eq_abi(a2) && e1.eq_abi(e2) && s1 == s2,
+            _ => false,
+        }
+    }
 }
 
 // Hack to disable non_upper_case_globals only for the bitflags! and not for the rest
@@ -62,17 +95,13 @@ mod attr_impl {
     // The subset of llvm::Attribute needed for arguments, packed into a bitfield.
     bitflags::bitflags! {
         #[derive(Default, HashStable_Generic)]
-        pub struct ArgAttribute: u16 {
+        pub struct ArgAttribute: u8 {
             const NoAlias   = 1 << 1;
             const NoCapture = 1 << 2;
             const NonNull   = 1 << 3;
             const ReadOnly  = 1 << 4;
             const InReg     = 1 << 5;
-            // Due to past miscompiles in LLVM, we use a separate attribute for
-            // &mut arguments, so that the codegen backend can decide whether
-            // or not to actually emit the attribute. It can also be controlled
-            // with the `-Zmutable-noalias` debugging option.
-            const NoAliasMutRef = 1 << 6;
+            const NoUndef = 1 << 6;
         }
     }
 }
@@ -128,6 +157,24 @@ impl ArgAttributes {
     pub fn contains(&self, attr: ArgAttribute) -> bool {
         self.regular.contains(attr)
     }
+
+    /// Checks if these two `ArgAttributes` are equal enough to be considered "the same for all
+    /// function call ABIs".
+    pub fn eq_abi(&self, other: &Self) -> bool {
+        // There's only one regular attribute that matters for the call ABI: InReg.
+        // Everything else is things like noalias, dereferenceable, nonnull, ...
+        // (This also applies to pointee_size, pointee_align.)
+        if self.regular.contains(ArgAttribute::InReg) != other.regular.contains(ArgAttribute::InReg)
+        {
+            return false;
+        }
+        // We also compare the sign extension mode -- this could let the callee make assumptions
+        // about bits that conceptually were not even passed.
+        if self.arg_ext != other.arg_ext {
+            return false;
+        }
+        return true;
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
@@ -173,12 +220,12 @@ impl Reg {
                 17..=32 => dl.i32_align.abi,
                 33..=64 => dl.i64_align.abi,
                 65..=128 => dl.i128_align.abi,
-                _ => panic!("unsupported integer: {:?}", self),
+                _ => panic!("unsupported integer: {self:?}"),
             },
             RegKind::Float => match self.size.bits() {
                 32 => dl.f32_align.abi,
                 64 => dl.f64_align.abi,
-                _ => panic!("unsupported float: {:?}", self),
+                _ => panic!("unsupported float: {self:?}"),
             },
             RegKind::Vector => dl.vector_align(self.size).abi,
         }
@@ -212,11 +259,18 @@ impl Uniform {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+/// Describes the type used for `PassMode::Cast`.
+///
+/// Passing arguments in this mode works as follows: the registers in the `prefix` (the ones that
+/// are `Some`) get laid out one after the other (using `repr(C)` layout rules). Then the
+/// `rest.unit` register type gets repeated often enough to cover `rest.size`. This describes the
+/// actual type used for the call; the Rust type of the argument is then transmuted to this ABI type
+/// (and all data in the padding between the registers is dropped).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct CastTarget {
-    pub prefix: [Option<RegKind>; 8],
-    pub prefix_chunk_size: Size,
+    pub prefix: [Option<Reg>; 8],
     pub rest: Uniform,
+    pub attrs: ArgAttributes,
 }
 
 impl From<Reg> for CastTarget {
@@ -227,32 +281,59 @@ impl From<Reg> for CastTarget {
 
 impl From<Uniform> for CastTarget {
     fn from(uniform: Uniform) -> CastTarget {
-        CastTarget { prefix: [None; 8], prefix_chunk_size: Size::ZERO, rest: uniform }
+        CastTarget {
+            prefix: [None; 8],
+            rest: uniform,
+            attrs: ArgAttributes {
+                regular: ArgAttribute::default(),
+                arg_ext: ArgExtension::None,
+                pointee_size: Size::ZERO,
+                pointee_align: None,
+            },
+        }
     }
 }
 
 impl CastTarget {
     pub fn pair(a: Reg, b: Reg) -> CastTarget {
         CastTarget {
-            prefix: [Some(a.kind), None, None, None, None, None, None, None],
-            prefix_chunk_size: a.size,
+            prefix: [Some(a), None, None, None, None, None, None, None],
             rest: Uniform::from(b),
+            attrs: ArgAttributes {
+                regular: ArgAttribute::default(),
+                arg_ext: ArgExtension::None,
+                pointee_size: Size::ZERO,
+                pointee_align: None,
+            },
         }
     }
 
-    pub fn size<C: HasDataLayout>(&self, cx: &C) -> Size {
-        (self.prefix_chunk_size * self.prefix.iter().filter(|x| x.is_some()).count() as u64)
-            .align_to(self.rest.align(cx))
-            + self.rest.total
+    pub fn size<C: HasDataLayout>(&self, _cx: &C) -> Size {
+        let mut size = self.rest.total;
+        for i in 0..self.prefix.iter().count() {
+            match self.prefix[i] {
+                Some(v) => size += v.size,
+                None => {}
+            }
+        }
+        return size;
     }
 
     pub fn align<C: HasDataLayout>(&self, cx: &C) -> Align {
         self.prefix
             .iter()
-            .filter_map(|x| x.map(|kind| Reg { kind, size: self.prefix_chunk_size }.align(cx)))
+            .filter_map(|x| x.map(|reg| reg.align(cx)))
             .fold(cx.data_layout().aggregate_align.abi.max(self.rest.align(cx)), |acc, align| {
                 acc.max(align)
             })
+    }
+
+    /// Checks if these two `CastTarget` are equal enough to be considered "the same for all
+    /// function call ABIs".
+    pub fn eq_abi(&self, other: &Self) -> bool {
+        let CastTarget { prefix: prefix_l, rest: rest_l, attrs: attrs_l } = self;
+        let CastTarget { prefix: prefix_r, rest: rest_r, attrs: attrs_r } = other;
+        prefix_l == prefix_r && rest_l == rest_r && attrs_l.eq_abi(attrs_r)
     }
 }
 
@@ -301,6 +382,7 @@ impl HomogeneousAggregate {
 }
 
 impl<'a, Ty> TyAndLayout<'a, Ty> {
+    /// Returns `true` if this is an aggregate type (including a ScalarPair!)
     fn is_aggregate(&self) -> bool {
         match self.abi {
             Abi::Uninhabited | Abi::Scalar(_) | Abi::Vector { .. } => false,
@@ -312,8 +394,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
     /// only a single type (e.g., `(u32, u32)`). Such aggregates are often
     /// special-cased in ABIs.
     ///
-    /// Note: We generally ignore fields of zero-sized type when computing
-    /// this value (see #56877).
+    /// Note: We generally ignore 1-ZST fields when computing this value (see #56877).
     ///
     /// This is public so that it can be used in unit tests, but
     /// should generally only be relevant to the ABI details of
@@ -327,8 +408,8 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
 
             // The primitive for this algorithm.
             Abi::Scalar(scalar) => {
-                let kind = match scalar.value {
-                    abi::Int(..) | abi::Pointer => RegKind::Integer,
+                let kind = match scalar.primitive() {
+                    abi::Int(..) | abi::Pointer(_) => RegKind::Integer,
                     abi::F32 | abi::F64 => RegKind::Float,
                 };
                 Ok(HomogeneousAggregate::Homogeneous(Reg { kind, size: self.size }))
@@ -342,7 +423,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                 }))
             }
 
-            Abi::ScalarPair(..) | Abi::Aggregate { .. } => {
+            Abi::ScalarPair(..) | Abi::Aggregate { sized: true } => {
                 // Helper for computing `homogeneous_aggregate`, allowing a custom
                 // starting offset (used below for handling variants).
                 let from_fields_at =
@@ -371,11 +452,17 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                         let mut total = start;
 
                         for i in 0..layout.fields.count() {
-                            if !is_union && total != layout.fields.offset(i) {
-                                return Err(Heterogeneous);
+                            let field = layout.field(cx, i);
+                            if field.is_1zst() {
+                                // No data here and no impact on layout, can be ignored.
+                                // (We might be able to also ignore all aligned ZST but that's less clear.)
+                                continue;
                             }
 
-                            let field = layout.field(cx, i);
+                            if !is_union && total != layout.fields.offset(i) {
+                                // This field isn't just after the previous one we considered, abort.
+                                return Err(Heterogeneous);
+                            }
 
                             result = result.merge(field.homogeneous_aggregate(cx)?)?;
 
@@ -434,23 +521,29 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                     Ok(result)
                 }
             }
+            Abi::Aggregate { sized: false } => Err(Heterogeneous),
         }
     }
 }
 
 /// Information about how to pass an argument to,
 /// or return a value from, a function, under some ABI.
-#[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, HashStable_Generic)]
 pub struct ArgAbi<'a, Ty> {
     pub layout: TyAndLayout<'a, Ty>,
-
-    /// Dummy argument, which is emitted before the real argument.
-    pub pad: Option<Reg>,
-
     pub mode: PassMode,
 }
 
+// Needs to be a custom impl because of the bounds on the `TyAndLayout` debug impl.
+impl<'a, Ty: fmt::Display> fmt::Debug for ArgAbi<'a, Ty> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ArgAbi { layout, mode } = self;
+        f.debug_struct("ArgAbi").field("layout", layout).field("mode", mode).finish()
+    }
+}
+
 impl<'a, Ty> ArgAbi<'a, Ty> {
+    /// This defines the "default ABI" for that type, that is then later adjusted in `fn_abi_adjust_for_abi`.
     pub fn new(
         cx: &impl HasDataLayout,
         layout: TyAndLayout<'a, Ty>,
@@ -461,12 +554,12 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             Abi::Scalar(scalar) => PassMode::Direct(scalar_attrs(&layout, scalar, Size::ZERO)),
             Abi::ScalarPair(a, b) => PassMode::Pair(
                 scalar_attrs(&layout, a, Size::ZERO),
-                scalar_attrs(&layout, b, a.value.size(cx).align_to(b.value.align(cx).abi)),
+                scalar_attrs(&layout, b, a.size(cx).align_to(b.align(cx).abi)),
             ),
             Abi::Vector { .. } => PassMode::Direct(ArgAttributes::new()),
-            Abi::Aggregate { .. } => PassMode::Direct(ArgAttributes::new()),
+            Abi::Aggregate { .. } => Self::indirect_pass_mode(&layout),
         };
-        ArgAbi { layout, pad: None, mode }
+        ArgAbi { layout, mode }
     }
 
     fn indirect_pass_mode(layout: &TyAndLayout<'a, Ty>) -> PassMode {
@@ -475,32 +568,58 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
         // For non-immediate arguments the callee gets its own copy of
         // the value on the stack, so there are no aliases. It's also
         // program-invisible so can't possibly capture
-        attrs.set(ArgAttribute::NoAlias).set(ArgAttribute::NoCapture).set(ArgAttribute::NonNull);
+        attrs
+            .set(ArgAttribute::NoAlias)
+            .set(ArgAttribute::NoCapture)
+            .set(ArgAttribute::NonNull)
+            .set(ArgAttribute::NoUndef);
         attrs.pointee_size = layout.size;
-        // FIXME(eddyb) We should be doing this, but at least on
-        // i686-pc-windows-msvc, it results in wrong stack offsets.
-        // attrs.pointee_align = Some(layout.align.abi);
+        attrs.pointee_align = Some(layout.align.abi);
 
-        let extra_attrs = layout.is_unsized().then_some(ArgAttributes::new());
+        let meta_attrs = layout.is_unsized().then_some(ArgAttributes::new());
 
-        PassMode::Indirect { attrs, extra_attrs, on_stack: false }
+        PassMode::Indirect { attrs, meta_attrs, on_stack: false }
+    }
+
+    /// Pass this argument directly instead. Should NOT be used!
+    /// Only exists because of past ABI mistakes that will take time to fix
+    /// (see <https://github.com/rust-lang/rust/issues/115666>).
+    pub fn make_direct_deprecated(&mut self) {
+        match self.mode {
+            PassMode::Indirect { .. } => {
+                self.mode = PassMode::Direct(ArgAttributes::new());
+            }
+            PassMode::Ignore | PassMode::Direct(_) | PassMode::Pair(_, _) => return, // already direct
+            _ => panic!("Tried to make {:?} direct", self.mode),
+        }
     }
 
     pub fn make_indirect(&mut self) {
         match self.mode {
-            PassMode::Direct(_) | PassMode::Pair(_, _) => {}
-            PassMode::Indirect { attrs: _, extra_attrs: None, on_stack: false } => return,
+            PassMode::Direct(_) | PassMode::Pair(_, _) => {
+                self.mode = Self::indirect_pass_mode(&self.layout);
+            }
+            PassMode::Indirect { attrs: _, meta_attrs: _, on_stack: false } => {
+                // already indirect
+                return;
+            }
             _ => panic!("Tried to make {:?} indirect", self.mode),
         }
-
-        self.mode = Self::indirect_pass_mode(&self.layout);
     }
 
-    pub fn make_indirect_byval(&mut self) {
+    pub fn make_indirect_byval(&mut self, byval_align: Option<Align>) {
         self.make_indirect();
         match self.mode {
-            PassMode::Indirect { attrs: _, extra_attrs: _, ref mut on_stack } => {
+            PassMode::Indirect { ref mut attrs, meta_attrs: _, ref mut on_stack } => {
                 *on_stack = true;
+
+                // Some platforms, like 32-bit x86, change the alignment of the type when passing
+                // `byval`. Account for that.
+                if let Some(byval_align) = byval_align {
+                    // On all targets with byval align this is currently true, so let's assert it.
+                    debug_assert!(byval_align >= Align::from_bytes(4).unwrap());
+                    attrs.pointee_align = Some(byval_align);
+                }
             }
             _ => unreachable!(),
         }
@@ -509,7 +628,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     pub fn extend_integer_width_to(&mut self, bits: u64) {
         // Only integers have signedness
         if let Abi::Scalar(scalar) = self.layout.abi {
-            if let abi::Int(i, signed) = scalar.value {
+            if let abi::Int(i, signed) = scalar.primitive() {
                 if i.size().bits() < bits {
                     if let PassMode::Direct(ref mut attrs) = self.mode {
                         if signed {
@@ -524,11 +643,11 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     }
 
     pub fn cast_to<T: Into<CastTarget>>(&mut self, target: T) {
-        self.mode = PassMode::Cast(target.into());
+        self.mode = PassMode::Cast { cast: Box::new(target.into()), pad_i32: false };
     }
 
-    pub fn pad_with(&mut self, reg: Reg) {
-        self.pad = Some(reg);
+    pub fn cast_to_and_pad_i32<T: Into<CastTarget>>(&mut self, target: T, pad_i32: bool) {
+        self.mode = PassMode::Cast { cast: Box::new(target.into()), pad_i32 };
     }
 
     pub fn is_indirect(&self) -> bool {
@@ -536,15 +655,23 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     }
 
     pub fn is_sized_indirect(&self) -> bool {
-        matches!(self.mode, PassMode::Indirect { attrs: _, extra_attrs: None, on_stack: _ })
+        matches!(self.mode, PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ })
     }
 
     pub fn is_unsized_indirect(&self) -> bool {
-        matches!(self.mode, PassMode::Indirect { attrs: _, extra_attrs: Some(_), on_stack: _ })
+        matches!(self.mode, PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ })
     }
 
     pub fn is_ignore(&self) -> bool {
         matches!(self.mode, PassMode::Ignore)
+    }
+
+    /// Checks if these two `ArgAbi` are equal enough to be considered "the same for all
+    /// function call ABIs".
+    pub fn eq_abi(&self, other: &Self) -> bool {
+        // Ideally we'd just compare the `mode`, but that is not enough -- for some modes LLVM will look
+        // at the type.
+        self.layout.eq_abi(&other.layout) && self.mode.eq_abi(&other.mode)
     }
 }
 
@@ -554,6 +681,10 @@ pub enum Conv {
     // should have its own backend (e.g. LLVM) support.
     C,
     Rust,
+
+    Cold,
+    PreserveMost,
+    PreserveAll,
 
     // Target-specific calling conventions.
     ArmAapcs,
@@ -575,6 +706,23 @@ pub enum Conv {
     AmdGpuKernel,
     AvrInterrupt,
     AvrNonBlockingInterrupt,
+
+    RiscvInterrupt { kind: RiscvInterruptKind },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+pub enum RiscvInterruptKind {
+    Machine,
+    Supervisor,
+}
+
+impl RiscvInterruptKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Machine => "machine",
+            Self::Supervisor => "supervisor",
+        }
+    }
 }
 
 /// Metadata describing how the arguments to a native function
@@ -582,10 +730,10 @@ pub enum Conv {
 ///
 /// I will do my best to describe this structure, but these
 /// comments are reverse-engineered and may be inaccurate. -NDM
-#[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, HashStable_Generic)]
 pub struct FnAbi<'a, Ty> {
     /// The LLVM types of each argument.
-    pub args: Vec<ArgAbi<'a, Ty>>,
+    pub args: Box<[ArgAbi<'a, Ty>]>,
 
     /// LLVM return type.
     pub ret: ArgAbi<'a, Ty>,
@@ -596,28 +744,33 @@ pub struct FnAbi<'a, Ty> {
     ///
     /// Should only be different from args.len() when c_variadic is true.
     /// This can be used to know whether an argument is variadic or not.
-    pub fixed_count: usize,
+    pub fixed_count: u32,
 
     pub conv: Conv,
 
     pub can_unwind: bool,
 }
 
-/// Error produced by attempting to adjust a `FnAbi`, for a "foreign" ABI.
-#[derive(Clone, Debug, HashStable_Generic)]
-pub enum AdjustForForeignAbiError {
-    /// Target architecture doesn't support "foreign" (i.e. non-Rust) ABIs.
-    Unsupported { arch: String, abi: spec::abi::Abi },
+// Needs to be a custom impl because of the bounds on the `TyAndLayout` debug impl.
+impl<'a, Ty: fmt::Display> fmt::Debug for FnAbi<'a, Ty> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let FnAbi { args, ret, c_variadic, fixed_count, conv, can_unwind } = self;
+        f.debug_struct("FnAbi")
+            .field("args", args)
+            .field("ret", ret)
+            .field("c_variadic", c_variadic)
+            .field("fixed_count", fixed_count)
+            .field("conv", conv)
+            .field("can_unwind", can_unwind)
+            .finish()
+    }
 }
 
-impl fmt::Display for AdjustForForeignAbiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { arch, abi } => {
-                write!(f, "target architecture {:?} does not support `extern {}` ABI", arch, abi)
-            }
-        }
-    }
+/// Error produced by attempting to adjust a `FnAbi`, for a "foreign" ABI.
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
+pub enum AdjustForForeignAbiError {
+    /// Target architecture doesn't support "foreign" (i.e. non-Rust) ABIs.
+    Unsupported { arch: Symbol, abi: spec::abi::Abi },
 }
 
 impl<'a, Ty> FnAbi<'a, Ty> {
@@ -632,44 +785,65 @@ impl<'a, Ty> FnAbi<'a, Ty> {
     {
         if abi == spec::abi::Abi::X86Interrupt {
             if let Some(arg) = self.args.first_mut() {
-                arg.make_indirect_byval();
+                // FIXME(pcwalton): This probably should use the x86 `byval` ABI...
+                arg.make_indirect_byval(None);
             }
             return Ok(());
         }
 
         match &cx.target_spec().arch[..] {
             "x86" => {
-                let flavor = if abi == spec::abi::Abi::Fastcall {
-                    x86::Flavor::Fastcall
+                let flavor = if let spec::abi::Abi::Fastcall { .. }
+                | spec::abi::Abi::Vectorcall { .. } = abi
+                {
+                    x86::Flavor::FastcallOrVectorcall
                 } else {
                     x86::Flavor::General
                 };
                 x86::compute_abi_info(cx, self, flavor);
             }
-            "x86_64" => {
-                if abi == spec::abi::Abi::SysV64 {
-                    x86_64::compute_abi_info(cx, self);
-                } else if abi == spec::abi::Abi::Win64 || cx.target_spec().is_like_windows {
-                    x86_win64::compute_abi_info(self);
-                } else {
-                    x86_64::compute_abi_info(cx, self);
+            "x86_64" => match abi {
+                spec::abi::Abi::SysV64 { .. } => x86_64::compute_abi_info(cx, self),
+                spec::abi::Abi::Win64 { .. } => x86_win64::compute_abi_info(self),
+                _ => {
+                    if cx.target_spec().is_like_windows {
+                        x86_win64::compute_abi_info(self)
+                    } else {
+                        x86_64::compute_abi_info(cx, self)
+                    }
                 }
+            },
+            "aarch64" => {
+                let kind = if cx.target_spec().is_like_osx {
+                    aarch64::AbiKind::DarwinPCS
+                } else if cx.target_spec().is_like_windows {
+                    aarch64::AbiKind::Win64
+                } else {
+                    aarch64::AbiKind::AAPCS
+                };
+                aarch64::compute_abi_info(cx, self, kind)
             }
-            "aarch64" => aarch64::compute_abi_info(cx, self),
             "amdgpu" => amdgpu::compute_abi_info(cx, self),
             "arm" => arm::compute_abi_info(cx, self),
             "avr" => avr::compute_abi_info(self),
+            "loongarch64" => loongarch::compute_abi_info(cx, self),
             "m68k" => m68k::compute_abi_info(self),
-            "mips" => mips::compute_abi_info(cx, self),
-            "mips64" => mips64::compute_abi_info(cx, self),
+            "csky" => csky::compute_abi_info(self),
+            "mips" | "mips32r6" => mips::compute_abi_info(cx, self),
+            "mips64" | "mips64r6" => mips64::compute_abi_info(cx, self),
             "powerpc" => powerpc::compute_abi_info(self),
             "powerpc64" => powerpc64::compute_abi_info(cx, self),
             "s390x" => s390x::compute_abi_info(cx, self),
             "msp430" => msp430::compute_abi_info(self),
             "sparc" => sparc::compute_abi_info(cx, self),
             "sparc64" => sparc64::compute_abi_info(cx, self),
-            "nvptx" => nvptx::compute_abi_info(self),
-            "nvptx64" => nvptx64::compute_abi_info(self),
+            "nvptx64" => {
+                if cx.target_spec().adjust_abi(abi) == spec::abi::Abi::PtxKernel {
+                    nvptx64::compute_ptx_kernel_abi_info(cx, self)
+                } else {
+                    nvptx64::compute_abi_info(self)
+                }
+            }
             "hexagon" => hexagon::compute_abi_info(self),
             "riscv32" | "riscv64" => riscv::compute_abi_info(cx, self),
             "wasm32" | "wasm64" => {
@@ -679,13 +853,59 @@ impl<'a, Ty> FnAbi<'a, Ty> {
                     wasm::compute_c_abi_info(cx, self)
                 }
             }
-            "asmjs" => wasm::compute_c_abi_info(cx, self),
             "bpf" => bpf::compute_abi_info(self),
             arch => {
-                return Err(AdjustForForeignAbiError::Unsupported { arch: arch.to_string(), abi });
+                return Err(AdjustForForeignAbiError::Unsupported {
+                    arch: Symbol::intern(arch),
+                    abi,
+                });
             }
         }
 
         Ok(())
     }
+}
+
+impl FromStr for Conv {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "C" => Ok(Conv::C),
+            "Rust" => Ok(Conv::Rust),
+            "RustCold" => Ok(Conv::Rust),
+            "ArmAapcs" => Ok(Conv::ArmAapcs),
+            "CCmseNonSecureCall" => Ok(Conv::CCmseNonSecureCall),
+            "Msp430Intr" => Ok(Conv::Msp430Intr),
+            "PtxKernel" => Ok(Conv::PtxKernel),
+            "X86Fastcall" => Ok(Conv::X86Fastcall),
+            "X86Intr" => Ok(Conv::X86Intr),
+            "X86Stdcall" => Ok(Conv::X86Stdcall),
+            "X86ThisCall" => Ok(Conv::X86ThisCall),
+            "X86VectorCall" => Ok(Conv::X86VectorCall),
+            "X86_64SysV" => Ok(Conv::X86_64SysV),
+            "X86_64Win64" => Ok(Conv::X86_64Win64),
+            "AmdGpuKernel" => Ok(Conv::AmdGpuKernel),
+            "AvrInterrupt" => Ok(Conv::AvrInterrupt),
+            "AvrNonBlockingInterrupt" => Ok(Conv::AvrNonBlockingInterrupt),
+            "RiscvInterrupt(machine)" => {
+                Ok(Conv::RiscvInterrupt { kind: RiscvInterruptKind::Machine })
+            }
+            "RiscvInterrupt(supervisor)" => {
+                Ok(Conv::RiscvInterrupt { kind: RiscvInterruptKind::Supervisor })
+            }
+            _ => Err(format!("'{s}' is not a valid value for entry function call convention.")),
+        }
+    }
+}
+
+// Some types are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod size_asserts {
+    use super::*;
+    use rustc_data_structures::static_assert_size;
+    // tidy-alphabetical-start
+    static_assert_size!(ArgAbi<'_, usize>, 56);
+    static_assert_size!(FnAbi<'_, usize>, 80);
+    // tidy-alphabetical-end
 }

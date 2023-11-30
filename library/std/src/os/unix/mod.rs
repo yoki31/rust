@@ -37,6 +37,8 @@ use crate::os::linux as platform;
 
 #[cfg(not(doc))]
 mod platform {
+    #[cfg(target_os = "aix")]
+    pub use crate::os::aix::*;
     #[cfg(target_os = "android")]
     pub use crate::os::android::*;
     #[cfg(target_os = "dragonfly")]
@@ -51,24 +53,38 @@ mod platform {
     pub use crate::os::fuchsia::*;
     #[cfg(target_os = "haiku")]
     pub use crate::os::haiku::*;
+    #[cfg(target_os = "horizon")]
+    pub use crate::os::horizon::*;
+    #[cfg(target_os = "hurd")]
+    pub use crate::os::hurd::*;
     #[cfg(target_os = "illumos")]
     pub use crate::os::illumos::*;
     #[cfg(target_os = "ios")]
     pub use crate::os::ios::*;
-    #[cfg(any(target_os = "linux", target_os = "l4re"))]
+    #[cfg(target_os = "l4re")]
+    pub use crate::os::l4re::*;
+    #[cfg(target_os = "linux")]
     pub use crate::os::linux::*;
     #[cfg(target_os = "macos")]
     pub use crate::os::macos::*;
     #[cfg(target_os = "netbsd")]
     pub use crate::os::netbsd::*;
+    #[cfg(target_os = "nto")]
+    pub use crate::os::nto::*;
     #[cfg(target_os = "openbsd")]
     pub use crate::os::openbsd::*;
     #[cfg(target_os = "redox")]
     pub use crate::os::redox::*;
     #[cfg(target_os = "solaris")]
     pub use crate::os::solaris::*;
+    #[cfg(target_os = "tvos")]
+    pub use crate::os::tvos::*;
+    #[cfg(target_os = "vita")]
+    pub use crate::os::vita::*;
     #[cfg(target_os = "vxworks")]
     pub use crate::os::vxworks::*;
+    #[cfg(target_os = "watchos")]
+    pub use crate::os::watchos::*;
 }
 
 pub mod ffi;
@@ -86,9 +102,12 @@ pub mod thread;
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
     target_os = "macos",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    target_os = "nto",
 ))]
 pub mod ucred;
 

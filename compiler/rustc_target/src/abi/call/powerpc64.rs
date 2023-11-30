@@ -46,6 +46,10 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout,
 {
+    if !ret.layout.is_sized() {
+        // Not touching this...
+        return;
+    }
     if !ret.layout.is_aggregate() {
         ret.extend_integer_width_to(64);
         return;
@@ -89,6 +93,10 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout,
 {
+    if !arg.layout.is_sized() {
+        // Not touching this...
+        return;
+    }
     if !arg.layout.is_aggregate() {
         arg.extend_integer_width_to(64);
         return;
@@ -132,7 +140,7 @@ where
         classify_ret(cx, &mut fn_abi.ret, abi);
     }
 
-    for arg in &mut fn_abi.args {
+    for arg in fn_abi.args.iter_mut() {
         if arg.is_ignore() {
             continue;
         }

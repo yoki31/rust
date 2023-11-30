@@ -4,10 +4,12 @@
 
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{self, BasicBlock, Local, Location, Statement, StatementKind};
+use rustc_middle::mir::{
+    self, BasicBlock, CallReturnPlaces, Local, Location, Statement, StatementKind, TerminatorEdges,
+};
 use rustc_mir_dataflow::fmt::DebugWithContext;
 use rustc_mir_dataflow::JoinSemiLattice;
-use rustc_span::DUMMY_SP;
+use rustc_mir_dataflow::{Analysis, AnalysisDomain};
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -27,7 +29,7 @@ struct TransferFunction<'a, 'mir, 'tcx, Q> {
     _qualif: PhantomData<Q>,
 }
 
-impl<Q> TransferFunction<'a, 'mir, 'tcx, Q>
+impl<'a, 'mir, 'tcx, Q> TransferFunction<'a, 'mir, 'tcx, Q>
 where
     Q: Qualif,
 {
@@ -80,18 +82,18 @@ where
     fn apply_call_return_effect(
         &mut self,
         _block: BasicBlock,
-        _func: &mir::Operand<'tcx>,
-        _args: &[mir::Operand<'tcx>],
-        return_place: mir::Place<'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
-        // We cannot reason about another function's internals, so use conservative type-based
-        // qualification for the result of a function call.
-        let return_ty = return_place.ty(self.ccx.body, self.ccx.tcx).ty;
-        let qualif = Q::in_any_value_of_ty(self.ccx, return_ty);
+        return_places.for_each(|place| {
+            // We cannot reason about another function's internals, so use conservative type-based
+            // qualification for the result of a function call.
+            let return_ty = place.ty(self.ccx.body, self.ccx.tcx).ty;
+            let qualif = Q::in_any_value_of_ty(self.ccx, return_ty);
 
-        if !return_place.is_indirect() {
-            self.assign_qualif_direct(&return_place, qualif);
-        }
+            if !place.is_indirect() {
+                self.assign_qualif_direct(&place, qualif);
+            }
+        });
     }
 
     fn address_of_allows_mutation(&self, _mt: mir::Mutability, _place: mir::Place<'tcx>) -> bool {
@@ -103,7 +105,7 @@ where
     fn ref_allows_mutation(&self, kind: mir::BorrowKind, place: mir::Place<'tcx>) -> bool {
         match kind {
             mir::BorrowKind::Mut { .. } => true,
-            mir::BorrowKind::Shared | mir::BorrowKind::Shallow | mir::BorrowKind::Unique => {
+            mir::BorrowKind::Shared | mir::BorrowKind::Fake => {
                 self.shared_borrow_allows_mutation(place)
             }
         }
@@ -119,14 +121,11 @@ where
     ///
     /// [rust-lang/unsafe-code-guidelines#134]: https://github.com/rust-lang/unsafe-code-guidelines/issues/134
     fn shared_borrow_allows_mutation(&self, place: mir::Place<'tcx>) -> bool {
-        !place
-            .ty(self.ccx.body, self.ccx.tcx)
-            .ty
-            .is_freeze(self.ccx.tcx.at(DUMMY_SP), self.ccx.param_env)
+        !place.ty(self.ccx.body, self.ccx.tcx).ty.is_freeze(self.ccx.tcx, self.ccx.param_env)
     }
 }
 
-impl<Q> Visitor<'tcx> for TransferFunction<'_, '_, 'tcx, Q>
+impl<'tcx, Q> Visitor<'tcx> for TransferFunction<'_, '_, 'tcx, Q>
 where
     Q: Qualif,
 {
@@ -198,6 +197,7 @@ where
             mir::Rvalue::Cast(..)
             | mir::Rvalue::ShallowInitBox(..)
             | mir::Rvalue::Use(..)
+            | mir::Rvalue::CopyForDeref(..)
             | mir::Rvalue::ThreadLocalRef(..)
             | mir::Rvalue::Repeat(..)
             | mir::Rvalue::Len(..)
@@ -224,23 +224,8 @@ where
         // The effect of assignment to the return place in `TerminatorKind::Call` is not applied
         // here; that occurs in `apply_call_return_effect`.
 
-        if let mir::TerminatorKind::DropAndReplace { value, place, .. } = &terminator.kind {
-            let qualif = qualifs::in_operand::<Q, _>(
-                self.ccx,
-                &mut |l| self.state.qualif.contains(l),
-                value,
-            );
-
-            if !place.is_indirect() {
-                self.assign_qualif_direct(place, qualif);
-            }
-        }
-
         // We ignore borrow on drop because custom drop impls are not allowed in consts.
         // FIXME: Reconsider if accounting for borrows in drops is necessary for const drop.
-
-        // We need to assign qualifs to the dropped location before visiting the operand that
-        // replaces it since qualifs can be cleared on move.
         self.super_terminator(terminator, location);
     }
 }
@@ -329,7 +314,7 @@ impl JoinSemiLattice for State {
     }
 }
 
-impl<Q> rustc_mir_dataflow::AnalysisDomain<'tcx> for FlowSensitiveAnalysis<'_, '_, 'tcx, Q>
+impl<'tcx, Q> AnalysisDomain<'tcx> for FlowSensitiveAnalysis<'_, '_, 'tcx, Q>
 where
     Q: Qualif,
 {
@@ -349,12 +334,12 @@ where
     }
 }
 
-impl<Q> rustc_mir_dataflow::Analysis<'tcx> for FlowSensitiveAnalysis<'_, '_, 'tcx, Q>
+impl<'tcx, Q> Analysis<'tcx> for FlowSensitiveAnalysis<'_, '_, 'tcx, Q>
 where
     Q: Qualif,
 {
     fn apply_statement_effect(
-        &self,
+        &mut self,
         state: &mut Self::Domain,
         statement: &mir::Statement<'tcx>,
         location: Location,
@@ -362,23 +347,22 @@ where
         self.transfer_function(state).visit_statement(statement, location);
     }
 
-    fn apply_terminator_effect(
-        &self,
+    fn apply_terminator_effect<'mir>(
+        &mut self,
         state: &mut Self::Domain,
-        terminator: &mir::Terminator<'tcx>,
+        terminator: &'mir mir::Terminator<'tcx>,
         location: Location,
-    ) {
+    ) -> TerminatorEdges<'mir, 'tcx> {
         self.transfer_function(state).visit_terminator(terminator, location);
+        terminator.edges()
     }
 
     fn apply_call_return_effect(
-        &self,
+        &mut self,
         state: &mut Self::Domain,
         block: BasicBlock,
-        func: &mir::Operand<'tcx>,
-        args: &[mir::Operand<'tcx>],
-        return_place: mir::Place<'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
-        self.transfer_function(state).apply_call_return_effect(block, func, args, return_place)
+        self.transfer_function(state).apply_call_return_effect(block, return_places)
     }
 }

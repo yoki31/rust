@@ -7,28 +7,29 @@ pub(crate) mod printf {
     pub enum Substitution<'a> {
         /// A formatted output substitution with its internal byte offset.
         Format(Format<'a>),
-        /// A literal `%%` escape.
-        Escape,
+        /// A literal `%%` escape, with its start and end indices.
+        Escape((usize, usize)),
     }
 
     impl<'a> Substitution<'a> {
         pub fn as_str(&self) -> &str {
-            match *self {
-                Substitution::Format(ref fmt) => fmt.span,
-                Substitution::Escape => "%%",
+            match self {
+                Substitution::Format(fmt) => fmt.span,
+                Substitution::Escape(_) => "%%",
             }
         }
 
-        pub fn position(&self) -> Option<InnerSpan> {
-            match *self {
-                Substitution::Format(ref fmt) => Some(fmt.position),
-                _ => None,
+        pub fn position(&self) -> InnerSpan {
+            match self {
+                Substitution::Format(fmt) => fmt.position,
+                &Substitution::Escape((start, end)) => InnerSpan::new(start, end),
             }
         }
 
         pub fn set_position(&mut self, start: usize, end: usize) {
-            if let Substitution::Format(ref mut fmt) = self {
-                fmt.position = InnerSpan::new(start, end);
+            match self {
+                Substitution::Format(fmt) => fmt.position = InnerSpan::new(start, end),
+                Substitution::Escape(pos) => *pos = (start, end),
             }
         }
 
@@ -37,9 +38,9 @@ pub(crate) mod printf {
         /// This ignores cases where the substitution does not have an exact equivalent, or where
         /// the substitution would be unnecessary.
         pub fn translate(&self) -> Result<String, Option<String>> {
-            match *self {
-                Substitution::Format(ref fmt) => fmt.translate(),
-                Substitution::Escape => Err(None),
+            match self {
+                Substitution::Format(fmt) => fmt.translate(),
+                Substitution::Escape(_) => Err(None),
             }
         }
     }
@@ -85,10 +86,7 @@ pub(crate) mod printf {
                         '-' => c_left = true,
                         '+' => c_plus = true,
                         _ => {
-                            return Err(Some(format!(
-                                "the flag `{}` is unknown or unsupported",
-                                c
-                            )));
+                            return Err(Some(format!("the flag `{c}` is unknown or unsupported")));
                         }
                     }
                 }
@@ -252,7 +250,7 @@ pub(crate) mod printf {
     #[derive(Copy, Clone, PartialEq, Debug)]
     pub enum Num {
         // The range of these values is technically bounded by `NL_ARGMAX`... but, at least for GNU
-        // libc, it apparently has no real fixed limit.  A `u16` is used here on the basis that it
+        // libc, it apparently has no real fixed limit. A `u16` is used here on the basis that it
         // is *vanishingly* unlikely that *anyone* is going to try formatting something wider, or
         // with more precision, than 32 thousand positions which is so wide it couldn't possibly fit
         // on a screen.
@@ -267,21 +265,21 @@ pub(crate) mod printf {
     impl Num {
         fn from_str(s: &str, arg: Option<&str>) -> Self {
             if let Some(arg) = arg {
-                Num::Arg(arg.parse().unwrap_or_else(|_| panic!("invalid format arg `{:?}`", arg)))
+                Num::Arg(arg.parse().unwrap_or_else(|_| panic!("invalid format arg `{arg:?}`")))
             } else if s == "*" {
                 Num::Next
             } else {
-                Num::Num(s.parse().unwrap_or_else(|_| panic!("invalid format num `{:?}`", s)))
+                Num::Num(s.parse().unwrap_or_else(|_| panic!("invalid format num `{s:?}`")))
             }
         }
 
         fn translate(&self, s: &mut String) -> std::fmt::Result {
             use std::fmt::Write;
             match *self {
-                Num::Num(n) => write!(s, "{}", n),
+                Num::Num(n) => write!(s, "{n}"),
                 Num::Arg(n) => {
                     let n = n.checked_sub(1).ok_or(std::fmt::Error)?;
-                    write!(s, "{}$", n)
+                    write!(s, "{n}$")
                 }
                 Num::Next => write!(s, "*"),
             }
@@ -304,15 +302,9 @@ pub(crate) mod printf {
         fn next(&mut self) -> Option<Self::Item> {
             let (mut sub, tail) = parse_next_substitution(self.s)?;
             self.s = tail;
-            match sub {
-                Substitution::Format(_) => {
-                    if let Some(inner_span) = sub.position() {
-                        sub.set_position(inner_span.start + self.pos, inner_span.end + self.pos);
-                        self.pos += inner_span.end;
-                    }
-                }
-                Substitution::Escape => self.pos += 2,
-            }
+            let InnerSpan { start, end } = sub.position();
+            sub.set_position(start + self.pos, end + self.pos);
+            self.pos += end;
             Some(sub)
         }
 
@@ -340,7 +332,7 @@ pub(crate) mod printf {
         let at = {
             let start = s.find('%')?;
             if let '%' = s[start + 1..].chars().next()? {
-                return Some((Substitution::Escape, &s[start + 2..]));
+                return Some((Substitution::Escape((start, start + 2)), &s[start + 2..]));
             }
 
             Cur::new_at(s, start)
@@ -566,15 +558,13 @@ pub(crate) mod printf {
         }
 
         if let Type = state {
-            drop(c);
             type_ = at.slice_between(next).unwrap();
 
             // Don't use `move_to!` here, as we *can* be at the end of the input.
             at = next;
         }
 
-        drop(c);
-        drop(next);
+        let _ = c; // to avoid never used value
 
         end = at;
         let position = InnerSpan::new(start.at, end.at);
@@ -632,30 +622,24 @@ pub mod shell {
     impl Substitution<'_> {
         pub fn as_str(&self) -> String {
             match self {
-                Substitution::Ordinal(n, _) => format!("${}", n),
-                Substitution::Name(n, _) => format!("${}", n),
+                Substitution::Ordinal(n, _) => format!("${n}"),
+                Substitution::Name(n, _) => format!("${n}"),
                 Substitution::Escape(_) => "$$".into(),
             }
         }
 
-        pub fn position(&self) -> Option<InnerSpan> {
-            match self {
-                Substitution::Ordinal(_, pos)
-                | Substitution::Name(_, pos)
-                | Substitution::Escape(pos) => Some(InnerSpan::new(pos.0, pos.1)),
-            }
+        pub fn position(&self) -> InnerSpan {
+            let (Self::Ordinal(_, pos) | Self::Name(_, pos) | Self::Escape(pos)) = self;
+            InnerSpan::new(pos.0, pos.1)
         }
 
         pub fn set_position(&mut self, start: usize, end: usize) {
-            match self {
-                Substitution::Ordinal(_, ref mut pos)
-                | Substitution::Name(_, ref mut pos)
-                | Substitution::Escape(ref mut pos) => *pos = (start, end),
-            }
+            let (Self::Ordinal(_, pos) | Self::Name(_, pos) | Self::Escape(pos)) = self;
+            *pos = (start, end);
         }
 
         pub fn translate(&self) -> Result<String, Option<String>> {
-            match *self {
+            match self {
                 Substitution::Ordinal(n, _) => Ok(format!("{{{}}}", n)),
                 Substitution::Name(n, _) => Ok(format!("{{{}}}", n)),
                 Substitution::Escape(_) => Err(None),
@@ -679,10 +663,9 @@ pub mod shell {
         fn next(&mut self) -> Option<Self::Item> {
             let (mut sub, tail) = parse_next_substitution(self.s)?;
             self.s = tail;
-            if let Some(InnerSpan { start, end }) = sub.position() {
-                sub.set_position(start + self.pos, end + self.pos);
-                self.pos += end;
-            }
+            let InnerSpan { start, end } = sub.position();
+            sub.set_position(start + self.pos, end + self.pos);
+            self.pos += end;
             Some(sub)
         }
 

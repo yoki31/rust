@@ -6,8 +6,10 @@ use rustc_span::{SourceFile, Span, Symbol};
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::Size;
 
+use std::ops::Range;
+
 pub trait DebugInfoMethods<'tcx>: BackendTypes {
-    fn create_vtable_metadata(
+    fn create_vtable_debuginfo(
         &self,
         ty: Ty<'tcx>,
         trait_ref: Option<PolyExistentialTraitRef<'tcx>>,
@@ -24,7 +26,7 @@ pub trait DebugInfoMethods<'tcx>: BackendTypes {
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Function,
         mir: &mir::Body<'tcx>,
-    ) -> Option<FunctionDebugContext<Self::DIScope, Self::DILocation>>;
+    ) -> Option<FunctionDebugContext<'tcx, Self::DIScope, Self::DILocation>>;
 
     // FIXME(eddyb) find a common convention for all of the debuginfo-related
     // names (choose between `dbg`, `debug`, `debuginfo`, `debug_info` etc.).
@@ -72,6 +74,9 @@ pub trait DebugInfoBuilderMethods: BackendTypes {
         direct_offset: Size,
         // NB: each offset implies a deref (i.e. they're steps in a pointer chain).
         indirect_offsets: &[Size],
+        // Byte range in the `dbg_var` covered by this fragment,
+        // if this is a fragment of a composite `DIVariable`.
+        fragment: Option<Range<Size>>,
     );
     fn set_dbg_loc(&mut self, dbg_loc: Self::DILocation);
     fn insert_reference_to_gdb_debug_scripts_section_global(&mut self);

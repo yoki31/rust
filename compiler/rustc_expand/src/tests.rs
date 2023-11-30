@@ -2,13 +2,14 @@ use rustc_ast as ast;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_parse::{new_parser_from_source_str, parser::Parser, source_file_to_stream};
 use rustc_session::parse::ParseSess;
-use rustc_span::create_default_session_if_not_set_then;
+use rustc_span::create_default_session_globals_then;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{BytePos, MultiSpan, Span};
+use rustc_span::{BytePos, Span};
 
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::emitter::EmitterWriter;
-use rustc_errors::{Handler, PResult};
+use rustc_errors::{Handler, MultiSpan, PResult};
+use termcolor::WriteColor;
 
 use std::io;
 use std::io::prelude::*;
@@ -22,7 +23,24 @@ fn string_to_parser(ps: &ParseSess, source_str: String) -> Parser<'_> {
     new_parser_from_source_str(ps, PathBuf::from("bogofile").into(), source_str)
 }
 
-crate fn with_error_checking_parse<'a, T, F>(s: String, ps: &'a ParseSess, f: F) -> T
+fn create_test_handler() -> (Handler, Lrc<SourceMap>, Arc<Mutex<Vec<u8>>>) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let source_map = Lrc::new(SourceMap::new(FilePathMapping::empty()));
+    let fallback_bundle = rustc_errors::fallback_fluent_bundle(
+        vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
+        false,
+    );
+    let emitter = EmitterWriter::new(Box::new(Shared { data: output.clone() }), fallback_bundle)
+        .sm(Some(source_map.clone()))
+        .diagnostic_width(Some(140));
+    let handler = Handler::with_emitter(Box::new(emitter));
+    (handler, source_map, output)
+}
+
+/// Returns the result of parsing the given string via the given callback.
+///
+/// If there are any errors, this will panic.
+pub(crate) fn with_error_checking_parse<'a, T, F>(s: String, ps: &'a ParseSess, f: F) -> T
 where
     F: FnOnce(&mut Parser<'a>) -> PResult<'a, T>,
 {
@@ -32,20 +50,45 @@ where
     x
 }
 
+/// Verifies that parsing the given string using the given callback will
+/// generate an error that contains the given text.
+pub(crate) fn with_expected_parse_error<T, F>(source_str: &str, expected_output: &str, f: F)
+where
+    F: for<'a> FnOnce(&mut Parser<'a>) -> PResult<'a, T>,
+{
+    let (handler, source_map, output) = create_test_handler();
+    let ps = ParseSess::with_span_handler(handler, source_map);
+    let mut p = string_to_parser(&ps, source_str.to_string());
+    let result = f(&mut p);
+    assert!(result.is_ok());
+
+    let bytes = output.lock().unwrap();
+    let actual_output = str::from_utf8(&bytes).unwrap();
+    println!("expected output:\n------\n{}------", expected_output);
+    println!("actual output:\n------\n{}------", actual_output);
+
+    assert!(actual_output.contains(expected_output))
+}
+
 /// Maps a string to tts, using a made-up filename.
-crate fn string_to_stream(source_str: String) -> TokenStream {
-    let ps = ParseSess::new(FilePathMapping::empty());
+pub(crate) fn string_to_stream(source_str: String) -> TokenStream {
+    let ps = ParseSess::new(
+        vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
+        FilePathMapping::empty(),
+    );
     source_file_to_stream(
         &ps,
         ps.source_map().new_source_file(PathBuf::from("bogofile").into(), source_str),
         None,
     )
-    .0
 }
 
 /// Parses a string, returns a crate.
-crate fn string_to_crate(source_str: String) -> ast::Crate {
-    let ps = ParseSess::new(FilePathMapping::empty());
+pub(crate) fn string_to_crate(source_str: String) -> ast::Crate {
+    let ps = ParseSess::new(
+        vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
+        FilePathMapping::empty(),
+    );
     with_error_checking_parse(source_str, &ps, |p| p.parse_crate_mod())
 }
 
@@ -53,7 +96,7 @@ crate fn string_to_crate(source_str: String) -> ast::Crate {
 /// may be deleted or replaced with other whitespace to match the pattern.
 /// This function is relatively Unicode-ignorant; fortunately, the careful design
 /// of UTF-8 mitigates this ignorance. It doesn't do NKF-normalization(?).
-crate fn matches_codepattern(a: &str, b: &str) -> bool {
+pub(crate) fn matches_codepattern(a: &str, b: &str) -> bool {
     let mut a_iter = a.chars().peekable();
     let mut b_iter = b.chars().peekable();
 
@@ -92,7 +135,7 @@ crate fn matches_codepattern(a: &str, b: &str) -> bool {
 
 /// Advances the given peekable `Iterator` until it reaches a non-whitespace character.
 fn scan_for_non_ws_or_end<I: Iterator<Item = char>>(iter: &mut Peekable<I>) {
-    while iter.peek().copied().map(rustc_lexer::is_whitespace) == Some(true) {
+    while iter.peek().copied().is_some_and(rustc_lexer::is_whitespace) {
         iter.next();
     }
 }
@@ -109,8 +152,22 @@ struct SpanLabel {
     label: &'static str,
 }
 
-crate struct Shared<T: Write> {
+pub(crate) struct Shared<T: Write> {
     pub data: Arc<Mutex<T>>,
+}
+
+impl<T: Write> WriteColor for Shared<T> {
+    fn supports_color(&self) -> bool {
+        false
+    }
+
+    fn set_color(&mut self, _spec: &termcolor::ColorSpec) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: Write> Write for Shared<T> {
@@ -124,31 +181,20 @@ impl<T: Write> Write for Shared<T> {
 }
 
 fn test_harness(file_text: &str, span_labels: Vec<SpanLabel>, expected_output: &str) {
-    create_default_session_if_not_set_then(|_| {
-        let output = Arc::new(Mutex::new(Vec::new()));
-
-        let source_map = Lrc::new(SourceMap::new(FilePathMapping::empty()));
+    create_default_session_globals_then(|| {
+        let (handler, source_map, output) = create_test_handler();
         source_map.new_source_file(Path::new("test.rs").to_owned().into(), file_text.to_owned());
 
         let primary_span = make_span(&file_text, &span_labels[0].start, &span_labels[0].end);
         let mut msp = MultiSpan::from_span(primary_span);
         for span_label in span_labels {
             let span = make_span(&file_text, &span_label.start, &span_label.end);
-            msp.push_span_label(span, span_label.label.to_string());
+            msp.push_span_label(span, span_label.label);
             println!("span: {:?} label: {:?}", span, span_label.label);
             println!("text: {:?}", source_map.span_to_snippet(span));
         }
 
-        let emitter = EmitterWriter::new(
-            Box::new(Shared { data: output.clone() }),
-            Some(source_map.clone()),
-            false,
-            false,
-            false,
-            None,
-            false,
-        );
-        let handler = Handler::with_emitter(true, None, Box::new(emitter));
+        #[allow(rustc::untranslatable_diagnostic)]
         handler.span_err(msp, "foo");
 
         assert!(
@@ -267,13 +313,13 @@ error: foo
  --> test.rs:3:3
   |
 3 |      X0 Y0
-  |  ____^__-
-  | | ___|
+  |   ___^__-
+  |  |___|
   | ||
 4 | ||   X1 Y1
 5 | ||   X2 Y2
   | ||____^__- `Y` is a good letter too
-  |  |____|
+  | |_____|
   |       `X` is a good letter
 
 "#,
@@ -306,12 +352,12 @@ error: foo
  --> test.rs:3:3
   |
 3 |      X0 Y0
-  |  ____^__-
-  | | ___|
+  |   ___^__-
+  |  |___|
   | ||
 4 | ||   Y1 X1
   | ||____-__^ `X` is a good letter
-  | |_____|
+  |  |____|
   |       `Y` is a good letter too
 
 "#,
@@ -346,13 +392,13 @@ error: foo
  --> test.rs:3:6
   |
 3 |      X0 Y0 Z0
-  |   ______^
-4 |  |   X1 Y1 Z1
-  |  |_________-
+  |  _______^
+4 | |    X1 Y1 Z1
+  | | _________-
 5 | ||   X2 Y2 Z2
   | ||____^ `X` is a good letter
-6 | |    X3 Y3 Z3
-  | |_____- `Y` is a good letter too
+6 |  |   X3 Y3 Z3
+  |  |____- `Y` is a good letter too
 
 "#,
     );
@@ -390,15 +436,15 @@ error: foo
  --> test.rs:3:3
   |
 3 |       X0 Y0 Z0
-  |  _____^__-__-
-  | | ____|__|
-  | || ___|
+  |    ___^__-__-
+  |   |___|__|
+  |  ||___|
   | |||
 4 | |||   X1 Y1 Z1
 5 | |||   X2 Y2 Z2
   | |||____^__-__- `Z` label
-  |  ||____|__|
-  |   |____|  `Y` is a good letter too
+  | ||_____|__|
+  | |______|  `Y` is a good letter too
   |        `X` is a good letter
 
 "#,
@@ -482,24 +528,24 @@ error: foo
  --> test.rs:3:6
   |
 3 |      X0 Y0 Z0
-  |   ______^
-4 |  |   X1 Y1 Z1
-  |  |____^_-
+  |  _______^
+4 | |    X1 Y1 Z1
+  | | ____^_-
   | ||____|
-  | |     `X` is a good letter
-5 | |    X2 Y2 Z2
-  | |____-______- `Y` is a good letter too
-  |  ____|
-  | |
-6 | |    X3 Y3 Z3
-  | |________- `Z`
+  |  |    `X` is a good letter
+5 |  |   X2 Y2 Z2
+  |  |___-______- `Y` is a good letter too
+  |   ___|
+  |  |
+6 |  |   X3 Y3 Z3
+  |  |_______- `Z`
 
 "#,
     );
 }
 
 #[test]
-fn non_overlaping() {
+fn non_overlapping() {
     test_harness(
         r#"
 fn foo() {
@@ -538,7 +584,7 @@ error: foo
 }
 
 #[test]
-fn overlaping_start_and_end() {
+fn overlapping_start_and_end() {
     test_harness(
         r#"
 fn foo() {
@@ -565,14 +611,14 @@ error: foo
  --> test.rs:3:6
   |
 3 |      X0 Y0 Z0
-  |   ______^
-4 |  |   X1 Y1 Z1
-  |  |____^____-
+  |  _______^
+4 | |    X1 Y1 Z1
+  | | ____^____-
   | ||____|
-  | |     `X` is a good letter
-5 | |    X2 Y2 Z2
-6 | |    X3 Y3 Z3
-  | |___________- `Y` is a good letter too
+  |  |    `X` is a good letter
+5 |  |   X2 Y2 Z2
+6 |  |   X3 Y3 Z3
+  |  |__________- `Y` is a good letter too
 
 "#,
     );
@@ -936,18 +982,18 @@ error: foo
   --> test.rs:3:6
    |
 3  |      X0 Y0 Z0
-   |   ______^
-4  |  |   X1 Y1 Z1
-   |  |____^____-
+   |  _______^
+4  | |    X1 Y1 Z1
+   | | ____^____-
    | ||____|
-   | |     `X` is a good letter
-5  | |  1
-6  | |  2
-7  | |  3
-...  |
-15 | |    X2 Y2 Z2
-16 | |    X3 Y3 Z3
-   | |___________- `Y` is a good letter too
+   |  |    `X` is a good letter
+5  |  | 1
+6  |  | 2
+7  |  | 3
+...   |
+15 |  |   X2 Y2 Z2
+16 |  |   X3 Y3 Z3
+   |  |__________- `Y` is a good letter too
 
 "#,
     );
@@ -991,21 +1037,21 @@ error: foo
   --> test.rs:3:6
    |
 3  |      X0 Y0 Z0
-   |   ______^
-4  |  | 1
-5  |  | 2
-6  |  | 3
-7  |  |   X1 Y1 Z1
-   |  |_________-
+   |  _______^
+4  | |  1
+5  | |  2
+6  | |  3
+7  | |    X1 Y1 Z1
+   | | _________-
 8  | || 4
 9  | || 5
 10 | || 6
 11 | ||   X2 Y2 Z2
    | ||__________- `Z` is a good letter too
-...   |
-15 |  | 10
-16 |  |   X3 Y3 Z3
-   |  |_______^ `Y` is a good letter
+...  |
+15 | |  10
+16 | |    X3 Y3 Z3
+   | |________^ `Y` is a good letter
 
 "#,
     );

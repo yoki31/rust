@@ -1,22 +1,36 @@
 pub mod llvm;
 mod simd;
 
+#[cfg(feature="master")]
+use std::iter;
+
+#[cfg(feature="master")]
+use gccjit::FunctionType;
 use gccjit::{ComparisonOp, Function, RValue, ToRValue, Type, UnaryOp};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::base::wants_msvc_seh;
-use rustc_codegen_ssa::common::{IntPredicate, span_invalid_monomorphization_error};
+use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceRef;
-use rustc_codegen_ssa::traits::{ArgAbiMethods, BaseTypeMethods, BuilderMethods, ConstMethods, IntrinsicCallMethods};
+use rustc_codegen_ssa::traits::{ArgAbiMethods, BuilderMethods, ConstMethods, IntrinsicCallMethods};
+#[cfg(feature="master")]
+use rustc_codegen_ssa::traits::{BaseTypeMethods, MiscMethods};
+use rustc_codegen_ssa::errors::InvalidMonomorphization;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_middle::ty::layout::LayoutOf;
+#[cfg(feature="master")]
+use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt};
 use rustc_span::{Span, Symbol, symbol::kw, sym};
 use rustc_target::abi::HasDataLayout;
 use rustc_target::abi::call::{ArgAbi, FnAbi, PassMode};
 use rustc_target::spec::PanicStrategy;
+#[cfg(feature="master")]
+use rustc_target::spec::abi::Abi;
 
 use crate::abi::GccType;
+#[cfg(feature="master")]
+use crate::abi::FnAbiGccExt;
 use crate::builder::Builder;
 use crate::common::{SignType, TypeReflection};
 use crate::context::CodegenCx;
@@ -67,6 +81,8 @@ fn get_simple_intrinsic<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, name: Symbol) ->
         sym::nearbyintf64 => "nearbyint",
         sym::roundf32 => "roundf",
         sym::roundf64 => "round",
+        sym::roundevenf32 => "roundevenf",
+        sym::roundevenf64 => "roundeven",
         sym::abort => "abort",
         _ => return None,
     };
@@ -78,8 +94,8 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         let tcx = self.tcx;
         let callee_ty = instance.ty(tcx, ty::ParamEnv::reveal_all());
 
-        let (def_id, substs) = match *callee_ty.kind() {
-            ty::FnDef(def_id, substs) => (def_id, substs),
+        let (def_id, fn_args) = match *callee_ty.kind() {
+            ty::FnDef(def_id, fn_args) => (def_id, fn_args),
             _ => bug!("expected fn item type, found {}", callee_ty),
         };
 
@@ -88,9 +104,9 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         let arg_tys = sig.inputs();
         let ret_ty = sig.output();
         let name = tcx.item_name(def_id);
-        let name_str = &*name.as_str();
+        let name_str = name.as_str();
 
-        let llret_ty = self.layout_of(ret_ty).gcc_type(self, true);
+        let llret_ty = self.layout_of(ret_ty).gcc_type(self);
         let result = PlaceRef::new_sized(llresult, fn_abi.ret.layout);
 
         let simple = get_simple_intrinsic(self, name);
@@ -99,7 +115,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                 _ if simple.is_some() => {
                     // FIXME(antoyo): remove this cast when the API supports function.
                     let func = unsafe { std::mem::transmute(simple.expect("simple")) };
-                    self.call(self.type_void(), func, &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(), None)
+                    self.call(self.type_void(), None, None, func, &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(), None)
                 },
                 sym::likely => {
                     self.expect(args[0].immediate(), true)
@@ -128,12 +144,16 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                 }
 
                 sym::volatile_load | sym::unaligned_volatile_load => {
-                    let tp_ty = substs.type_at(0);
-                    let mut ptr = args[0].immediate();
-                    if let PassMode::Cast(ty) = fn_abi.ret.mode {
-                        ptr = self.pointercast(ptr, self.type_ptr_to(ty.gcc_type(self)));
-                    }
-                    let load = self.volatile_load(ptr.get_type(), ptr);
+                    let tp_ty = fn_args.type_at(0);
+                    let ptr = args[0].immediate();
+                    let load =
+                        if let PassMode::Cast { cast: ty, pad_i32: _ } = &fn_abi.ret.mode {
+                            let gcc_ty = ty.gcc_type(self);
+                            self.volatile_load(gcc_ty, ptr)
+                        }
+                        else {
+                            self.volatile_load(self.layout_of(tp_ty).gcc_type(self), ptr)
+                        };
                     // TODO(antoyo): set alignment.
                     self.to_immediate(load, self.layout_of(tp_ty))
                 }
@@ -175,19 +195,18 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
 
                                     let arg = args[0].immediate();
                                     let result = func.new_local(None, arg.get_type(), "zeros");
-                                    let zero = self.cx.context.new_rvalue_zero(arg.get_type());
-                                    let cond = self.cx.context.new_comparison(None, ComparisonOp::Equals, arg, zero);
+                                    let zero = self.cx.gcc_zero(arg.get_type());
+                                    let cond = self.gcc_icmp(IntPredicate::IntEQ, arg, zero);
                                     self.llbb().end_with_conditional(None, cond, then_block, else_block);
 
-                                    let zero_result = self.cx.context.new_rvalue_from_long(arg.get_type(), width as i64);
+                                    let zero_result = self.cx.gcc_uint(arg.get_type(), width);
                                     then_block.add_assignment(None, result, zero_result);
                                     then_block.end_with_jump(None, after_block);
 
                                     // NOTE: since jumps were added in a place
-                                    // count_leading_zeroes() does not expect, the current blocks
+                                    // count_leading_zeroes() does not expect, the current block
                                     // in the state need to be updated.
-                                    *self.current_block.borrow_mut() = Some(else_block);
-                                    self.block = Some(else_block);
+                                    self.switch_to_block(else_block);
 
                                     let zeros =
                                         match name {
@@ -195,13 +214,12 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                                             sym::cttz => self.count_trailing_zeroes(width, arg),
                                             _ => unreachable!(),
                                         };
-                                    else_block.add_assignment(None, result, zeros);
-                                    else_block.end_with_jump(None, after_block);
+                                    self.llbb().add_assignment(None, result, zeros);
+                                    self.llbb().end_with_jump(None, after_block);
 
                                     // NOTE: since jumps were added in a place rustc does not
-                                    // expect, the current blocks in the state need to be updated.
-                                    *self.current_block.borrow_mut() = Some(after_block);
-                                    self.block = Some(after_block);
+                                    // expect, the current block in the state need to be updated.
+                                    self.switch_to_block(after_block);
 
                                     result.to_rvalue()
                                 }
@@ -217,17 +235,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                                         args[0].immediate() // byte swap a u8/i8 is just a no-op
                                     }
                                     else {
-                                        // TODO(antoyo): check if it's faster to use string literals and a
-                                        // match instead of format!.
-                                        let bswap = self.cx.context.get_builtin_function(&format!("__builtin_bswap{}", width));
-                                        let mut arg = args[0].immediate();
-                                        // FIXME(antoyo): this cast should not be necessary. Remove
-                                        // when having proper sized integer types.
-                                        let param_type = bswap.get_param(0).to_rvalue().get_type();
-                                        if param_type != arg.get_type() {
-                                            arg = self.bitcast(arg, param_type);
-                                        }
-                                        self.cx.context.new_call(None, bswap, &[arg])
+                                        self.gcc_bswap(args[0].immediate(), width)
                                     }
                                 },
                                 sym::bitreverse => self.bit_reverse(width, args[0].immediate()),
@@ -254,15 +262,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                                 _ => bug!(),
                             },
                             None => {
-                                span_invalid_monomorphization_error(
-                                    tcx.sess,
-                                    span,
-                                    &format!(
-                                        "invalid monomorphization of `{}` intrinsic: \
-                                      expected basic integer type, found `{}`",
-                                      name, ty
-                                    ),
-                                );
+                                tcx.sess.emit_err(InvalidMonomorphization::BasicIntegerType { span, name, ty });
                                 return;
                             }
                         }
@@ -270,22 +270,22 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
 
                 sym::raw_eq => {
                     use rustc_target::abi::Abi::*;
-                    let tp_ty = substs.type_at(0);
+                    let tp_ty = fn_args.type_at(0);
                     let layout = self.layout_of(tp_ty).layout;
-                    let _use_integer_compare = match layout.abi {
+                    let _use_integer_compare = match layout.abi() {
                         Scalar(_) | ScalarPair(_, _) => true,
                         Uninhabited | Vector { .. } => false,
                         Aggregate { .. } => {
                             // For rusty ABIs, small aggregates are actually passed
                             // as `RegKind::Integer` (see `FnAbi::adjust_for_abi`),
                             // so we re-use that same threshold here.
-                            layout.size <= self.data_layout().pointer_size * 2
+                            layout.size() <= self.data_layout().pointer_size * 2
                         }
                     };
 
                     let a = args[0].immediate();
                     let b = args[1].immediate();
-                    if layout.size.bytes() == 0 {
+                    if layout.size().bytes() == 0 {
                         self.const_bool(true)
                     }
                     /*else if use_integer_compare {
@@ -301,11 +301,26 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                         let void_ptr_type = self.context.new_type::<*const ()>();
                         let a_ptr = self.bitcast(a, void_ptr_type);
                         let b_ptr = self.bitcast(b, void_ptr_type);
-                        let n = self.context.new_cast(None, self.const_usize(layout.size.bytes()), self.sizet_type);
+                        let n = self.context.new_cast(None, self.const_usize(layout.size().bytes()), self.sizet_type);
                         let builtin = self.context.get_builtin_function("memcmp");
                         let cmp = self.context.new_call(None, builtin, &[a_ptr, b_ptr, n]);
                         self.icmp(IntPredicate::IntEQ, cmp, self.const_i32(0))
                     }
+                }
+
+                sym::compare_bytes => {
+                    let a = args[0].immediate();
+                    let b = args[1].immediate();
+                    let n = args[2].immediate();
+
+                    let void_ptr_type = self.context.new_type::<*const ()>();
+                    let a_ptr = self.bitcast(a, void_ptr_type);
+                    let b_ptr = self.bitcast(b, void_ptr_type);
+
+                    // Here we assume that the `memcmp` provided by the target is a NOP for size 0.
+                    let builtin = self.context.get_builtin_function("memcmp");
+                    let cmp = self.context.new_call(None, builtin, &[a_ptr, b_ptr, n]);
+                    self.sext(cmp, self.type_ix(32))
                 }
 
                 sym::black_box => {
@@ -321,6 +336,18 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                     return;
                 }
 
+                sym::ptr_mask => {
+                    let usize_type = self.context.new_type::<usize>();
+                    let void_ptr_type = self.context.new_type::<*const ()>();
+
+                    let ptr = args[0].immediate();
+                    let mask = args[1].immediate();
+
+                    let addr = self.bitcast(ptr, usize_type);
+                    let masked = self.and(addr, mask);
+                    self.bitcast(masked, void_ptr_type)
+                },
+
                 _ if name_str.starts_with("simd_") => {
                     match generic_simd_intrinsic(self, name, callee_ty, args, ret_ty, llret_ty, span) {
                         Ok(llval) => llval,
@@ -332,7 +359,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
             };
 
         if !fn_abi.ret.is_ignore() {
-            if let PassMode::Cast(ty) = fn_abi.ret.mode {
+            if let PassMode::Cast { cast: ty, .. } = &fn_abi.ret.mode {
                 let ptr_llty = self.type_ptr_to(ty.gcc_type(self));
                 let ptr = self.pointercast(result.llval, ptr_llty);
                 self.store(llval, ptr, result.align);
@@ -348,11 +375,11 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
     fn abort(&mut self) {
         let func = self.context.get_builtin_function("abort");
         let func: RValue<'gcc> = unsafe { std::mem::transmute(func) };
-        self.call(self.type_void(), func, &[], None);
+        self.call(self.type_void(), None, None, func, &[], None);
     }
 
     fn assume(&mut self, value: Self::Value) {
-        // TODO(antoyo): switch to asumme when it exists.
+        // TODO(antoyo): switch to assume when it exists.
         // Or use something like this:
         // #define __assume(cond) do { if (!(cond)) __builtin_unreachable(); } while (0)
         self.expect(value, true);
@@ -364,6 +391,16 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
     }
 
     fn type_test(&mut self, _pointer: Self::Value, _typeid: Self::Value) -> Self::Value {
+        // Unsupported.
+        self.context.new_rvalue_from_int(self.int_type, 0)
+    }
+
+    fn type_checked_load(
+        &mut self,
+        _llvtable: Self::Value,
+        _vtable_byte_offset: u64,
+        _typeid: Self::Value,
+    ) -> Self::Value {
         // Unsupported.
         self.context.new_rvalue_from_int(self.int_type, 0)
     }
@@ -401,7 +438,7 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
     /// Gets the LLVM type for a place of the original Rust type of
     /// this argument/return, i.e., the result of `type_of::type_of`.
     fn memory_ty(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc> {
-        self.layout.gcc_type(cx, true)
+        self.layout.gcc_type(cx)
     }
 
     /// Stores a direct/indirect value described by this ArgAbi into a
@@ -418,7 +455,7 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
         else if self.is_unsized_indirect() {
             bug!("unsized `ArgAbi` must be handled through `store_fn_arg`");
         }
-        else if let PassMode::Cast(cast) = self.mode {
+        else if let PassMode::Cast { ref cast, .. } = self.mode {
             // FIXME(eddyb): Figure out when the simpler Store is safe, clang
             // uses it for i16 -> {i8, i8}, but not for i24 -> {i8, i8, i8}.
             let can_store_through_cast_ptr = false;
@@ -476,17 +513,17 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
             val.to_rvalue()
         };
         match self.mode {
-            PassMode::Ignore => {}
+            PassMode::Ignore => {},
             PassMode::Pair(..) => {
                 OperandValue::Pair(next(), next()).store(bx, dst);
-            }
-            PassMode::Indirect { extra_attrs: Some(_), .. } => {
+            },
+            PassMode::Indirect { meta_attrs: Some(_), .. } => {
                 OperandValue::Ref(next(), Some(next()), self.layout.align.abi).store(bx, dst);
-            }
-            PassMode::Direct(_) | PassMode::Indirect { extra_attrs: None, .. } | PassMode::Cast(_) => {
+            },
+            PassMode::Direct(_) | PassMode::Indirect { meta_attrs: None, .. } | PassMode::Cast { .. } => {
                 let next_arg = next();
-                self.store(bx, next_arg.to_rvalue(), dst);
-            }
+                self.store(bx, next_arg, dst);
+            },
         }
     }
 }
@@ -526,7 +563,7 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
 
         let value =
             if result_type.is_signed(self.cx) {
-                self.context.new_bitcast(None, value, typ)
+                self.gcc_int_cast(value, typ)
             }
             else {
                 value
@@ -535,168 +572,82 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         let context = &self.cx.context;
         let result =
             match width {
-                8 => {
+                8 | 16 | 32 | 64 => {
+                    let mask = ((1u128 << width) - 1) as u64;
+                    let (m0, m1, m2) = if width > 16 {
+                        (
+                            context.new_rvalue_from_long(typ, (0x5555555555555555u64 & mask) as i64),
+                            context.new_rvalue_from_long(typ, (0x3333333333333333u64 & mask) as i64),
+                            context.new_rvalue_from_long(typ, (0x0f0f0f0f0f0f0f0fu64 & mask) as i64),
+                        )
+                    } else {
+                        (
+                            context.new_rvalue_from_int(typ, (0x5555u64 & mask) as i32),
+                            context.new_rvalue_from_int(typ, (0x3333u64 & mask) as i32),
+                            context.new_rvalue_from_int(typ, (0x0f0fu64 & mask) as i32),
+                        )
+                    };
+                    let one = context.new_rvalue_from_int(typ, 1);
+                    let two = context.new_rvalue_from_int(typ, 2);
+                    let four = context.new_rvalue_from_int(typ, 4);
+
                     // First step.
-                    let left = self.and(value, context.new_rvalue_from_int(typ, 0xF0));
-                    let left = self.lshr(left, context.new_rvalue_from_int(typ, 4));
-                    let right = self.and(value, context.new_rvalue_from_int(typ, 0x0F));
-                    let right = self.shl(right, context.new_rvalue_from_int(typ, 4));
+                    let left = self.lshr(value, one);
+                    let left = self.and(left, m0);
+                    let right = self.and(value, m0);
+                    let right = self.shl(right, one);
                     let step1 = self.or(left, right);
 
                     // Second step.
-                    let left = self.and(step1, context.new_rvalue_from_int(typ, 0xCC));
-                    let left = self.lshr(left, context.new_rvalue_from_int(typ, 2));
-                    let right = self.and(step1, context.new_rvalue_from_int(typ, 0x33));
-                    let right = self.shl(right, context.new_rvalue_from_int(typ, 2));
+                    let left = self.lshr(step1, two);
+                    let left = self.and(left, m1);
+                    let right = self.and(step1, m1);
+                    let right = self.shl(right, two);
                     let step2 = self.or(left, right);
 
                     // Third step.
-                    let left = self.and(step2, context.new_rvalue_from_int(typ, 0xAA));
-                    let left = self.lshr(left, context.new_rvalue_from_int(typ, 1));
-                    let right = self.and(step2, context.new_rvalue_from_int(typ, 0x55));
-                    let right = self.shl(right, context.new_rvalue_from_int(typ, 1));
-                    let step3 = self.or(left, right);
-
-                    step3
-                },
-                16 => {
-                    // First step.
-                    let left = self.and(value, context.new_rvalue_from_int(typ, 0x5555));
-                    let left = self.shl(left, context.new_rvalue_from_int(typ, 1));
-                    let right = self.and(value, context.new_rvalue_from_int(typ, 0xAAAA));
-                    let right = self.lshr(right, context.new_rvalue_from_int(typ, 1));
-                    let step1 = self.or(left, right);
-
-                    // Second step.
-                    let left = self.and(step1, context.new_rvalue_from_int(typ, 0x3333));
-                    let left = self.shl(left, context.new_rvalue_from_int(typ, 2));
-                    let right = self.and(step1, context.new_rvalue_from_int(typ, 0xCCCC));
-                    let right = self.lshr(right, context.new_rvalue_from_int(typ, 2));
-                    let step2 = self.or(left, right);
-
-                    // Third step.
-                    let left = self.and(step2, context.new_rvalue_from_int(typ, 0x0F0F));
-                    let left = self.shl(left, context.new_rvalue_from_int(typ, 4));
-                    let right = self.and(step2, context.new_rvalue_from_int(typ, 0xF0F0));
-                    let right = self.lshr(right, context.new_rvalue_from_int(typ, 4));
+                    let left = self.lshr(step2, four);
+                    let left = self.and(left, m2);
+                    let right = self.and(step2, m2);
+                    let right = self.shl(right, four);
                     let step3 = self.or(left, right);
 
                     // Fourth step.
-                    let left = self.and(step3, context.new_rvalue_from_int(typ, 0x00FF));
-                    let left = self.shl(left, context.new_rvalue_from_int(typ, 8));
-                    let right = self.and(step3, context.new_rvalue_from_int(typ, 0xFF00));
-                    let right = self.lshr(right, context.new_rvalue_from_int(typ, 8));
-                    let step4 = self.or(left, right);
-
-                    step4
-                },
-                32 => {
-                    // TODO(antoyo): Refactor with other implementations.
-                    // First step.
-                    let left = self.and(value, context.new_rvalue_from_long(typ, 0x55555555));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 1));
-                    let right = self.and(value, context.new_rvalue_from_long(typ, 0xAAAAAAAA));
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 1));
-                    let step1 = self.or(left, right);
-
-                    // Second step.
-                    let left = self.and(step1, context.new_rvalue_from_long(typ, 0x33333333));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 2));
-                    let right = self.and(step1, context.new_rvalue_from_long(typ, 0xCCCCCCCC));
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 2));
-                    let step2 = self.or(left, right);
-
-                    // Third step.
-                    let left = self.and(step2, context.new_rvalue_from_long(typ, 0x0F0F0F0F));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 4));
-                    let right = self.and(step2, context.new_rvalue_from_long(typ, 0xF0F0F0F0));
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 4));
-                    let step3 = self.or(left, right);
-
-                    // Fourth step.
-                    let left = self.and(step3, context.new_rvalue_from_long(typ, 0x00FF00FF));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 8));
-                    let right = self.and(step3, context.new_rvalue_from_long(typ, 0xFF00FF00));
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 8));
-                    let step4 = self.or(left, right);
-
-                    // Fifth step.
-                    let left = self.and(step4, context.new_rvalue_from_long(typ, 0x0000FFFF));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 16));
-                    let right = self.and(step4, context.new_rvalue_from_long(typ, 0xFFFF0000));
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 16));
-                    let step5 = self.or(left, right);
-
-                    step5
-                },
-                64 => {
-                    // First step.
-                    let left = self.shl(value, context.new_rvalue_from_long(typ, 32));
-                    let right = self.lshr(value, context.new_rvalue_from_long(typ, 32));
-                    let step1 = self.or(left, right);
-
-                    // Second step.
-                    let left = self.and(step1, context.new_rvalue_from_long(typ, 0x0001FFFF0001FFFF));
-                    let left = self.shl(left, context.new_rvalue_from_long(typ, 15));
-                    let right = self.and(step1, context.new_rvalue_from_long(typ, 0xFFFE0000FFFE0000u64 as i64)); // TODO(antoyo): transmute the number instead?
-                    let right = self.lshr(right, context.new_rvalue_from_long(typ, 17));
-                    let step2 = self.or(left, right);
-
-                    // Third step.
-                    let left = self.lshr(step2, context.new_rvalue_from_long(typ, 10));
-                    let left = self.xor(step2, left);
-                    let temp = self.and(left, context.new_rvalue_from_long(typ, 0x003F801F003F801F));
-
-                    let left = self.shl(temp, context.new_rvalue_from_long(typ, 10));
-                    let left = self.or(temp, left);
-                    let step3 = self.xor(left, step2);
-
-                    // Fourth step.
-                    let left = self.lshr(step3, context.new_rvalue_from_long(typ, 4));
-                    let left = self.xor(step3, left);
-                    let temp = self.and(left, context.new_rvalue_from_long(typ, 0x0E0384210E038421));
-
-                    let left = self.shl(temp, context.new_rvalue_from_long(typ, 4));
-                    let left = self.or(temp, left);
-                    let step4 = self.xor(left, step3);
-
-                    // Fifth step.
-                    let left = self.lshr(step4, context.new_rvalue_from_long(typ, 2));
-                    let left = self.xor(step4, left);
-                    let temp = self.and(left, context.new_rvalue_from_long(typ, 0x2248884222488842));
-
-                    let left = self.shl(temp, context.new_rvalue_from_long(typ, 2));
-                    let left = self.or(temp, left);
-                    let step5 = self.xor(left, step4);
-
-                    step5
+                    if width == 8 {
+                        step3
+                    } else {
+                        self.gcc_bswap(step3, width)
+                    }
                 },
                 128 => {
                     // TODO(antoyo): find a more efficient implementation?
-                    let sixty_four = self.context.new_rvalue_from_long(typ, 64);
-                    let high = self.context.new_cast(None, value >> sixty_four, self.u64_type);
-                    let low = self.context.new_cast(None, value, self.u64_type);
+                    let sixty_four = self.gcc_int(typ, 64);
+                    let right_shift = self.gcc_lshr(value, sixty_four);
+                    let high = self.gcc_int_cast(right_shift, self.u64_type);
+                    let low = self.gcc_int_cast(value, self.u64_type);
 
                     let reversed_high = self.bit_reverse(64, high);
                     let reversed_low = self.bit_reverse(64, low);
 
-                    let new_low = self.context.new_cast(None, reversed_high, typ);
-                    let new_high = self.context.new_cast(None, reversed_low, typ) << sixty_four;
+                    let new_low = self.gcc_int_cast(reversed_high, typ);
+                    let new_high = self.shl(self.gcc_int_cast(reversed_low, typ), sixty_four);
 
-                    new_low | new_high
+                    self.gcc_or(new_low, new_high)
                 },
                 _ => {
                     panic!("cannot bit reverse with width = {}", width);
                 },
             };
 
-        self.context.new_bitcast(None, result, result_type)
+        self.gcc_int_cast(result, result_type)
     }
 
-    fn count_leading_zeroes(&self, width: u64, arg: RValue<'gcc>) -> RValue<'gcc> {
+    fn count_leading_zeroes(&mut self, width: u64, arg: RValue<'gcc>) -> RValue<'gcc> {
         // TODO(antoyo): use width?
         let arg_type = arg.get_type();
         let count_leading_zeroes =
+            // TODO(antoyo): write a new function Type::is_compatible_with(&Type) and use it here
+            // instead of using is_uint().
             if arg_type.is_uint(&self.cx) {
                 "__builtin_clz"
             }
@@ -712,9 +663,10 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let result = self.current_func()
                     .new_local(None, array_type, "count_loading_zeroes_results");
 
-                let sixty_four = self.context.new_rvalue_from_long(arg_type, 64);
-                let high = self.context.new_cast(None, arg >> sixty_four, self.u64_type);
-                let low = self.context.new_cast(None, arg, self.u64_type);
+                let sixty_four = self.const_uint(arg_type, 64);
+                let shift = self.lshr(arg, sixty_four);
+                let high = self.gcc_int_cast(shift, self.u64_type);
+                let low = self.gcc_int_cast(arg, self.u64_type);
 
                 let zero = self.context.new_rvalue_zero(self.usize_type);
                 let one = self.context.new_rvalue_one(self.usize_type);
@@ -723,17 +675,18 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let clzll = self.context.get_builtin_function("__builtin_clzll");
 
                 let first_elem = self.context.new_array_access(None, result, zero);
-                let first_value = self.context.new_cast(None, self.context.new_call(None, clzll, &[high]), arg_type);
+                let first_value = self.gcc_int_cast(self.context.new_call(None, clzll, &[high]), arg_type);
                 self.llbb()
                     .add_assignment(None, first_elem, first_value);
 
                 let second_elem = self.context.new_array_access(None, result, one);
-                let second_value = self.context.new_cast(None, self.context.new_call(None, clzll, &[low]), arg_type) + sixty_four;
+                let cast = self.gcc_int_cast(self.context.new_call(None, clzll, &[low]), arg_type);
+                let second_value = self.add(cast, sixty_four);
                 self.llbb()
                     .add_assignment(None, second_elem, second_value);
 
                 let third_elem = self.context.new_array_access(None, result, two);
-                let third_value = self.context.new_rvalue_from_long(arg_type, 128);
+                let third_value = self.const_uint(arg_type, 128);
                 self.llbb()
                     .add_assignment(None, third_elem, third_value);
 
@@ -741,16 +694,21 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let not_low = self.context.new_unary_op(None, UnaryOp::LogicalNegate, self.u64_type, low);
                 let not_low_and_not_high = not_low & not_high;
                 let index = not_high + not_low_and_not_high;
+                // NOTE: the following cast is necessary to avoid a GIMPLE verification failure in
+                // gcc.
+                // TODO(antoyo): do the correct verification in libgccjit to avoid an error at the
+                // compilation stage.
+                let index = self.context.new_cast(None, index, self.i32_type);
 
                 let res = self.context.new_array_access(None, result, index);
 
-                return self.context.new_cast(None, res, arg_type);
+                return self.gcc_int_cast(res.to_rvalue(), arg_type);
             }
             else {
-                let count_leading_zeroes = self.context.get_builtin_function("__builtin_clz");
-                let arg = self.context.new_cast(None, arg, self.uint_type);
-                let diff = self.int_width(self.uint_type) - self.int_width(arg_type);
-                let diff = self.context.new_rvalue_from_long(self.int_type, diff);
+                let count_leading_zeroes = self.context.get_builtin_function("__builtin_clzll");
+                let arg = self.context.new_cast(None, arg, self.ulonglong_type);
+                let diff = self.ulonglong_type.get_size() as i64 - arg_type.get_size() as i64;
+                let diff = self.context.new_rvalue_from_long(self.int_type, diff * 8);
                 let res = self.context.new_call(None, count_leading_zeroes, &[arg]) - diff;
                 return self.context.new_cast(None, res, arg_type);
             };
@@ -759,18 +717,20 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         self.context.new_cast(None, res, arg_type)
     }
 
-    fn count_trailing_zeroes(&self, _width: u64, arg: RValue<'gcc>) -> RValue<'gcc> {
+    fn count_trailing_zeroes(&mut self, _width: u64, arg: RValue<'gcc>) -> RValue<'gcc> {
         let result_type = arg.get_type();
         let arg =
             if result_type.is_signed(self.cx) {
                 let new_type = result_type.to_unsigned(self.cx);
-                self.context.new_bitcast(None, arg, new_type)
+                self.gcc_int_cast(arg, new_type)
             }
             else {
                 arg
             };
         let arg_type = arg.get_type();
         let (count_trailing_zeroes, expected_type) =
+            // TODO(antoyo): write a new function Type::is_compatible_with(&Type) and use it here
+            // instead of using is_uint().
             if arg_type.is_uchar(&self.cx) || arg_type.is_ushort(&self.cx) || arg_type.is_uint(&self.cx) {
                 // NOTE: we don't need to & 0xFF for uchar because the result is undefined on zero.
                 ("__builtin_ctz", self.cx.uint_type)
@@ -787,9 +747,10 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let result = self.current_func()
                     .new_local(None, array_type, "count_loading_zeroes_results");
 
-                let sixty_four = self.context.new_rvalue_from_long(arg_type, 64);
-                let high = self.context.new_cast(None, arg >> sixty_four, self.u64_type);
-                let low = self.context.new_cast(None, arg, self.u64_type);
+                let sixty_four = self.gcc_int(arg_type, 64);
+                let shift = self.gcc_lshr(arg, sixty_four);
+                let high = self.gcc_int_cast(shift, self.u64_type);
+                let low = self.gcc_int_cast(arg, self.u64_type);
 
                 let zero = self.context.new_rvalue_zero(self.usize_type);
                 let one = self.context.new_rvalue_one(self.usize_type);
@@ -798,17 +759,17 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let ctzll = self.context.get_builtin_function("__builtin_ctzll");
 
                 let first_elem = self.context.new_array_access(None, result, zero);
-                let first_value = self.context.new_cast(None, self.context.new_call(None, ctzll, &[low]), arg_type);
+                let first_value = self.gcc_int_cast(self.context.new_call(None, ctzll, &[low]), arg_type);
                 self.llbb()
                     .add_assignment(None, first_elem, first_value);
 
                 let second_elem = self.context.new_array_access(None, result, one);
-                let second_value = self.context.new_cast(None, self.context.new_call(None, ctzll, &[high]), arg_type) + sixty_four;
+                let second_value = self.gcc_add(self.gcc_int_cast(self.context.new_call(None, ctzll, &[high]), arg_type), sixty_four);
                 self.llbb()
                     .add_assignment(None, second_elem, second_value);
 
                 let third_elem = self.context.new_array_access(None, result, two);
-                let third_value = self.context.new_rvalue_from_long(arg_type, 128);
+                let third_value = self.gcc_int(arg_type, 128);
                 self.llbb()
                     .add_assignment(None, third_elem, third_value);
 
@@ -816,13 +777,28 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 let not_high = self.context.new_unary_op(None, UnaryOp::LogicalNegate, self.u64_type, high);
                 let not_low_and_not_high = not_low & not_high;
                 let index = not_low + not_low_and_not_high;
+                // NOTE: the following cast is necessary to avoid a GIMPLE verification failure in
+                // gcc.
+                // TODO(antoyo): do the correct verification in libgccjit to avoid an error at the
+                // compilation stage.
+                let index = self.context.new_cast(None, index, self.i32_type);
 
                 let res = self.context.new_array_access(None, result, index);
 
-                return self.context.new_bitcast(None, res, result_type);
+                return self.gcc_int_cast(res.to_rvalue(), result_type);
             }
             else {
-                unimplemented!("count_trailing_zeroes for {:?}", arg_type);
+                let count_trailing_zeroes = self.context.get_builtin_function("__builtin_ctzll");
+                let arg_size = arg_type.get_size();
+                let casted_arg = self.context.new_cast(None, arg, self.ulonglong_type);
+                let byte_diff = self.ulonglong_type.get_size() as i64 - arg_size as i64;
+                let diff = self.context.new_rvalue_from_long(self.int_type, byte_diff * 8);
+                let mask = self.context.new_rvalue_from_long(arg_type, -1); // To get the value with all bits set.
+                let masked = mask & self.context.new_unary_op(None, UnaryOp::BitwiseNegate, arg_type, arg);
+                let cond = self.context.new_comparison(None, ComparisonOp::Equals, masked, mask);
+                let diff = diff * self.context.new_cast(None, cond, self.int_type);
+                let res = self.context.new_call(None, count_trailing_zeroes, &[casted_arg]) - diff;
+                return self.context.new_cast(None, res, result_type);
             };
         let count_trailing_zeroes = self.context.get_builtin_function(count_trailing_zeroes);
         let arg =
@@ -833,105 +809,86 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
                 arg
             };
         let res = self.context.new_call(None, count_trailing_zeroes, &[arg]);
-        self.context.new_bitcast(None, res, result_type)
+        self.context.new_cast(None, res, result_type)
     }
 
-    fn int_width(&self, typ: Type<'gcc>) -> i64 {
-        self.cx.int_width(typ) as i64
-    }
-
-    fn pop_count(&self, value: RValue<'gcc>) -> RValue<'gcc> {
+    fn pop_count(&mut self, value: RValue<'gcc>) -> RValue<'gcc> {
         // TODO(antoyo): use the optimized version with fewer operations.
         let result_type = value.get_type();
         let value_type = result_type.to_unsigned(self.cx);
 
         let value =
             if result_type.is_signed(self.cx) {
-                self.context.new_bitcast(None, value, value_type)
+                self.gcc_int_cast(value, value_type)
             }
             else {
                 value
             };
 
-        if value_type.is_u128(&self.cx) {
-            // TODO(antoyo): implement in the normal algorithm below to have a more efficient
-            // implementation (that does not require a call to __popcountdi2).
-            let popcount = self.context.get_builtin_function("__builtin_popcountll");
-            let sixty_four = self.context.new_rvalue_from_long(value_type, 64);
-            let high = self.context.new_cast(None, value >> sixty_four, self.cx.ulonglong_type);
-            let high = self.context.new_call(None, popcount, &[high]);
-            let low = self.context.new_cast(None, value, self.cx.ulonglong_type);
-            let low = self.context.new_call(None, popcount, &[low]);
+        // only break apart 128-bit ints if they're not natively supported
+        // TODO(antoyo): remove this if/when native 128-bit integers land in libgccjit
+        if value_type.is_u128(&self.cx) && !self.cx.supports_128bit_integers {
+            let sixty_four = self.gcc_int(value_type, 64);
+            let right_shift = self.gcc_lshr(value, sixty_four);
+            let high = self.gcc_int_cast(right_shift, self.cx.ulonglong_type);
+            let high = self.pop_count(high);
+            let low = self.gcc_int_cast(value, self.cx.ulonglong_type);
+            let low = self.pop_count(low);
             let res = high + low;
-            return self.context.new_bitcast(None, res, result_type);
+            return self.gcc_int_cast(res, result_type);
         }
 
-        // First step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x5555555555555555);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 1);
-        let right = shifted & mask;
-        let value = left + right;
+        // Use Wenger's algorithm for population count, gcc's seems to play better with it
+        // for (int counter = 0; value != 0; counter++) {
+        //     value &= value - 1;
+        // }
+        let func = self.current_func.borrow().expect("func");
+        let loop_head = func.new_block("head");
+        let loop_body = func.new_block("body");
+        let loop_tail = func.new_block("tail");
 
-        // Second step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x3333333333333333);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 2);
-        let right = shifted & mask;
-        let value = left + right;
+        let counter_type = self.int_type;
+        let counter = self.current_func().new_local(None, counter_type, "popcount_counter");
+        let val = self.current_func().new_local(None, value_type, "popcount_value");
+        let zero = self.gcc_zero(counter_type);
+        self.llbb().add_assignment(None, counter, zero);
+        self.llbb().add_assignment(None, val, value);
+        self.br(loop_head);
 
-        // Third step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x0F0F0F0F0F0F0F0F);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 4);
-        let right = shifted & mask;
-        let value = left + right;
+        // check if value isn't zero
+        self.switch_to_block(loop_head);
+        let zero = self.gcc_zero(value_type);
+        let cond = self.gcc_icmp(IntPredicate::IntNE, val.to_rvalue(), zero);
+        self.cond_br(cond, loop_body, loop_tail);
 
-        if value_type.is_u8(&self.cx) {
-            return self.context.new_bitcast(None, value, result_type);
-        }
+        // val &= val - 1;
+        self.switch_to_block(loop_body);
+        let one = self.gcc_int(value_type, 1);
+        let sub = self.gcc_sub(val.to_rvalue(), one);
+        let op = self.gcc_and(val.to_rvalue(), sub);
+        loop_body.add_assignment(None, val, op);
 
-        // Fourth step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x00FF00FF00FF00FF);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 8);
-        let right = shifted & mask;
-        let value = left + right;
+        // counter += 1
+        let one = self.gcc_int(counter_type, 1);
+        let op = self.gcc_add(counter.to_rvalue(), one);
+        loop_body.add_assignment(None, counter, op);
+        self.br(loop_head);
 
-        if value_type.is_u16(&self.cx) {
-            return self.context.new_bitcast(None, value, result_type);
-        }
-
-        // Fifth step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x0000FFFF0000FFFF);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 16);
-        let right = shifted & mask;
-        let value = left + right;
-
-        if value_type.is_u32(&self.cx) {
-            return self.context.new_bitcast(None, value, result_type);
-        }
-
-        // Sixth step.
-        let mask = self.context.new_rvalue_from_long(value_type, 0x00000000FFFFFFFF);
-        let left = value & mask;
-        let shifted = value >> self.context.new_rvalue_from_int(value_type, 32);
-        let right = shifted & mask;
-        let value = left + right;
-
-        self.context.new_bitcast(None, value, result_type)
+        // end of loop
+        self.switch_to_block(loop_tail);
+        self.gcc_int_cast(counter.to_rvalue(), result_type)
     }
 
     // Algorithm from: https://blog.regehr.org/archives/1063
     fn rotate_left(&mut self, value: RValue<'gcc>, shift: RValue<'gcc>, width: u64) -> RValue<'gcc> {
-        let max = self.context.new_rvalue_from_long(shift.get_type(), width as i64);
-        let shift = shift % max;
+        let max = self.const_uint(shift.get_type(), width);
+        let shift = self.urem(shift, max);
         let lhs = self.shl(value, shift);
+        let result_neg = self.neg(shift);
         let result_and =
             self.and(
-                self.context.new_unary_op(None, UnaryOp::Minus, shift.get_type(), shift),
-                self.context.new_rvalue_from_long(shift.get_type(), width as i64 - 1),
+                result_neg,
+                self.const_uint(shift.get_type(), width - 1),
             );
         let rhs = self.lshr(value, result_and);
         self.or(lhs, rhs)
@@ -939,121 +896,145 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
 
     // Algorithm from: https://blog.regehr.org/archives/1063
     fn rotate_right(&mut self, value: RValue<'gcc>, shift: RValue<'gcc>, width: u64) -> RValue<'gcc> {
-        let max = self.context.new_rvalue_from_long(shift.get_type(), width as i64);
-        let shift = shift % max;
+        let max = self.const_uint(shift.get_type(), width);
+        let shift = self.urem(shift, max);
         let lhs = self.lshr(value, shift);
+        let result_neg = self.neg(shift);
         let result_and =
             self.and(
-                self.context.new_unary_op(None, UnaryOp::Minus, shift.get_type(), shift),
-                self.context.new_rvalue_from_long(shift.get_type(), width as i64 - 1),
+                result_neg,
+                self.const_uint(shift.get_type(), width - 1),
             );
         let rhs = self.shl(value, result_and);
         self.or(lhs, rhs)
     }
 
     fn saturating_add(&mut self, lhs: RValue<'gcc>, rhs: RValue<'gcc>, signed: bool, width: u64) -> RValue<'gcc> {
-        let func = self.current_func.borrow().expect("func");
-
+        let result_type = lhs.get_type();
         if signed {
-            // Algorithm from: https://stackoverflow.com/a/56531252/389119
-            let after_block = func.new_block("after");
-            let func_name =
-                match width {
-                    8 => "__builtin_add_overflow",
-                    16 => "__builtin_add_overflow",
-                    32 => "__builtin_sadd_overflow",
-                    64 => "__builtin_saddll_overflow",
-                    128 => "__builtin_add_overflow",
-                    _ => unreachable!(),
-                };
-            let overflow_func = self.context.get_builtin_function(func_name);
-            let result_type = lhs.get_type();
+            // Based on algorithm from: https://stackoverflow.com/a/56531252/389119
+            let func = self.current_func.borrow().expect("func");
             let res = func.new_local(None, result_type, "saturating_sum");
-            let overflow = self.overflow_call(overflow_func, &[lhs, rhs, res.get_address(None)], None);
+            let supports_native_type = self.is_native_int_type(result_type);
+            let overflow =
+                if supports_native_type {
+                    let func_name =
+                        match width {
+                            8 => "__builtin_add_overflow",
+                            16 => "__builtin_add_overflow",
+                            32 => "__builtin_sadd_overflow",
+                            64 => "__builtin_saddll_overflow",
+                            128 => "__builtin_add_overflow",
+                            _ => unreachable!(),
+                        };
+                    let overflow_func = self.context.get_builtin_function(func_name);
+                    self.overflow_call(overflow_func, &[lhs, rhs, res.get_address(None)], None)
+                }
+                else {
+                    let func_name =
+                        match width {
+                            128 => "__rust_i128_addo",
+                            _ => unreachable!(),
+                        };
+                    let (int_result, overflow) = self.operation_with_overflow(func_name, lhs, rhs);
+                    self.llbb().add_assignment(None, res, int_result);
+                    overflow
+                };
 
             let then_block = func.new_block("then");
+            let after_block = func.new_block("after");
 
-            let unsigned_type = self.context.new_int_type(width as i32 / 8, false);
-            let shifted = self.context.new_cast(None, lhs, unsigned_type) >> self.context.new_rvalue_from_int(unsigned_type, width as i32 - 1);
-            let uint_max = self.context.new_unary_op(None, UnaryOp::BitwiseNegate, unsigned_type,
-                self.context.new_rvalue_from_int(unsigned_type, 0)
-            );
-            let int_max = uint_max >> self.context.new_rvalue_one(unsigned_type);
-            then_block.add_assignment(None, res, self.context.new_cast(None, shifted + int_max, result_type));
+            // Return `result_type`'s maximum or minimum value on overflow
+            // NOTE: convert the type to unsigned to have an unsigned shift.
+            let unsigned_type = result_type.to_unsigned(&self.cx);
+            let shifted = self.gcc_lshr(self.gcc_int_cast(lhs, unsigned_type), self.gcc_int(unsigned_type, width as i64 - 1));
+            let uint_max = self.gcc_not(self.gcc_int(unsigned_type, 0));
+            let int_max = self.gcc_lshr(uint_max, self.gcc_int(unsigned_type, 1));
+            then_block.add_assignment(None, res, self.gcc_int_cast(self.gcc_add(shifted, int_max), result_type));
             then_block.end_with_jump(None, after_block);
 
             self.llbb().end_with_conditional(None, overflow, then_block, after_block);
 
             // NOTE: since jumps were added in a place rustc does not
-            // expect, the current blocks in the state need to be updated.
-            *self.current_block.borrow_mut() = Some(after_block);
-            self.block = Some(after_block);
+            // expect, the current block in the state need to be updated.
+            self.switch_to_block(after_block);
 
             res.to_rvalue()
         }
         else {
             // Algorithm from: http://locklessinc.com/articles/sat_arithmetic/
-            let res = lhs + rhs;
-            let res_type = res.get_type();
-            let cond = self.context.new_comparison(None, ComparisonOp::LessThan, res, lhs);
-            let value = self.context.new_unary_op(None, UnaryOp::Minus, res_type, self.context.new_cast(None, cond, res_type));
-            res | value
+            let res = self.gcc_add(lhs, rhs);
+            let cond = self.gcc_icmp(IntPredicate::IntULT, res, lhs);
+            let value = self.gcc_neg(self.gcc_int_cast(cond, result_type));
+            self.gcc_or(res, value)
         }
     }
 
     // Algorithm from: https://locklessinc.com/articles/sat_arithmetic/
     fn saturating_sub(&mut self, lhs: RValue<'gcc>, rhs: RValue<'gcc>, signed: bool, width: u64) -> RValue<'gcc> {
+        let result_type = lhs.get_type();
         if signed {
-            // Also based on algorithm from: https://stackoverflow.com/a/56531252/389119
-            let func_name =
-                match width {
-                    8 => "__builtin_sub_overflow",
-                    16 => "__builtin_sub_overflow",
-                    32 => "__builtin_ssub_overflow",
-                    64 => "__builtin_ssubll_overflow",
-                    128 => "__builtin_sub_overflow",
-                    _ => unreachable!(),
-                };
-            let overflow_func = self.context.get_builtin_function(func_name);
-            let result_type = lhs.get_type();
+            // Based on algorithm from: https://stackoverflow.com/a/56531252/389119
             let func = self.current_func.borrow().expect("func");
             let res = func.new_local(None, result_type, "saturating_diff");
-            let overflow = self.overflow_call(overflow_func, &[lhs, rhs, res.get_address(None)], None);
+            let supports_native_type = self.is_native_int_type(result_type);
+            let overflow =
+                if supports_native_type {
+                    let func_name =
+                        match width {
+                            8 => "__builtin_sub_overflow",
+                            16 => "__builtin_sub_overflow",
+                            32 => "__builtin_ssub_overflow",
+                            64 => "__builtin_ssubll_overflow",
+                            128 => "__builtin_sub_overflow",
+                            _ => unreachable!(),
+                        };
+                    let overflow_func = self.context.get_builtin_function(func_name);
+                    self.overflow_call(overflow_func, &[lhs, rhs, res.get_address(None)], None)
+                }
+                else {
+                    let func_name =
+                        match width {
+                            128 => "__rust_i128_subo",
+                            _ => unreachable!(),
+                        };
+                    let (int_result, overflow) = self.operation_with_overflow(func_name, lhs, rhs);
+                    self.llbb().add_assignment(None, res, int_result);
+                    overflow
+                };
 
             let then_block = func.new_block("then");
             let after_block = func.new_block("after");
 
-            let unsigned_type = self.context.new_int_type(width as i32 / 8, false);
-            let shifted = self.context.new_cast(None, lhs, unsigned_type) >> self.context.new_rvalue_from_int(unsigned_type, width as i32 - 1);
-            let uint_max = self.context.new_unary_op(None, UnaryOp::BitwiseNegate, unsigned_type,
-                self.context.new_rvalue_from_int(unsigned_type, 0)
-            );
-            let int_max = uint_max >> self.context.new_rvalue_one(unsigned_type);
-            then_block.add_assignment(None, res, self.context.new_cast(None, shifted + int_max, result_type));
+            // Return `result_type`'s maximum or minimum value on overflow
+            // NOTE: convert the type to unsigned to have an unsigned shift.
+            let unsigned_type = result_type.to_unsigned(&self.cx);
+            let shifted = self.gcc_lshr(self.gcc_int_cast(lhs, unsigned_type), self.gcc_int(unsigned_type, width as i64 - 1));
+            let uint_max = self.gcc_not(self.gcc_int(unsigned_type, 0));
+            let int_max = self.gcc_lshr(uint_max, self.gcc_int(unsigned_type, 1));
+            then_block.add_assignment(None, res, self.gcc_int_cast(self.gcc_add(shifted, int_max), result_type));
             then_block.end_with_jump(None, after_block);
 
             self.llbb().end_with_conditional(None, overflow, then_block, after_block);
 
             // NOTE: since jumps were added in a place rustc does not
-            // expect, the current blocks in the state need to be updated.
-            *self.current_block.borrow_mut() = Some(after_block);
-            self.block = Some(after_block);
+            // expect, the current block in the state need to be updated.
+            self.switch_to_block(after_block);
 
             res.to_rvalue()
         }
         else {
-            let res = lhs - rhs;
-            let comparison = self.context.new_comparison(None, ComparisonOp::LessThanEquals, res, lhs);
-            let comparison = self.context.new_cast(None, comparison, lhs.get_type());
-            let unary_op = self.context.new_unary_op(None, UnaryOp::Minus, comparison.get_type(), comparison);
-            self.and(res, unary_op)
+            let res = self.gcc_sub(lhs, rhs);
+            let comparison = self.gcc_icmp(IntPredicate::IntULE, res, lhs);
+            let value = self.gcc_neg(self.gcc_int_cast(comparison, result_type));
+            self.gcc_and(res, value)
         }
     }
 }
 
-fn try_intrinsic<'gcc, 'tcx>(bx: &mut Builder<'_, 'gcc, 'tcx>, try_func: RValue<'gcc>, data: RValue<'gcc>, _catch_func: RValue<'gcc>, dest: RValue<'gcc>) {
+fn try_intrinsic<'a, 'b, 'gcc, 'tcx>(bx: &'b mut Builder<'a, 'gcc, 'tcx>, try_func: RValue<'gcc>, data: RValue<'gcc>, _catch_func: RValue<'gcc>, dest: RValue<'gcc>) {
     if bx.sess().panic_strategy() == PanicStrategy::Abort {
-        bx.call(bx.type_void(), try_func, &[data], None);
+        bx.call(bx.type_void(), None, None, try_func, &[data], None);
         // Return 0 unconditionally from the intrinsic call;
         // we can never unwind.
         let ret_align = bx.tcx.data_layout.i32_align.abi;
@@ -1063,6 +1044,141 @@ fn try_intrinsic<'gcc, 'tcx>(bx: &mut Builder<'_, 'gcc, 'tcx>, try_func: RValue<
         unimplemented!();
     }
     else {
+        #[cfg(feature="master")]
+        codegen_gnu_try(bx, try_func, data, _catch_func, dest);
+        #[cfg(not(feature="master"))]
         unimplemented!();
     }
+}
+
+// Definition of the standard `try` function for Rust using the GNU-like model
+// of exceptions (e.g., the normal semantics of LLVM's `landingpad` and `invoke`
+// instructions).
+//
+// This codegen is a little surprising because we always call a shim
+// function instead of inlining the call to `invoke` manually here. This is done
+// because in LLVM we're only allowed to have one personality per function
+// definition. The call to the `try` intrinsic is being inlined into the
+// function calling it, and that function may already have other personality
+// functions in play. By calling a shim we're guaranteed that our shim will have
+// the right personality function.
+#[cfg(feature="master")]
+fn codegen_gnu_try<'gcc>(bx: &mut Builder<'_, 'gcc, '_>, try_func: RValue<'gcc>, data: RValue<'gcc>, catch_func: RValue<'gcc>, dest: RValue<'gcc>) {
+    let cx: &CodegenCx<'gcc, '_> = bx.cx;
+    let (llty, func) = get_rust_try_fn(cx, &mut |mut bx| {
+        // Codegens the shims described above:
+        //
+        //   bx:
+        //      invoke %try_func(%data) normal %normal unwind %catch
+        //
+        //   normal:
+        //      ret 0
+        //
+        //   catch:
+        //      (%ptr, _) = landingpad
+        //      call %catch_func(%data, %ptr)
+        //      ret 1
+        let then = bx.append_sibling_block("then");
+        let catch = bx.append_sibling_block("catch");
+
+        let func = bx.current_func();
+        let try_func = func.get_param(0).to_rvalue();
+        let data = func.get_param(1).to_rvalue();
+        let catch_func = func.get_param(2).to_rvalue();
+        let try_func_ty = bx.type_func(&[bx.type_i8p()], bx.type_void());
+
+        let current_block = bx.block.clone();
+
+        bx.switch_to_block(then);
+        bx.ret(bx.const_i32(0));
+
+        // Type indicator for the exception being thrown.
+        //
+        // The value is a pointer to the exception object
+        // being thrown.
+        bx.switch_to_block(catch);
+        bx.set_personality_fn(bx.eh_personality());
+
+        let eh_pointer_builtin = bx.cx.context.get_target_builtin_function("__builtin_eh_pointer");
+        let zero = bx.cx.context.new_rvalue_zero(bx.int_type);
+        let ptr = bx.cx.context.new_call(None, eh_pointer_builtin, &[zero]);
+        let catch_ty = bx.type_func(&[bx.type_i8p(), bx.type_i8p()], bx.type_void());
+        bx.call(catch_ty, None, None, catch_func, &[data, ptr], None);
+        bx.ret(bx.const_i32(1));
+
+        // NOTE: the blocks must be filled before adding the try/catch, otherwise gcc will not
+        // generate a try/catch.
+        // FIXME(antoyo): add a check in the libgccjit API to prevent this.
+        bx.switch_to_block(current_block);
+        bx.invoke(try_func_ty, None, None, try_func, &[data], then, catch, None);
+    });
+
+    let func = unsafe { std::mem::transmute(func) };
+
+    // Note that no invoke is used here because by definition this function
+    // can't panic (that's what it's catching).
+    let ret = bx.call(llty, None, None, func, &[try_func, data, catch_func], None);
+    let i32_align = bx.tcx().data_layout.i32_align.abi;
+    bx.store(ret, dest, i32_align);
+}
+
+
+// Helper function used to get a handle to the `__rust_try` function used to
+// catch exceptions.
+//
+// This function is only generated once and is then cached.
+#[cfg(feature="master")]
+fn get_rust_try_fn<'a, 'gcc, 'tcx>(cx: &'a CodegenCx<'gcc, 'tcx>, codegen: &mut dyn FnMut(Builder<'a, 'gcc, 'tcx>)) -> (Type<'gcc>, Function<'gcc>) {
+    if let Some(llfn) = cx.rust_try_fn.get() {
+        return llfn;
+    }
+
+    // Define the type up front for the signature of the rust_try function.
+    let tcx = cx.tcx;
+    let i8p = Ty::new_mut_ptr(tcx,tcx.types.i8);
+    // `unsafe fn(*mut i8) -> ()`
+    let try_fn_ty = Ty::new_fn_ptr(tcx,ty::Binder::dummy(tcx.mk_fn_sig(
+        iter::once(i8p),
+        Ty::new_unit(tcx,),
+        false,
+        rustc_hir::Unsafety::Unsafe,
+        Abi::Rust,
+    )));
+    // `unsafe fn(*mut i8, *mut i8) -> ()`
+    let catch_fn_ty = Ty::new_fn_ptr(tcx,ty::Binder::dummy(tcx.mk_fn_sig(
+        [i8p, i8p].iter().cloned(),
+        Ty::new_unit(tcx,),
+        false,
+        rustc_hir::Unsafety::Unsafe,
+        Abi::Rust,
+    )));
+    // `unsafe fn(unsafe fn(*mut i8) -> (), *mut i8, unsafe fn(*mut i8, *mut i8) -> ()) -> i32`
+    let rust_fn_sig = ty::Binder::dummy(cx.tcx.mk_fn_sig(
+        [try_fn_ty, i8p, catch_fn_ty],
+        tcx.types.i32,
+        false,
+        rustc_hir::Unsafety::Unsafe,
+        Abi::Rust,
+    ));
+    let rust_try = gen_fn(cx, "__rust_try", rust_fn_sig, codegen);
+    cx.rust_try_fn.set(Some(rust_try));
+    rust_try
+}
+
+// Helper function to give a Block to a closure to codegen a shim function.
+// This is currently primarily used for the `try` intrinsic functions above.
+#[cfg(feature="master")]
+fn gen_fn<'a, 'gcc, 'tcx>(cx: &'a CodegenCx<'gcc, 'tcx>, name: &str, rust_fn_sig: ty::PolyFnSig<'tcx>, codegen: &mut dyn FnMut(Builder<'a, 'gcc, 'tcx>)) -> (Type<'gcc>, Function<'gcc>) {
+    let fn_abi = cx.fn_abi_of_fn_ptr(rust_fn_sig, ty::List::empty());
+    let return_type = fn_abi.gcc_type(cx).return_type;
+    // FIXME(eddyb) find a nicer way to do this.
+    cx.linkage.set(FunctionType::Internal);
+    let func = cx.declare_fn(name, fn_abi);
+    let func_val = unsafe { std::mem::transmute(func) };
+    cx.set_frame_pointer_type(func_val);
+    cx.apply_target_cpu_attr(func_val);
+    let block = Builder::append_block(cx, func_val, "entry-block");
+    let bx = Builder::build(cx, block);
+    codegen(bx);
+    (return_type, func)
 }

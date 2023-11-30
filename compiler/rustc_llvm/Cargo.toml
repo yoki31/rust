@@ -3,13 +3,12 @@ name = "rustc_llvm"
 version = "0.0.0"
 edition = "2021"
 
-[features]
-static-libstdcpp = []
-emscripten = []
-
 [dependencies]
+# tidy-alphabetical-start
 libc = "0.2.73"
+# tidy-alphabetical-end
 
 [build-dependencies]
-build_helper = { path = "../../src/build_helper" }
+# tidy-alphabetical-start
 cc = "1.0.69"
+# tidy-alphabetical-end

@@ -1,7 +1,13 @@
-// run-rustfix
 // rustfix-only-machine-applicable
+#![feature(lint_reasons)]
+#![warn(clippy::redundant_clone)]
+#![allow(
+    clippy::drop_non_drop,
+    clippy::implicit_clone,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_literal_unwrap
+)]
 
-#![allow(clippy::implicit_clone)]
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -27,6 +33,10 @@ fn main() {
 
     // Check that lint level works
     #[allow(clippy::redundant_clone)]
+    let _s = String::new().to_string();
+
+    // Check that lint level works
+    #[expect(clippy::redundant_clone)]
     let _s = String::new().to_string();
 
     let tup = (String::from("foo"),);

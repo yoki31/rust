@@ -1,25 +1,28 @@
-use crate::mem;
-use crate::slice;
-
 pub fn hashmap_random_keys() -> (u64, u64) {
-    let mut v = (0, 0);
-    unsafe {
-        let view = slice::from_raw_parts_mut(&mut v as *mut _ as *mut u8, mem::size_of_val(&v));
-        imp::fill_bytes(view);
-    }
-    v
+    const KEY_LEN: usize = core::mem::size_of::<u64>();
+
+    let mut v = [0u8; KEY_LEN * 2];
+    imp::fill_bytes(&mut v);
+
+    let key1 = v[0..KEY_LEN].try_into().unwrap();
+    let key2 = v[KEY_LEN..].try_into().unwrap();
+
+    (u64::from_ne_bytes(key1), u64::from_ne_bytes(key2))
 }
 
 #[cfg(all(
     unix,
     not(target_os = "macos"),
     not(target_os = "ios"),
+    not(target_os = "tvos"),
+    not(target_os = "watchos"),
     not(target_os = "openbsd"),
-    not(target_os = "freebsd"),
     not(target_os = "netbsd"),
     not(target_os = "fuchsia"),
     not(target_os = "redox"),
-    not(target_os = "vxworks")
+    not(target_os = "vxworks"),
+    not(target_os = "emscripten"),
+    not(target_os = "vita"),
 ))]
 mod imp {
     use crate::fs::File;
@@ -30,6 +33,9 @@ mod imp {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+        use crate::sys::os::errno;
+
         // A weak symbol allows interposition, e.g. for perf measurements that want to
         // disable randomness for consistency. Otherwise, we'll try a raw syscall.
         // (`getrandom` was added in glibc 2.25, musl 1.1.20, android API level 28)
@@ -41,20 +47,54 @@ mod imp {
             ) -> libc::ssize_t
         }
 
+        // This provides the best quality random numbers available at the given moment
+        // without ever blocking, and is preferable to falling back to /dev/urandom.
+        static GRND_INSECURE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+        if GRND_INSECURE_AVAILABLE.load(Ordering::Relaxed) {
+            let ret = unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_INSECURE) };
+            if ret == -1 && errno() as libc::c_int == libc::EINVAL {
+                GRND_INSECURE_AVAILABLE.store(false, Ordering::Relaxed);
+            } else {
+                return ret;
+            }
+        }
+
         unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_NONBLOCK) }
     }
 
-    #[cfg(target_os = "espidf")]
+    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "freebsd"))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
-        unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
+        #[cfg(not(target_os = "freebsd"))]
+        use libc::getrandom;
+        #[cfg(target_os = "freebsd")]
+        extern "C" {
+            fn getrandom(
+                buf: *mut libc::c_void,
+                buflen: libc::size_t,
+                flags: libc::c_uint,
+            ) -> libc::ssize_t;
+        }
+        unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "espidf")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd"
+    )))]
     fn getrandom_fill_bytes(_buf: &mut [u8]) -> bool {
         false
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "espidf"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd"
+    ))]
     fn getrandom_fill_bytes(v: &mut [u8]) -> bool {
         use crate::sync::atomic::{AtomicBool, Ordering};
         use crate::sys::os::errno;
@@ -82,7 +122,7 @@ mod imp {
                 } else if err == libc::EAGAIN {
                     return false;
                 } else {
-                    panic!("unexpected getrandom error: {}", err);
+                    panic!("unexpected getrandom error: {err}");
                 }
             } else {
                 read += result as usize;
@@ -111,44 +151,69 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
-    use crate::fs::File;
-    use crate::io::Read;
-    use crate::sys::os::errno;
-    use crate::sys::weak::weak;
+    use crate::io;
     use libc::{c_int, c_void, size_t};
 
-    fn getentropy_fill_bytes(v: &mut [u8]) -> bool {
-        weak!(fn getentropy(*mut c_void, size_t) -> c_int);
+    #[inline(always)]
+    fn random_failure() -> ! {
+        panic!("unexpected random generation error: {}", io::Error::last_os_error());
+    }
 
-        getentropy
-            .get()
-            .map(|f| {
-                // getentropy(2) permits a maximum buffer size of 256 bytes
-                for s in v.chunks_mut(256) {
-                    let ret = unsafe { f(s.as_mut_ptr() as *mut c_void, s.len()) };
-                    if ret == -1 {
-                        panic!("unexpected getentropy error: {}", errno());
-                    }
-                }
-                true
-            })
-            .unwrap_or(false)
+    #[cfg(target_os = "macos")]
+    fn getentropy_fill_bytes(v: &mut [u8]) {
+        extern "C" {
+            fn getentropy(bytes: *mut c_void, count: size_t) -> c_int;
+        }
+
+        // getentropy(2) permits a maximum buffer size of 256 bytes
+        for s in v.chunks_mut(256) {
+            let ret = unsafe { getentropy(s.as_mut_ptr().cast(), s.len()) };
+            if ret == -1 {
+                random_failure()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ccrandom_fill_bytes(v: &mut [u8]) {
+        extern "C" {
+            fn CCRandomGenerateBytes(bytes: *mut c_void, count: size_t) -> c_int;
+        }
+
+        let ret = unsafe { CCRandomGenerateBytes(v.as_mut_ptr().cast(), v.len()) };
+        if ret == -1 {
+            random_failure()
+        }
     }
 
     pub fn fill_bytes(v: &mut [u8]) {
-        if getentropy_fill_bytes(v) {
-            return;
-        }
+        // All supported versions of macOS (10.12+) support getentropy.
+        //
+        // `getentropy` is measurably faster (via Divan) then the other alternatives so its preferred
+        // when usable.
+        #[cfg(target_os = "macos")]
+        getentropy_fill_bytes(v);
 
-        // for older macos which doesn't support getentropy
-        let mut file = File::open("/dev/urandom").expect("failed to open /dev/urandom");
-        file.read_exact(v).expect("failed to read /dev/urandom")
+        // On Apple platforms, `CCRandomGenerateBytes` and `SecRandomCopyBytes` simply
+        // call into `CCRandomCopyBytes` with `kCCRandomDefault`. `CCRandomCopyBytes`
+        // manages a CSPRNG which is seeded from the kernel's CSPRNG and which runs on
+        // its own thread accessed via GCD. This seems needlessly heavyweight for our purposes
+        // so we only use it on non-Mac OSes where the better entrypoints are blocked.
+        //
+        // `CCRandomGenerateBytes` is used instead of `SecRandomCopyBytes` because the former is accessible
+        // via `libSystem` (libc) while the other needs to link to `Security.framework`.
+        //
+        // Note that while `getentropy` has a available attribute in the macOS headers, the lack
+        // of a header in the iOS (and others) SDK means that its can cause app store rejections.
+        // Just use `CCRandomGenerateBytes` instead.
+        #[cfg(not(target_os = "macos"))]
+        ccrandom_fill_bytes(v);
     }
 }
 
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "openbsd", target_os = "emscripten", target_os = "vita"))]
 mod imp {
     use crate::sys::os::errno;
 
@@ -163,37 +228,8 @@ mod imp {
     }
 }
 
-// On iOS and MacOS `SecRandomCopyBytes` calls `CCRandomCopyBytes` with
-// `kCCRandomDefault`. `CCRandomCopyBytes` manages a CSPRNG which is seeded
-// from `/dev/random` and which runs on its own thread accessed via GCD.
-// This seems needlessly heavyweight for the purposes of generating two u64s
-// once per thread in `hashmap_random_keys`. Therefore `SecRandomCopyBytes` is
-// only used on iOS where direct access to `/dev/urandom` is blocked by the
-// sandbox.
-#[cfg(target_os = "ios")]
-mod imp {
-    use crate::io;
-    use crate::ptr;
-    use libc::{c_int, size_t};
-
-    enum SecRandom {}
-
-    #[allow(non_upper_case_globals)]
-    const kSecRandomDefault: *const SecRandom = ptr::null();
-
-    extern "C" {
-        fn SecRandomCopyBytes(rnd: *const SecRandom, count: size_t, bytes: *mut u8) -> c_int;
-    }
-
-    pub fn fill_bytes(v: &mut [u8]) {
-        let ret = unsafe { SecRandomCopyBytes(kSecRandomDefault, v.len(), v.as_mut_ptr()) };
-        if ret == -1 {
-            panic!("couldn't generate random bytes: {}", io::Error::last_os_error());
-        }
-    }
-}
-
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+// FIXME: once the 10.x release becomes the minimum, this can be dropped for simplification.
+#[cfg(target_os = "netbsd")]
 mod imp {
     use crate::ptr;
 

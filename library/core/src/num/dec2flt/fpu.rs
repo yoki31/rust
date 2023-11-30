@@ -8,8 +8,20 @@ pub use fpu_precision::set_precision;
 // round to 80 bits causing double rounding to happen when values are eventually represented as
 // 32/64 bit float values. To overcome this, the FPU control word can be set so that the
 // computations are performed in the desired precision.
+//
+// Note that normally, it is Undefined Behavior to alter the FPU control word while Rust code runs.
+// The compiler assumes that the control word is always in its default state. However, in this
+// particular case the semantics with the altered control word are actually *more faithful*
+// to Rust semantics than the default -- arguably it is all the code that runs *outside* of the scope
+// of a `set_precision` guard that is wrong.
+// In other words, we are only using this to work around <https://github.com/rust-lang/rust/issues/114479>.
+// Sometimes killing UB with UB actually works...
+// (If this is used to set 32bit precision, there is still a risk that the compiler moves some 64bit
+// operation into the scope of the `set_precision` guard. So it's not like this is totally sound.
+// But it's not really any less sound than the default state of 80bit precision...)
 #[cfg(all(target_arch = "x86", not(target_feature = "sse2")))]
 mod fpu_precision {
+    use core::arch::asm;
     use core::mem::size_of;
 
     /// A structure used to preserve the original value of the FPU control word, so that it can be
@@ -25,7 +37,7 @@ mod fpu_precision {
     /// Developer's Manual (Volume 1).
     ///
     /// The only field which is relevant for the following code is PC, Precision Control. This
-    /// field determines the precision of the operations performed by the  FPU. It can be set to:
+    /// field determines the precision of the operations performed by the FPU. It can be set to:
     ///  - 0b00, single precision i.e., 32-bits
     ///  - 0b10, double precision i.e., 64-bits
     ///  - 0b11, double extended precision i.e., 80-bits (default state)

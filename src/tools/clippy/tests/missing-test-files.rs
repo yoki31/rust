@@ -17,7 +17,7 @@ fn test_missing_tests() {
             "Didn't see a test file for the following files:\n\n{}\n",
             missing_files
                 .iter()
-                .map(|s| format!("\t{}", s))
+                .map(|s| format!("\t{s}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
@@ -41,8 +41,8 @@ fn explore_directory(dir: &Path) -> Vec<String> {
             x.path().extension().and_then(OsStr::to_str),
             y.path().extension().and_then(OsStr::to_str),
         ) {
-            (Some("rs"), _) => Ordering::Less,
-            (_, Some("rs")) => Ordering::Greater,
+            (Some("rs" | "toml"), _) => Ordering::Less,
+            (_, Some("rs" | "toml")) => Ordering::Greater,
             _ => Ordering::Equal,
         }
     });
@@ -54,7 +54,7 @@ fn explore_directory(dir: &Path) -> Vec<String> {
             let file_prefix = path.file_prefix().unwrap().to_str().unwrap().to_string();
             if let Some(ext) = path.extension() {
                 match ext.to_str().unwrap() {
-                    "rs" => current_file = file_prefix.clone(),
+                    "rs" | "toml" => current_file = file_prefix.clone(),
                     "stderr" | "stdout" => {
                         if file_prefix != current_file {
                             missing_files.push(path.to_str().unwrap().to_string());

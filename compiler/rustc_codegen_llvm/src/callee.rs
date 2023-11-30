@@ -4,16 +4,14 @@
 //! and methods are represented as just a fn ptr and not a full
 //! closure.
 
-use crate::abi::FnAbiLlvmExt;
 use crate::attributes;
+use crate::common;
 use crate::context::CodegenCx;
 use crate::llvm;
 use crate::value::Value;
-use rustc_codegen_ssa::traits::*;
-use tracing::debug;
 
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt};
-use rustc_middle::ty::{self, Instance, TypeFoldable};
+use rustc_middle::ty::{self, Instance, TypeVisitableExt};
 
 /// Codegens a reference to a fn/method item, monomorphizing and
 /// inlining as it goes.
@@ -22,13 +20,13 @@ use rustc_middle::ty::{self, Instance, TypeFoldable};
 ///
 /// - `cx`: the crate context
 /// - `instance`: the instance to be instantiated
-pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value {
+pub fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value {
     let tcx = cx.tcx();
 
     debug!("get_fn(instance={:?})", instance);
 
-    assert!(!instance.substs.needs_infer());
-    assert!(!instance.substs.has_escaping_bound_vars());
+    assert!(!instance.args.has_infer());
+    assert!(!instance.args.has_escaping_bound_vars());
 
     if let Some(&llfn) = cx.instances.borrow().get(&instance) {
         return llfn;
@@ -45,46 +43,42 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
     let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
 
     let llfn = if let Some(llfn) = cx.get_declared_value(sym) {
-        // Create a fn pointer with the new signature.
-        let llptrty = fn_abi.ptr_to_llvm_type(cx);
-
-        // This is subtle and surprising, but sometimes we have to bitcast
-        // the resulting fn pointer.  The reason has to do with external
-        // functions.  If you have two crates that both bind the same C
-        // library, they may not use precisely the same types: for
-        // example, they will probably each declare their own structs,
-        // which are distinct types from LLVM's point of view (nominal
-        // types).
-        //
-        // Now, if those two crates are linked into an application, and
-        // they contain inlined code, you can wind up with a situation
-        // where both of those functions wind up being loaded into this
-        // application simultaneously. In that case, the same function
-        // (from LLVM's point of view) requires two types. But of course
-        // LLVM won't allow one function to have two types.
-        //
-        // What we currently do, therefore, is declare the function with
-        // one of the two types (whichever happens to come first) and then
-        // bitcast as needed when the function is referenced to make sure
-        // it has the type we expect.
-        //
-        // This can occur on either a crate-local or crate-external
-        // reference. It also occurs when testing libcore and in some
-        // other weird situations. Annoying.
-        if cx.val_ty(llfn) != llptrty {
-            debug!("get_fn: casting {:?} to {:?}", llfn, llptrty);
-            cx.const_ptrcast(llfn, llptrty)
-        } else {
-            debug!("get_fn: not casting pointer!");
-            llfn
-        }
+        llfn
     } else {
-        let llfn = cx.declare_fn(sym, fn_abi);
+        let instance_def_id = instance.def_id();
+        let llfn = if tcx.sess.target.arch == "x86"
+            && let Some(dllimport) = common::get_dllimport(tcx, instance_def_id, sym)
+        {
+            // Fix for https://github.com/rust-lang/rust/issues/104453
+            // On x86 Windows, LLVM uses 'L' as the prefix for any private
+            // global symbols, so when we create an undecorated function symbol
+            // that begins with an 'L' LLVM misinterprets that as a private
+            // global symbol that it created and so fails the compilation at a
+            // later stage since such a symbol must have a definition.
+            //
+            // To avoid this, we set the Storage Class to "DllImport" so that
+            // LLVM will prefix the name with `__imp_`. Ideally, we'd like the
+            // existing logic below to set the Storage Class, but it has an
+            // exemption for MinGW for backwards compatibility.
+            let llfn = cx.declare_fn(
+                &common::i686_decorated_name(
+                    dllimport,
+                    common::is_mingw_gnu_toolchain(&tcx.sess.target),
+                    true,
+                ),
+                fn_abi,
+                Some(instance),
+            );
+            unsafe {
+                llvm::LLVMSetDLLStorageClass(llfn, llvm::DLLStorageClass::DllImport);
+            }
+            llfn
+        } else {
+            cx.declare_fn(sym, fn_abi, Some(instance))
+        };
         debug!("get_fn: not casting pointer!");
 
         attributes::from_fn_attrs(cx, llfn, instance);
-
-        let instance_def_id = instance.def_id();
 
         // Apply an appropriate linkage/visibility value to our item that we
         // just declared.
@@ -111,7 +105,8 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
         unsafe {
             llvm::LLVMRustSetLinkage(llfn, llvm::Linkage::ExternalLinkage);
 
-            let is_generic = instance.substs.non_erasable_generics().next().is_some();
+            let is_generic =
+                instance.args.non_erasable_generics(tcx, instance.def_id()).next().is_some();
 
             if is_generic {
                 // This is a monomorphization. Its expected visibility depends
@@ -174,7 +169,8 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
             // MinGW: For backward compatibility we rely on the linker to decide whether it
             // should use dllimport for functions.
             if cx.use_dll_storage_attrs
-                && tcx.is_dllimport_foreign_item(instance_def_id)
+                && let Some(library) = tcx.native_library(instance_def_id)
+                && library.kind.is_dllimport()
                 && !matches!(tcx.sess.target.env.as_ref(), "gnu" | "uclibc")
             {
                 llvm::LLVMSetDLLStorageClass(llfn, llvm::DLLStorageClass::DllImport);

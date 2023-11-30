@@ -3,7 +3,7 @@ mod tests;
 
 use crate::fmt;
 use crate::sync::{mutex, poison, LockResult, MutexGuard, PoisonError};
-use crate::sys_common::condvar as sys;
+use crate::sys::locks as sys;
 use crate::time::{Duration, Instant};
 
 /// A type indicating whether a timed wait on a condition variable returned
@@ -21,11 +21,11 @@ impl WaitTimeoutResult {
     ///
     /// # Examples
     ///
-    /// This example spawns a thread which will update the boolean value and
-    /// then wait 100 milliseconds before notifying the condvar.
+    /// This example spawns a thread which will sleep 20 milliseconds before
+    /// updating a boolean value and then notifying the condvar.
     ///
-    /// The main thread will wait with a timeout on the condvar and then leave
-    /// once the boolean has been updated and notified.
+    /// The main thread will wait with a 10 millisecond timeout on the condvar
+    /// and will leave the loop upon timeout.
     ///
     /// ```
     /// use std::sync::{Arc, Condvar, Mutex};
@@ -49,14 +49,12 @@ impl WaitTimeoutResult {
     ///
     /// // Wait for the thread to start up.
     /// let (lock, cvar) = &*pair;
-    /// let mut started = lock.lock().unwrap();
     /// loop {
     ///     // Let's put a timeout on the condvar's wait.
-    ///     let result = cvar.wait_timeout(started, Duration::from_millis(10)).unwrap();
-    ///     // 10 milliseconds have passed, or maybe the value changed!
-    ///     started = result.0;
-    ///     if *started == true {
-    ///         // We received the notification and the value has been updated, we can leave.
+    ///     let result = cvar.wait_timeout(lock.lock().unwrap(), Duration::from_millis(10)).unwrap();
+    ///     // 10 milliseconds have passed.
+    ///     if result.1.timed_out() {
+    ///         // timed out now and we can leave.
     ///         break
     ///     }
     /// }
@@ -122,8 +120,10 @@ impl Condvar {
     /// let condvar = Condvar::new();
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_stable(feature = "const_locks", since = "1.63.0")]
     #[must_use]
-    pub fn new() -> Condvar {
+    #[inline]
+    pub const fn new() -> Condvar {
         Condvar { inner: sys::Condvar::new() }
     }
 
@@ -303,7 +303,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(since = "1.6.0", reason = "replaced by `std::sync::Condvar::wait_timeout`")]
+    #[deprecated(since = "1.6.0", note = "replaced by `std::sync::Condvar::wait_timeout`")]
     pub fn wait_timeout_ms<'a, T>(
         &self,
         guard: MutexGuard<'a, T>,

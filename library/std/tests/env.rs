@@ -1,12 +1,15 @@
 use std::env::*;
 use std::ffi::{OsStr, OsString};
 
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::distributions::{Alphanumeric, DistString};
 
+mod common;
+use common::test_rng;
+use std::thread;
+
+#[track_caller]
 fn make_rand_name() -> OsString {
-    let rng = thread_rng();
-    let n = format!("TEST{}", rng.sample_iter(&Alphanumeric).take(10).collect::<String>());
+    let n = format!("TEST{}", Alphanumeric.sample_string(&mut test_rng(), 10));
     let n = OsString::from(n);
     assert!(var_os(&n).is_none());
     n
@@ -137,4 +140,23 @@ fn env_home_dir() {
             if let Some(olduserprofile) = olduserprofile { set_var("USERPROFILE", olduserprofile); }
         }
     }
+}
+
+#[test] // miri shouldn't detect any data race in this fn
+#[cfg_attr(any(not(miri), target_os = "emscripten"), ignore)]
+fn test_env_get_set_multithreaded() {
+    let getter = thread::spawn(|| {
+        for _ in 0..100 {
+            let _ = var_os("foo");
+        }
+    });
+
+    let setter = thread::spawn(|| {
+        for _ in 0..100 {
+            set_var("foo", "bar");
+        }
+    });
+
+    let _ = getter.join();
+    let _ = setter.join();
 }

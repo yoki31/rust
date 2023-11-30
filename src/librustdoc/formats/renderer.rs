@@ -1,5 +1,4 @@
 use rustc_middle::ty::TyCtxt;
-use rustc_span::Symbol;
 
 use crate::clean;
 use crate::config::RenderOptions;
@@ -9,11 +8,11 @@ use crate::formats::cache::Cache;
 /// Allows for different backends to rustdoc to be used with the `run_format()` function. Each
 /// backend renderer has hooks for initialization, documenting an item, entering and exiting a
 /// module, and cleanup/finalizing output.
-crate trait FormatRenderer<'tcx>: Sized {
+pub(crate) trait FormatRenderer<'tcx>: Sized {
     /// Gives a description of the renderer. Used for performance profiling.
     fn descr() -> &'static str;
 
-    /// Whether to call `item` recursivly for modules
+    /// Whether to call `item` recursively for modules
     ///
     /// This is true for html, and false for json. See #80664
     const RUN_ON_MODULE: bool;
@@ -48,7 +47,7 @@ crate trait FormatRenderer<'tcx>: Sized {
 }
 
 /// Main method for rendering a crate.
-crate fn run_format<'tcx, T: FormatRenderer<'tcx>>(
+pub(crate) fn run_format<'tcx, T: FormatRenderer<'tcx>>(
     krate: clean::Crate,
     options: RenderOptions,
     cache: Cache,
@@ -58,7 +57,7 @@ crate fn run_format<'tcx, T: FormatRenderer<'tcx>>(
 
     let emit_crate = options.should_emit_crate();
     let (mut format_renderer, krate) = prof
-        .extra_verbose_generic_activity("create_renderer", T::descr())
+        .verbose_generic_activity_with_arg("create_renderer", T::descr())
         .run(|| T::init(krate, options, cache, tcx))?;
 
     if !emit_crate {
@@ -68,7 +67,6 @@ crate fn run_format<'tcx, T: FormatRenderer<'tcx>>(
     // Render the crate documentation
     let mut work = vec![(format_renderer.make_child_renderer(), krate.module)];
 
-    let unknown = Symbol::intern("<unknown item>");
     while let Some((mut cx, item)) = work.pop() {
         if item.is_mod() && T::RUN_ON_MODULE {
             // modules are special because they add a namespace. We also need to
@@ -77,9 +75,10 @@ crate fn run_format<'tcx, T: FormatRenderer<'tcx>>(
                 prof.generic_activity_with_arg("render_mod_item", item.name.unwrap().to_string());
 
             cx.mod_item_in(&item)?;
-            let module = match *item.kind {
-                clean::StrippedItem(box clean::ModuleItem(m)) | clean::ModuleItem(m) => m,
-                _ => unreachable!(),
+            let (clean::StrippedItem(box clean::ModuleItem(module)) | clean::ModuleItem(module)) =
+                *item.kind
+            else {
+                unreachable!()
             };
             for it in module.items {
                 debug!("Adding {:?} to worklist", it.name);
@@ -89,11 +88,13 @@ crate fn run_format<'tcx, T: FormatRenderer<'tcx>>(
             cx.mod_item_out()?;
         // FIXME: checking `item.name.is_some()` is very implicit and leads to lots of special
         // cases. Use an explicit match instead.
-        } else if item.name.is_some() && !item.is_extern_crate() {
-            prof.generic_activity_with_arg("render_item", &*item.name.unwrap_or(unknown).as_str())
+        } else if let Some(item_name) = item.name
+            && !item.is_extern_crate()
+        {
+            prof.generic_activity_with_arg("render_item", item_name.as_str())
                 .run(|| cx.item(item))?;
         }
     }
-    prof.extra_verbose_generic_activity("renderer_after_krate", T::descr())
+    prof.verbose_generic_activity_with_arg("renderer_after_krate", T::descr())
         .run(|| format_renderer.after_krate())
 }

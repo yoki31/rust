@@ -11,9 +11,11 @@ If parsing the output with Rust, the
 [`cargo_metadata`](https://crates.io/crates/cargo_metadata) crate provides
 some support for parsing the messages.
 
-When parsing, care should be taken to be forwards-compatible with future changes
-to the format. Optional values may be `null`. New fields may be added. Enumerated
-fields like "level" or "suggestion_applicability" may add new values.
+Each type of message has a `$message_type` field which can be used to
+distinguish the different formats. When parsing, care should be taken
+to be forwards-compatible with future changes to the format. Optional
+values may be `null`. New fields may be added. Enumerated fields like
+"level" or "suggestion_applicability" may add new values.
 
 ## Diagnostics
 
@@ -29,6 +31,8 @@ Diagnostics have the following format:
 
 ```javascript
 {
+    /* Type of this message */
+    "$message_type": "diagnostic",
     /* The primary message. */
     "message": "unused variable: `x`",
     /* The diagnostic code.
@@ -61,7 +65,7 @@ Diagnostics have the following format:
             /* The file where the span is located.
                Note that this path may not exist. For example, if the path
                points to the standard library, and the rust src is not
-               available in the sysroot, then it may point to a non-existent
+               available in the sysroot, then it may point to a nonexistent
                file. Beware that this may also point to the source of an
                external crate.
             */
@@ -217,15 +221,44 @@ flag][option-emit] documentation.
 
 ```javascript
 {
+    /* Type of this message */
+    "$message_type": "artifact",
     /* The filename that was generated. */
     "artifact": "libfoo.rlib",
     /* The kind of artifact that was generated. Possible values:
        - "link": The generated crate as specified by the crate-type.
        - "dep-info": The `.d` file with dependency information in a Makefile-like syntax.
        - "metadata": The Rust `.rmeta` file containing metadata about the crate.
-       - "save-analysis": A JSON file emitted by the `-Zsave-analysis` feature.
     */
     "emit": "link"
+}
+```
+
+## Future-incompatible reports
+
+If the [`--json=future-incompat`][option-json] flag is used, then a separate
+JSON structure will be emitted if the crate may stop compiling in the future.
+This contains diagnostic information about the particular warnings that may be
+turned into a hard error in the future. This will include the diagnostic
+information, even if the diagnostics have been suppressed (such as with an
+`#[allow]` attribute or the `--cap-lints` option).
+
+```javascript
+{
+    /* Type of this message */
+    "$message_type": "future_incompat",
+    /* An array of objects describing a warning that will become a hard error
+       in the future.
+    */
+    "future_incompat_report":
+    [
+        {
+            /* A diagnostic structure as defined in
+               https://doc.rust-lang.org/rustc/json.html#diagnostics
+            */
+            "diagnostic": {...},
+        }
+    ]
 }
 ```
 

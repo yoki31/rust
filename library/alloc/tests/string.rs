@@ -368,32 +368,77 @@ fn remove_bad() {
 
 #[test]
 fn test_remove_matches() {
+    // test_single_pattern_occurrence
     let mut s = "abc".to_string();
-
     s.remove_matches('b');
     assert_eq!(s, "ac");
+    // repeat_test_single_pattern_occurrence
     s.remove_matches('b');
     assert_eq!(s, "ac");
 
+    // test_single_character_pattern
     let mut s = "abcb".to_string();
-
     s.remove_matches('b');
     assert_eq!(s, "ac");
 
+    // test_pattern_with_special_characters
     let mut s = "ศไทย中华Việt Nam; foobarศ".to_string();
     s.remove_matches('ศ');
     assert_eq!(s, "ไทย中华Việt Nam; foobar");
 
+    // test_pattern_empty_text_and_pattern
     let mut s = "".to_string();
     s.remove_matches("");
     assert_eq!(s, "");
 
+    // test_pattern_empty_text
+    let mut s = "".to_string();
+    s.remove_matches("something");
+    assert_eq!(s, "");
+
+    // test_empty_pattern
+    let mut s = "Testing with empty pattern.".to_string();
+    s.remove_matches("");
+    assert_eq!(s, "Testing with empty pattern.");
+
+    // test_multiple_consecutive_patterns_1
     let mut s = "aaaaa".to_string();
     s.remove_matches('a');
     assert_eq!(s, "");
+
+    // test_multiple_consecutive_patterns_2
+    let mut s = "Hello **world****today!**".to_string();
+    s.remove_matches("**");
+    assert_eq!(s, "Hello worldtoday!");
+
+    // test_case_insensitive_pattern
+    let mut s = "CASE ** SeNsItIvE ** PaTtErN.".to_string();
+    s.remove_matches("sEnSiTiVe");
+    assert_eq!(s, "CASE ** SeNsItIvE ** PaTtErN.");
+
+    // test_pattern_with_digits
+    let mut s = "123 ** 456 ** 789".to_string();
+    s.remove_matches("**");
+    assert_eq!(s, "123  456  789");
+
+    // test_pattern_occurs_after_empty_string
+    let mut s = "abc X defXghi".to_string();
+    s.remove_matches("X");
+    assert_eq!(s, "abc  defghi");
+
+    // test_large_pattern
+    let mut s = "aaaXbbbXcccXdddXeee".to_string();
+    s.remove_matches("X");
+    assert_eq!(s, "aaabbbcccdddeee");
+
+    // test_pattern_at_multiple_positions
+    let mut s = "Pattern ** found ** multiple ** times ** in ** text.".to_string();
+    s.remove_matches("**");
+    assert_eq!(s, "Pattern  found  multiple  times  in  text.");
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_retain() {
     let mut s = String::from("α_β_γ");
 
@@ -470,7 +515,7 @@ fn test_simple_types() {
 #[test]
 fn test_vectors() {
     let x: Vec<i32> = vec![];
-    assert_eq!(format!("{:?}", x), "[]");
+    assert_eq!(format!("{x:?}"), "[]");
     assert_eq!(format!("{:?}", vec![1]), "[1]");
     assert_eq!(format!("{:?}", vec![1, 2, 3]), "[1, 2, 3]");
     assert!(format!("{:?}", vec![vec![], vec![1], vec![1, 1]]) == "[[], [1], [1, 1]]");
@@ -489,7 +534,7 @@ fn test_from_iterator() {
     b.extend(u.chars());
     assert_eq!(s, b);
 
-    let c: String = vec![t, u].into_iter().collect();
+    let c: String = [t, u].into_iter().collect();
     assert_eq!(s, c);
 
     let mut d = t.to_string();
@@ -693,12 +738,6 @@ fn test_try_reserve() {
     const MAX_CAP: usize = isize::MAX as usize;
     const MAX_USIZE: usize = usize::MAX;
 
-    // On 16/32-bit, we check that allocations don't exceed isize::MAX,
-    // on 64-bit, we assume the OS will give an OOM for such a ridiculous size.
-    // Any platform that succeeds for these requests is technically broken with
-    // ptr::offset because LLVM is the worst.
-    let guards_against_isize = usize::BITS < 64;
-
     {
         // Note: basic stuff is checked by test_reserve
         let mut empty_string: String = String::new();
@@ -712,35 +751,19 @@ fn test_try_reserve() {
             panic!("isize::MAX shouldn't trigger an overflow!");
         }
 
-        if guards_against_isize {
-            // Check isize::MAX + 1 does count as overflow
-            assert_matches!(
-                empty_string.try_reserve(MAX_CAP + 1).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "isize::MAX + 1 should trigger an overflow!"
-            );
+        // Check isize::MAX + 1 does count as overflow
+        assert_matches!(
+            empty_string.try_reserve(MAX_CAP + 1).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "isize::MAX + 1 should trigger an overflow!"
+        );
 
-            // Check usize::MAX does count as overflow
-            assert_matches!(
-                empty_string.try_reserve(MAX_USIZE).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "usize::MAX should trigger an overflow!"
-            );
-        } else {
-            // Check isize::MAX + 1 is an OOM
-            assert_matches!(
-                empty_string.try_reserve(MAX_CAP + 1).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "isize::MAX + 1 should trigger an OOM!"
-            );
-
-            // Check usize::MAX is an OOM
-            assert_matches!(
-                empty_string.try_reserve(MAX_USIZE).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "usize::MAX should trigger an OOM!"
-            );
-        }
+        // Check usize::MAX does count as overflow
+        assert_matches!(
+            empty_string.try_reserve(MAX_USIZE).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "usize::MAX should trigger an overflow!"
+        );
     }
 
     {
@@ -753,19 +776,13 @@ fn test_try_reserve() {
         if let Err(CapacityOverflow) = ten_bytes.try_reserve(MAX_CAP - 10).map_err(|e| e.kind()) {
             panic!("isize::MAX shouldn't trigger an overflow!");
         }
-        if guards_against_isize {
-            assert_matches!(
-                ten_bytes.try_reserve(MAX_CAP - 9).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "isize::MAX + 1 should trigger an overflow!"
-            );
-        } else {
-            assert_matches!(
-                ten_bytes.try_reserve(MAX_CAP - 9).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "isize::MAX + 1 should trigger an OOM!"
-            );
-        }
+
+        assert_matches!(
+            ten_bytes.try_reserve(MAX_CAP - 9).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "isize::MAX + 1 should trigger an overflow!"
+        );
+
         // Should always overflow in the add-to-len
         assert_matches!(
             ten_bytes.try_reserve(MAX_USIZE).map_err(|e| e.kind()),
@@ -785,8 +802,6 @@ fn test_try_reserve_exact() {
     const MAX_CAP: usize = isize::MAX as usize;
     const MAX_USIZE: usize = usize::MAX;
 
-    let guards_against_isize = usize::BITS < 64;
-
     {
         let mut empty_string: String = String::new();
 
@@ -799,31 +814,17 @@ fn test_try_reserve_exact() {
             panic!("isize::MAX shouldn't trigger an overflow!");
         }
 
-        if guards_against_isize {
-            assert_matches!(
-                empty_string.try_reserve_exact(MAX_CAP + 1).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "isize::MAX + 1 should trigger an overflow!"
-            );
+        assert_matches!(
+            empty_string.try_reserve_exact(MAX_CAP + 1).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "isize::MAX + 1 should trigger an overflow!"
+        );
 
-            assert_matches!(
-                empty_string.try_reserve_exact(MAX_USIZE).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "usize::MAX should trigger an overflow!"
-            );
-        } else {
-            assert_matches!(
-                empty_string.try_reserve_exact(MAX_CAP + 1).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "isize::MAX + 1 should trigger an OOM!"
-            );
-
-            assert_matches!(
-                empty_string.try_reserve_exact(MAX_USIZE).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "usize::MAX should trigger an OOM!"
-            );
-        }
+        assert_matches!(
+            empty_string.try_reserve_exact(MAX_USIZE).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "usize::MAX should trigger an overflow!"
+        );
     }
 
     {
@@ -839,19 +840,13 @@ fn test_try_reserve_exact() {
         {
             panic!("isize::MAX shouldn't trigger an overflow!");
         }
-        if guards_against_isize {
-            assert_matches!(
-                ten_bytes.try_reserve_exact(MAX_CAP - 9).map_err(|e| e.kind()),
-                Err(CapacityOverflow),
-                "isize::MAX + 1 should trigger an overflow!"
-            );
-        } else {
-            assert_matches!(
-                ten_bytes.try_reserve_exact(MAX_CAP - 9).map_err(|e| e.kind()),
-                Err(AllocError { .. }),
-                "isize::MAX + 1 should trigger an OOM!"
-            );
-        }
+
+        assert_matches!(
+            ten_bytes.try_reserve_exact(MAX_CAP - 9).map_err(|e| e.kind()),
+            Err(CapacityOverflow),
+            "isize::MAX + 1 should trigger an overflow!"
+        );
+
         assert_matches!(
             ten_bytes.try_reserve_exact(MAX_USIZE).map_err(|e| e.kind()),
             Err(CapacityOverflow),
@@ -871,6 +866,6 @@ fn test_from_char() {
 fn test_str_concat() {
     let a: String = "hello".to_string();
     let b: String = "world".to_string();
-    let s: String = format!("{}{}", a, b);
+    let s: String = format!("{a}{b}");
     assert_eq!(s.as_bytes()[9], 'd' as u8);
 }

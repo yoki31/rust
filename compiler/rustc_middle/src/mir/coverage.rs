@@ -1,165 +1,112 @@
 //! Metadata from source code coverage analysis and instrumentation.
 
+use rustc_index::IndexVec;
 use rustc_macros::HashStable;
 use rustc_span::Symbol;
 
-use std::cmp::Ord;
 use std::fmt::{self, Debug, Formatter};
 
 rustc_index::newtype_index! {
-    /// An ExpressionOperandId value is assigned directly from either a
-    /// CounterValueReference.as_u32() (which ascend from 1) or an ExpressionOperandId.as_u32()
-    /// (which _*descend*_ from u32::MAX). Id value `0` (zero) represents a virtual counter with a
-    /// constant value of `0`.
-    pub struct ExpressionOperandId {
-        derive [HashStable]
-        DEBUG_FORMAT = "ExpressionOperandId({})",
-        MAX = 0xFFFF_FFFF,
-    }
+    /// ID of a coverage counter. Values ascend from 0.
+    ///
+    /// Before MIR inlining, counter IDs are local to their enclosing function.
+    /// After MIR inlining, coverage statements may have been inlined into
+    /// another function, so use the statement's source-scope to find which
+    /// function/instance its IDs are meaningful for.
+    ///
+    /// Note that LLVM handles counter IDs as `uint32_t`, so there is no need
+    /// to use a larger representation on the Rust side.
+    #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
+    #[max = 0xFFFF_FFFF]
+    #[debug_format = "CounterId({})"]
+    pub struct CounterId {}
 }
 
-impl ExpressionOperandId {
-    /// An expression operand for a "zero counter", as described in the following references:
-    ///
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#counter>
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#tag>
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#counter-expressions>
-    ///
-    /// This operand can be used to count two or more separate code regions with a single counter,
-    /// if they run sequentially with no branches, by injecting the `Counter` in a `BasicBlock` for
-    /// one of the code regions, and inserting `CounterExpression`s ("add ZERO to the counter") in
-    /// the coverage map for the other code regions.
-    pub const ZERO: Self = Self::from_u32(0);
+impl CounterId {
+    pub const START: Self = Self::from_u32(0);
 }
 
 rustc_index::newtype_index! {
-    pub struct CounterValueReference {
-        derive [HashStable]
-        DEBUG_FORMAT = "CounterValueReference({})",
-        MAX = 0xFFFF_FFFF,
-    }
-}
-
-impl CounterValueReference {
-    /// Counters start at 1 to reserve 0 for ExpressionOperandId::ZERO.
-    pub const START: Self = Self::from_u32(1);
-
-    /// Returns explicitly-requested zero-based version of the counter id, used
-    /// during codegen. LLVM expects zero-based indexes.
-    pub fn zero_based_index(&self) -> u32 {
-        let one_based_index = self.as_u32();
-        debug_assert!(one_based_index > 0);
-        one_based_index - 1
-    }
-}
-
-rustc_index::newtype_index! {
-    /// InjectedExpressionId.as_u32() converts to ExpressionOperandId.as_u32()
+    /// ID of a coverage-counter expression. Values ascend from 0.
     ///
-    /// Values descend from u32::MAX.
-    pub struct InjectedExpressionId {
-        derive [HashStable]
-        DEBUG_FORMAT = "InjectedExpressionId({})",
-        MAX = 0xFFFF_FFFF,
-    }
-}
-
-rustc_index::newtype_index! {
-    /// InjectedExpressionIndex.as_u32() translates to u32::MAX - ExpressionOperandId.as_u32()
+    /// Before MIR inlining, expression IDs are local to their enclosing function.
+    /// After MIR inlining, coverage statements may have been inlined into
+    /// another function, so use the statement's source-scope to find which
+    /// function/instance its IDs are meaningful for.
     ///
-    /// Values ascend from 0.
-    pub struct InjectedExpressionIndex {
-        derive [HashStable]
-        DEBUG_FORMAT = "InjectedExpressionIndex({})",
-        MAX = 0xFFFF_FFFF,
-    }
+    /// Note that LLVM handles expression IDs as `uint32_t`, so there is no need
+    /// to use a larger representation on the Rust side.
+    #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
+    #[max = 0xFFFF_FFFF]
+    #[debug_format = "ExpressionId({})"]
+    pub struct ExpressionId {}
 }
 
-rustc_index::newtype_index! {
-    /// MappedExpressionIndex values ascend from zero, and are recalculated indexes based on their
-    /// array position in the LLVM coverage map "Expressions" array, which is assembled during the
-    /// "mapgen" process. They cannot be computed algorithmically, from the other `newtype_index`s.
-    pub struct MappedExpressionIndex {
-        derive [HashStable]
-        DEBUG_FORMAT = "MappedExpressionIndex({})",
-        MAX = 0xFFFF_FFFF,
-    }
+impl ExpressionId {
+    pub const START: Self = Self::from_u32(0);
 }
 
-impl From<CounterValueReference> for ExpressionOperandId {
-    #[inline]
-    fn from(v: CounterValueReference) -> ExpressionOperandId {
-        ExpressionOperandId::from(v.as_u32())
-    }
+/// Enum that can hold a constant zero value, the ID of an physical coverage
+/// counter, or the ID of a coverage-counter expression.
+///
+/// This was originally only used for expression operands (and named `Operand`),
+/// but the zero/counter/expression distinction is also useful for representing
+/// the value of code/gap mappings, and the true/false arms of branch mappings.
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub enum CovTerm {
+    Zero,
+    Counter(CounterId),
+    Expression(ExpressionId),
 }
 
-impl From<InjectedExpressionId> for ExpressionOperandId {
-    #[inline]
-    fn from(v: InjectedExpressionId) -> ExpressionOperandId {
-        ExpressionOperandId::from(v.as_u32())
-    }
-}
-
-#[derive(Clone, PartialEq, TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable)]
-pub enum CoverageKind {
-    Counter {
-        function_source_hash: u64,
-        id: CounterValueReference,
-    },
-    Expression {
-        id: InjectedExpressionId,
-        lhs: ExpressionOperandId,
-        op: Op,
-        rhs: ExpressionOperandId,
-    },
-    Unreachable,
-}
-
-impl CoverageKind {
-    pub fn as_operand_id(&self) -> ExpressionOperandId {
-        use CoverageKind::*;
-        match *self {
-            Counter { id, .. } => ExpressionOperandId::from(id),
-            Expression { id, .. } => ExpressionOperandId::from(id),
-            Unreachable => bug!("Unreachable coverage cannot be part of an expression"),
+impl Debug for CovTerm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => write!(f, "Zero"),
+            Self::Counter(id) => f.debug_tuple("Counter").field(&id.as_u32()).finish(),
+            Self::Expression(id) => f.debug_tuple("Expression").field(&id.as_u32()).finish(),
         }
     }
+}
 
-    pub fn is_expression(&self) -> bool {
-        matches!(self, Self::Expression { .. })
-    }
+#[derive(Clone, PartialEq, TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub enum CoverageKind {
+    /// Marks the point in MIR control flow represented by a coverage counter.
+    ///
+    /// This is eventually lowered to `llvm.instrprof.increment` in LLVM IR.
+    ///
+    /// If this statement does not survive MIR optimizations, any mappings that
+    /// refer to this counter can have those references simplified to zero.
+    CounterIncrement { id: CounterId },
+
+    /// Marks the point in MIR control-flow represented by a coverage expression.
+    ///
+    /// If this statement does not survive MIR optimizations, any mappings that
+    /// refer to this expression can have those references simplified to zero.
+    ///
+    /// (This is only inserted for expression IDs that are directly used by
+    /// mappings. Intermediate expressions with no direct mappings are
+    /// retained/zeroed based on whether they are transitively used.)
+    ExpressionUsed { id: ExpressionId },
 }
 
 impl Debug for CoverageKind {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         use CoverageKind::*;
         match self {
-            Counter { id, .. } => write!(fmt, "Counter({:?})", id.index()),
-            Expression { id, lhs, op, rhs } => write!(
-                fmt,
-                "Expression({:?}) = {} {} {}",
-                id.index(),
-                lhs.index(),
-                if *op == Op::Add { "+" } else { "-" },
-                rhs.index(),
-            ),
-            Unreachable => write!(fmt, "Unreachable"),
+            CounterIncrement { id } => write!(fmt, "CounterIncrement({:?})", id.index()),
+            ExpressionUsed { id } => write!(fmt, "ExpressionUsed({:?})", id.index()),
         }
     }
 }
 
-#[derive(
-    Clone,
-    TyEncodable,
-    TyDecodable,
-    Hash,
-    HashStable,
-    TypeFoldable,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord
-)]
+#[derive(Clone, TyEncodable, TyDecodable, Hash, HashStable, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(TypeFoldable, TypeVisitable)]
 pub struct CodeRegion {
     pub file_name: Symbol,
     pub start_line: u32,
@@ -178,7 +125,8 @@ impl Debug for CodeRegion {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable)]
+#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable, Hash, HashStable)]
+#[derive(TypeFoldable, TypeVisitable)]
 pub enum Op {
     Subtract,
     Add,
@@ -192,4 +140,39 @@ impl Op {
     pub fn is_subtract(&self) -> bool {
         matches!(self, Self::Subtract)
     }
+}
+
+#[derive(Clone, Debug)]
+#[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub struct Expression {
+    pub lhs: CovTerm,
+    pub op: Op,
+    pub rhs: CovTerm,
+}
+
+#[derive(Clone, Debug)]
+#[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub struct Mapping {
+    pub code_region: CodeRegion,
+
+    /// Indicates whether this mapping uses a counter value, expression value,
+    /// or zero value.
+    ///
+    /// FIXME: When we add support for mapping kinds other than `Code`
+    /// (e.g. branch regions, expansion regions), replace this with a dedicated
+    /// mapping-kind enum.
+    pub term: CovTerm,
+}
+
+/// Stores per-function coverage information attached to a `mir::Body`,
+/// to be used in conjunction with the individual coverage statements injected
+/// into the function's basic blocks.
+#[derive(Clone, Debug)]
+#[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub struct FunctionCoverageInfo {
+    pub function_source_hash: u64,
+    pub num_counters: usize,
+
+    pub expressions: IndexVec<ExpressionId, Expression>,
+    pub mappings: Vec<Mapping>,
 }

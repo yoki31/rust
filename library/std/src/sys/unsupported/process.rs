@@ -27,6 +27,8 @@ pub struct StdioPipes {
     pub stderr: Option<AnonPipe>,
 }
 
+// FIXME: This should be a unit struct, so we can always construct it
+// The value here should be never used, since we cannot spawn processes.
 pub enum Stdio {
     Inherit,
     Null,
@@ -75,6 +77,10 @@ impl Command {
     ) -> io::Result<(Process, StdioPipes)> {
         unsupported()
     }
+
+    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        unsupported()
+    }
 }
 
 impl From<AnonPipe> for Stdio {
@@ -83,8 +89,26 @@ impl From<AnonPipe> for Stdio {
     }
 }
 
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        // FIXME: This is wrong.
+        // Instead, the Stdio we have here should be a unit struct.
+        panic!("unsupported")
+    }
+}
+
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        // FIXME: This is wrong.
+        // Instead, the Stdio we have here should be a unit struct.
+        panic!("unsupported")
+    }
+}
+
 impl From<File> for Stdio {
     fn from(_file: File) -> Stdio {
+        // FIXME: This is wrong.
+        // Instead, the Stdio we have here should be a unit struct.
         panic!("unsupported")
     }
 }
@@ -95,58 +119,59 @@ impl fmt::Debug for Command {
     }
 }
 
-pub struct ExitStatus(!);
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct ExitStatus();
 
 impl ExitStatus {
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        self.0
+        Ok(())
     }
 
     pub fn code(&self) -> Option<i32> {
-        self.0
-    }
-}
-
-impl Clone for ExitStatus {
-    fn clone(&self) -> ExitStatus {
-        self.0
-    }
-}
-
-impl Copy for ExitStatus {}
-
-impl PartialEq for ExitStatus {
-    fn eq(&self, _other: &ExitStatus) -> bool {
-        self.0
-    }
-}
-
-impl Eq for ExitStatus {}
-
-impl fmt::Debug for ExitStatus {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+        Some(0)
     }
 }
 
 impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<dummy exit status>")
+    }
+}
+
+pub struct ExitStatusError(!);
+
+impl Clone for ExitStatusError {
+    fn clone(&self) -> ExitStatusError {
+        self.0
+    }
+}
+
+impl Copy for ExitStatusError {}
+
+impl PartialEq for ExitStatusError {
+    fn eq(&self, _other: &ExitStatusError) -> bool {
+        self.0
+    }
+}
+
+impl Eq for ExitStatusError {}
+
+impl fmt::Debug for ExitStatusError {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub struct ExitStatusError(ExitStatus);
-
 impl Into<ExitStatus> for ExitStatusError {
     fn into(self) -> ExitStatus {
-        self.0.0
+        self.0
     }
 }
 
 impl ExitStatusError {
     pub fn code(self) -> Option<NonZeroI32> {
-        self.0.0
+        self.0
     }
 }
 
@@ -159,6 +184,15 @@ impl ExitCode {
 
     pub fn as_i32(&self) -> i32 {
         self.0 as i32
+    }
+}
+
+impl From<u8> for ExitCode {
+    fn from(code: u8) -> Self {
+        match code {
+            0 => Self::SUCCESS,
+            1..=255 => Self::FAILURE,
+        }
     }
 }
 
@@ -190,6 +224,9 @@ impl<'a> Iterator for CommandArgs<'a> {
     type Item = &'a OsStr;
     fn next(&mut self) -> Option<&'a OsStr> {
         None
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(0))
     }
 }
 

@@ -1,3 +1,5 @@
+mod array_chunks;
+mod by_ref_sized;
 mod chain;
 mod cloned;
 mod copied;
@@ -11,6 +13,7 @@ mod fuse;
 mod inspect;
 mod intersperse;
 mod map;
+mod map_windows;
 mod peekable;
 mod scan;
 mod skip;
@@ -22,7 +25,7 @@ mod zip;
 
 use core::cell::Cell;
 
-/// An iterator that panics whenever `next` or next_back` is called
+/// An iterator that panics whenever `next` or `next_back` is called
 /// after `None` has already been returned. This does not violate
 /// `Iterator`'s contract. Used to test that iterator adapters don't
 /// poll their inner iterators after exhausting them.
@@ -181,5 +184,27 @@ impl Clone for CountClone {
         let n = self.0.get();
         self.0.set(n + 1);
         ret
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CountDrop<'a> {
+    dropped: bool,
+    count: &'a Cell<usize>,
+}
+
+impl<'a> CountDrop<'a> {
+    pub fn new(count: &'a Cell<usize>) -> Self {
+        Self { dropped: false, count }
+    }
+}
+
+impl Drop for CountDrop<'_> {
+    fn drop(&mut self) {
+        if self.dropped {
+            panic!("double drop");
+        }
+        self.dropped = true;
+        self.count.set(self.count.get() + 1);
     }
 }

@@ -32,6 +32,10 @@ pub fn bounds_to_string(bounds: &[ast::GenericBound]) -> String {
     State::new().bounds_to_string(bounds)
 }
 
+pub fn where_bound_predicate_to_string(where_bound_predicate: &ast::WhereBoundPredicate) -> String {
+    State::new().where_bound_predicate_to_string(where_bound_predicate)
+}
+
 pub fn pat_to_string(pat: &ast::Pat) -> String {
     State::new().pat_to_string(pat)
 }
@@ -73,5 +77,14 @@ pub fn attribute_to_string(attr: &ast::Attribute) -> String {
 }
 
 pub fn to_string(f: impl FnOnce(&mut State<'_>)) -> String {
-    State::new().to_string(f)
+    State::to_string(f)
+}
+
+pub fn crate_to_string_for_macros(krate: &ast::Crate) -> String {
+    State::to_string(|s| {
+        s.print_inner_attributes(&krate.attrs);
+        for item in &krate.items {
+            s.print_item(item);
+        }
+    })
 }

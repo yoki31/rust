@@ -1,5 +1,4 @@
-// run-rustfix
-#![allow(dead_code, unused_must_use)]
+#![allow(clippy::needless_if, dead_code, unused_must_use)]
 
 fn main() {}
 
@@ -7,6 +6,10 @@ fn main() {}
 fn starts_with() {
     "".chars().next() == Some(' ');
     Some(' ') != "".chars().next();
+
+    // Ensure that suggestion is escaped correctly
+    "".chars().next() == Some('\n');
+    Some('\n') != "".chars().next();
 }
 
 fn chars_cmp_with_unwrap() {
@@ -31,7 +34,7 @@ fn chars_cmp_with_unwrap() {
         // !s.ends_with('o')
         // Nothing here
     }
-    if s.chars().last().unwrap() != 'o' {
+    if s.chars().last().unwrap() != '\n' {
         // !s.ends_with('o')
         // Nothing here
     }
@@ -43,4 +46,8 @@ fn ends_with() {
     Some(' ') != "".chars().last();
     "".chars().next_back() == Some(' ');
     Some(' ') != "".chars().next_back();
+
+    // Ensure that suggestion is escaped correctly
+    "".chars().last() == Some('\n');
+    Some('\n') != "".chars().last();
 }

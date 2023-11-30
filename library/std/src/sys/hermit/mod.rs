@@ -13,23 +13,21 @@
 //! compiling for wasm. That way it's a compile time error for something that's
 //! guaranteed to be a runtime error!
 
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(missing_docs, nonstandard_style, unsafe_op_in_unsafe_fn)]
 
-use crate::intrinsics;
 use crate::os::raw::c_char;
 
 pub mod alloc;
 pub mod args;
 #[path = "../unix/cmath.rs"]
 pub mod cmath;
-pub mod condvar;
 pub mod env;
 pub mod fd;
 pub mod fs;
+pub mod futex;
 #[path = "../unsupported/io.rs"]
 pub mod io;
 pub mod memchr;
-pub mod mutex;
 pub mod net;
 pub mod os;
 #[path = "../unix/os_str.rs"]
@@ -40,7 +38,6 @@ pub mod path;
 pub mod pipe;
 #[path = "../unsupported/process.rs"]
 pub mod process;
-pub mod rwlock;
 pub mod stdio;
 pub mod thread;
 pub mod thread_local_dtor;
@@ -48,35 +45,28 @@ pub mod thread_local_dtor;
 pub mod thread_local_key;
 pub mod time;
 
-use crate::io::ErrorKind;
+#[path = "../unix/locks"]
+pub mod locks {
+    mod futex_condvar;
+    mod futex_mutex;
+    mod futex_rwlock;
+    pub(crate) use futex_condvar::Condvar;
+    pub(crate) use futex_mutex::Mutex;
+    pub(crate) use futex_rwlock::RwLock;
+}
 
-#[allow(unused_extern_crates)]
-pub extern crate hermit_abi as abi;
+use crate::io::ErrorKind;
+use crate::os::hermit::abi;
 
 pub fn unsupported<T>() -> crate::io::Result<T> {
     Err(unsupported_err())
 }
 
 pub fn unsupported_err() -> crate::io::Error {
-    crate::io::Error::new_const(
+    crate::io::const_io_error!(
         crate::io::ErrorKind::Unsupported,
-        &"operation not supported on HermitCore yet",
+        "operation not supported on HermitCore yet",
     )
-}
-
-pub unsafe fn strlen(start: *const c_char) -> usize {
-    let mut str = start;
-
-    while *str != 0 {
-        str = str.offset(1);
-    }
-
-    (str as usize) - (start as usize)
-}
-
-#[no_mangle]
-pub extern "C" fn floor(x: f64) -> f64 {
-    unsafe { intrinsics::floorf64(x) }
 }
 
 pub fn abort_internal() -> ! {
@@ -85,9 +75,18 @@ pub fn abort_internal() -> ! {
     }
 }
 
-// FIXME: just a workaround to test the system
 pub fn hashmap_random_keys() -> (u64, u64) {
-    (1, 2)
+    let mut buf = [0; 16];
+    let mut slice = &mut buf[..];
+    while !slice.is_empty() {
+        let res = cvt(unsafe { abi::read_entropy(slice.as_mut_ptr(), slice.len(), 0) })
+            .expect("failed to generate random hashmap keys");
+        slice = &mut slice[res as usize..];
+    }
+
+    let key1 = buf[..8].try_into().unwrap();
+    let key2 = buf[8..].try_into().unwrap();
+    (u64::from_ne_bytes(key1), u64::from_ne_bytes(key2))
 }
 
 // This function is needed by the panic runtime. The symbol is named in
@@ -101,16 +100,13 @@ pub extern "C" fn __rust_abort() {
 
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
-pub unsafe fn init(argc: isize, argv: *const *const u8) {
-    let _ = net::init();
+pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
     args::init(argc, argv);
 }
 
 // SAFETY: must be called only once during runtime cleanup.
 // NOTE: this is not guaranteed to run, for example when the program aborts.
-pub unsafe fn cleanup() {
-    args::cleanup();
-}
+pub unsafe fn cleanup() {}
 
 #[cfg(not(test))]
 #[no_mangle]
@@ -133,27 +129,79 @@ pub unsafe extern "C" fn runtime_entry(
     abi::exit(result);
 }
 
+#[inline]
+pub(crate) fn is_interrupted(errno: i32) -> bool {
+    errno == abi::errno::EINTR
+}
+
 pub fn decode_error_kind(errno: i32) -> ErrorKind {
     match errno {
-        x if x == 13 as i32 => ErrorKind::PermissionDenied,
-        x if x == 98 as i32 => ErrorKind::AddrInUse,
-        x if x == 99 as i32 => ErrorKind::AddrNotAvailable,
-        x if x == 11 as i32 => ErrorKind::WouldBlock,
-        x if x == 103 as i32 => ErrorKind::ConnectionAborted,
-        x if x == 111 as i32 => ErrorKind::ConnectionRefused,
-        x if x == 104 as i32 => ErrorKind::ConnectionReset,
-        x if x == 17 as i32 => ErrorKind::AlreadyExists,
-        x if x == 4 as i32 => ErrorKind::Interrupted,
-        x if x == 22 as i32 => ErrorKind::InvalidInput,
-        x if x == 2 as i32 => ErrorKind::NotFound,
-        x if x == 107 as i32 => ErrorKind::NotConnected,
-        x if x == 1 as i32 => ErrorKind::PermissionDenied,
-        x if x == 32 as i32 => ErrorKind::BrokenPipe,
-        x if x == 110 as i32 => ErrorKind::TimedOut,
+        abi::errno::EACCES => ErrorKind::PermissionDenied,
+        abi::errno::EADDRINUSE => ErrorKind::AddrInUse,
+        abi::errno::EADDRNOTAVAIL => ErrorKind::AddrNotAvailable,
+        abi::errno::EAGAIN => ErrorKind::WouldBlock,
+        abi::errno::ECONNABORTED => ErrorKind::ConnectionAborted,
+        abi::errno::ECONNREFUSED => ErrorKind::ConnectionRefused,
+        abi::errno::ECONNRESET => ErrorKind::ConnectionReset,
+        abi::errno::EEXIST => ErrorKind::AlreadyExists,
+        abi::errno::EINTR => ErrorKind::Interrupted,
+        abi::errno::EINVAL => ErrorKind::InvalidInput,
+        abi::errno::ENOENT => ErrorKind::NotFound,
+        abi::errno::ENOTCONN => ErrorKind::NotConnected,
+        abi::errno::EPERM => ErrorKind::PermissionDenied,
+        abi::errno::EPIPE => ErrorKind::BrokenPipe,
+        abi::errno::ETIMEDOUT => ErrorKind::TimedOut,
         _ => ErrorKind::Uncategorized,
     }
 }
 
-pub fn cvt(result: i32) -> crate::io::Result<usize> {
-    if result < 0 { Err(crate::io::Error::from_raw_os_error(-result)) } else { Ok(result as usize) }
+#[doc(hidden)]
+pub trait IsNegative {
+    fn is_negative(&self) -> bool;
+    fn negate(&self) -> i32;
+}
+
+macro_rules! impl_is_negative {
+    ($($t:ident)*) => ($(impl IsNegative for $t {
+        fn is_negative(&self) -> bool {
+            *self < 0
+        }
+
+        fn negate(&self) -> i32 {
+            i32::try_from(-(*self)).unwrap()
+        }
+    })*)
+}
+
+impl IsNegative for i32 {
+    fn is_negative(&self) -> bool {
+        *self < 0
+    }
+
+    fn negate(&self) -> i32 {
+        -(*self)
+    }
+}
+impl_is_negative! { i8 i16 i64 isize }
+
+pub fn cvt<T: IsNegative>(t: T) -> crate::io::Result<T> {
+    if t.is_negative() {
+        let e = decode_error_kind(t.negate());
+        Err(crate::io::Error::from(e))
+    } else {
+        Ok(t)
+    }
+}
+
+pub fn cvt_r<T, F>(mut f: F) -> crate::io::Result<T>
+where
+    T: IsNegative,
+    F: FnMut() -> T,
+{
+    loop {
+        match cvt(f()) {
+            Err(ref e) if e.is_interrupted() => {}
+            other => return other,
+        }
+    }
 }

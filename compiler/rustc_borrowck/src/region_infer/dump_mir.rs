@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 //! As part of generating the regions, if you enable `-Zdump-mir=nll`,
 //! we will generate an annotated copy of the MIR that includes the
 //! state of region inference. This code handles emitting the region
@@ -50,7 +52,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
 
         writeln!(out, "|")?;
         writeln!(out, "| Inference Constraints")?;
-        self.for_each_constraint(tcx, &mut |msg| writeln!(out, "| {}", msg))?;
+        self.for_each_constraint(tcx, &mut |msg| writeln!(out, "| {msg}"))?;
 
         Ok(())
     }
@@ -65,23 +67,23 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         with_msg: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> io::Result<()> {
         for region in self.definitions.indices() {
-            let value = self.liveness_constraints.region_value_str(region);
+            let value = self.liveness_constraints.pretty_print_live_points(region);
             if value != "{}" {
-                with_msg(&format!("{:?} live at {}", region, value))?;
+                with_msg(&format!("{region:?} live at {value}"))?;
             }
         }
 
         let mut constraints: Vec<_> = self.constraints.outlives().iter().collect();
-        constraints.sort();
+        constraints.sort_by_key(|c| (c.sup, c.sub));
         for constraint in &constraints {
-            let OutlivesConstraint { sup, sub, locations, category, variance_info: _ } = constraint;
+            let OutlivesConstraint { sup, sub, locations, category, span, .. } = constraint;
             let (name, arg) = match locations {
                 Locations::All(span) => {
                     ("All", tcx.sess.source_map().span_to_embeddable_string(*span))
                 }
-                Locations::Single(loc) => ("Single", format!("{:?}", loc)),
+                Locations::Single(loc) => ("Single", format!("{loc:?}")),
             };
-            with_msg(&format!("{:?}: {:?} due to {:?} at {}({})", sup, sub, category, name, arg))?;
+            with_msg(&format!("{sup:?}: {sub:?} due to {category:?} at {name}({arg}) ({span:?}"))?;
         }
 
         Ok(())

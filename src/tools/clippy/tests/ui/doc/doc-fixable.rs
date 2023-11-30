@@ -1,4 +1,4 @@
-// run-rustfix
+
 //! This file tests for the `DOC_MARKDOWN` lint.
 
 #![allow(dead_code, incomplete_features)]
@@ -60,6 +60,7 @@ fn test_units() {
 /// GitHub GitLab
 /// IPv4 IPv6
 /// ClojureScript CoffeeScript JavaScript PureScript TypeScript
+/// WebAssembly
 /// NaN NaNs
 /// OAuth GraphQL
 /// OCaml
@@ -75,10 +76,10 @@ fn test_units() {
 fn test_allowed() {
 }
 
-/// This test has [a link_with_underscores][chunked-example] inside it. See #823.
+/// This test has [a `link_with_underscores`][chunked-example] inside it. See #823.
 /// See also [the issue tracker](https://github.com/rust-lang/rust-clippy/search?q=clippy::doc_markdown&type=Issues)
 /// on GitHub (which is a camel-cased word, but is OK). And here is another [inline link][inline_link].
-/// It can also be [inline_link2].
+/// It can also be [inline_link2]. A link to [StackOverflow](https://stackoverflow.com) is also acceptable.
 ///
 /// [chunked-example]: https://en.wikipedia.org/wiki/Chunked_transfer_encoding#Example
 /// [inline_link]: https://foobar
@@ -197,6 +198,16 @@ fn pulldown_cmark_crash() {}
 /// [plain text][path::to::item]
 fn intra_doc_link() {}
 
+/// Ignore escaped\_underscores
+///
+/// \\[
+///     \\prod\_{x\\in X} p\_x
+/// \\]
+fn issue_2581() {}
+
+/// Foo \[bar\] \[baz\] \[qux\]. DocMarkdownLint
+fn lint_after_escaped_chars() {}
+
 // issue #7033 - generic_const_exprs ICE
 struct S<T, const N: usize>
 where [(); N.checked_next_power_of_two().unwrap()]: {
@@ -213,3 +224,6 @@ where [(); N.checked_next_power_of_two().unwrap()]: {
         }
     }
 }
+
+/// this checks if the lowerCamelCase issue is fixed
+fn issue_11568() {}

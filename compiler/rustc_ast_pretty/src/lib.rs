@@ -1,5 +1,8 @@
-#![feature(bool_to_option)]
-#![feature(crate_visibility_modifier)]
+#![allow(internal_features)]
+#![feature(rustdoc_internals)]
+#![doc(rust_logo)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(box_patterns)]
 #![recursion_limit = "256"]
 

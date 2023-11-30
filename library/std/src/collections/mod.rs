@@ -172,7 +172,8 @@
 //!
 //! ## Iterators
 //!
-//! Iterators are a powerful and robust mechanism used throughout Rust's
+//! [Iterators][crate::iter]
+//! are a powerful and robust mechanism used throughout Rust's
 //! standard libraries. Iterators provide a sequence of values in a generic,
 //! safe, efficient and convenient way. The contents of an iterator are usually
 //! *lazily* evaluated, so that only the values that are actually needed are
@@ -199,7 +200,7 @@
 //! ```
 //! let vec = vec![1, 2, 3, 4];
 //! for x in vec.iter() {
-//!    println!("vec contained {}", x);
+//!    println!("vec contained {x:?}");
 //! }
 //! ```
 //!
@@ -232,7 +233,7 @@
 //! ```
 //! use std::collections::VecDeque;
 //!
-//! let vec = vec![1, 2, 3, 4];
+//! let vec = [1, 2, 3, 4];
 //! let buf: VecDeque<_> = vec.into_iter().collect();
 //! ```
 //!
@@ -246,13 +247,15 @@
 //! ```
 //! let vec = vec![1, 2, 3, 4];
 //! for x in vec.iter().rev() {
-//!    println!("vec contained {}", x);
+//!    println!("vec contained {x:?}");
 //! }
 //! ```
 //!
 //! Several other collection methods also return iterators to yield a sequence
 //! of results but avoid allocating an entire collection to store the result in.
-//! This provides maximum flexibility as `collect` or `extend` can be called to
+//! This provides maximum flexibility as
+//! [`collect`][crate::iter::Iterator::collect] or
+//! [`extend`][crate::iter::Extend::extend] can be called to
 //! "pipe" the sequence into any collection if desired. Otherwise, the sequence
 //! can be looped over with a `for` loop. The iterator can also be discarded
 //! after partial use, preventing the computation of the unused items.
@@ -306,7 +309,7 @@
 //!
 //! println!("Number of occurrences of each character");
 //! for (char, count) in &count {
-//!     println!("{}: {}", char, count);
+//!     println!("{char}: {count}");
 //! }
 //! ```
 //!
@@ -339,7 +342,7 @@
 //!     // Check if they're sober enough to have another beer.
 //!     if person.blood_alcohol > 0.3 {
 //!         // Too drunk... for now.
-//!         println!("Sorry {}, I have to cut you off", id);
+//!         println!("Sorry {id}, I have to cut you off");
 //!     } else {
 //!         // Have another!
 //!         person.blood_alcohol += 0.1;
@@ -395,14 +398,12 @@
 //! // ...but the key hasn't changed. b is still "baz", not "xyz".
 //! assert_eq!(map.keys().next().unwrap().b, "baz");
 //! ```
-//!
-//! [IntoIterator]: crate::iter::IntoIterator "iter::IntoIterator"
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
 #[stable(feature = "rust1", since = "1.0.0")]
 // FIXME(#82080) The deprecation here is only theoretical, and does not actually produce a warning.
-#[rustc_deprecated(reason = "moved to `std::ops::Bound`", since = "1.26.0")]
+#[deprecated(note = "moved to `std::ops::Bound`", since = "1.26.0")]
 #[doc(hidden)]
 pub use crate::ops::Bound;
 
@@ -416,8 +417,10 @@ pub use alloc_crate::collections::{BTreeMap, BTreeSet, BinaryHeap};
 pub use alloc_crate::collections::{LinkedList, VecDeque};
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[doc(inline)]
 pub use self::hash_map::HashMap;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[doc(inline)]
 pub use self::hash_set::HashSet;
 
 #[stable(feature = "try_reserve", since = "1.57.0")]
@@ -436,6 +439,11 @@ pub mod hash_map {
     //! A hash map implemented with quadratic probing and SIMD lookup.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::hash::map::*;
+
+    #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
+    pub use crate::hash::random::DefaultHasher;
+    #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
+    pub use crate::hash::random::RandomState;
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]

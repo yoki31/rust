@@ -6,15 +6,45 @@ use crate::iter;
 use crate::mem;
 use crate::ops;
 
-#[lang = "slice_u8"]
 #[cfg(not(test))]
 impl [u8] {
     /// Checks if all bytes in this slice are within the ASCII range.
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_stable(feature = "const_slice_is_ascii", since = "1.74.0")]
     #[must_use]
     #[inline]
-    pub fn is_ascii(&self) -> bool {
+    pub const fn is_ascii(&self) -> bool {
         is_ascii(self)
+    }
+
+    /// If this slice [`is_ascii`](Self::is_ascii), returns it as a slice of
+    /// [ASCII characters](`ascii::Char`), otherwise returns `None`.
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[must_use]
+    #[inline]
+    pub const fn as_ascii(&self) -> Option<&[ascii::Char]> {
+        if self.is_ascii() {
+            // SAFETY: Just checked that it's ASCII
+            Some(unsafe { self.as_ascii_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    /// Converts this slice of bytes into a slice of ASCII characters,
+    /// without checking whether they're valid.
+    ///
+    /// # Safety
+    ///
+    /// Every byte in the slice must be in `0..=127`, or else this is UB.
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[must_use]
+    #[inline]
+    pub const unsafe fn as_ascii_unchecked(&self) -> &[ascii::Char] {
+        let byte_ptr: *const [u8] = self;
+        let ascii_ptr = byte_ptr as *const [ascii::Char];
+        // SAFETY: The caller promised all the bytes are ASCII
+        unsafe { &*ascii_ptr }
     }
 
     /// Checks that two slices are an ASCII case-insensitive match.
@@ -68,7 +98,6 @@ impl [u8] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(inherent_ascii_escape)]
     ///
     /// let s = b"0\t\r\n'\"\\\x9d";
     /// let escaped = s.escape_ascii().to_string();
@@ -76,9 +105,87 @@ impl [u8] {
     /// ```
     #[must_use = "this returns the escaped bytes as an iterator, \
                   without modifying the original"]
-    #[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+    #[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
     pub fn escape_ascii(&self) -> EscapeAscii<'_> {
         EscapeAscii { inner: self.iter().flat_map(EscapeByte) }
+    }
+
+    /// Returns a byte slice with leading ASCII whitespace bytes removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// `u8::is_ascii_whitespace`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(byte_slice_trim_ascii)]
+    ///
+    /// assert_eq!(b" \t hello world\n".trim_ascii_start(), b"hello world\n");
+    /// assert_eq!(b"  ".trim_ascii_start(), b"");
+    /// assert_eq!(b"".trim_ascii_start(), b"");
+    /// ```
+    #[unstable(feature = "byte_slice_trim_ascii", issue = "94035")]
+    pub const fn trim_ascii_start(&self) -> &[u8] {
+        let mut bytes = self;
+        // Note: A pattern matching based approach (instead of indexing) allows
+        // making the function const.
+        while let [first, rest @ ..] = bytes {
+            if first.is_ascii_whitespace() {
+                bytes = rest;
+            } else {
+                break;
+            }
+        }
+        bytes
+    }
+
+    /// Returns a byte slice with trailing ASCII whitespace bytes removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// `u8::is_ascii_whitespace`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(byte_slice_trim_ascii)]
+    ///
+    /// assert_eq!(b"\r hello world\n ".trim_ascii_end(), b"\r hello world");
+    /// assert_eq!(b"  ".trim_ascii_end(), b"");
+    /// assert_eq!(b"".trim_ascii_end(), b"");
+    /// ```
+    #[unstable(feature = "byte_slice_trim_ascii", issue = "94035")]
+    pub const fn trim_ascii_end(&self) -> &[u8] {
+        let mut bytes = self;
+        // Note: A pattern matching based approach (instead of indexing) allows
+        // making the function const.
+        while let [rest @ .., last] = bytes {
+            if last.is_ascii_whitespace() {
+                bytes = rest;
+            } else {
+                break;
+            }
+        }
+        bytes
+    }
+
+    /// Returns a byte slice with leading and trailing ASCII whitespace bytes
+    /// removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// `u8::is_ascii_whitespace`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(byte_slice_trim_ascii)]
+    ///
+    /// assert_eq!(b"\r hello world\n ".trim_ascii(), b"hello world");
+    /// assert_eq!(b"  ".trim_ascii(), b"");
+    /// assert_eq!(b"".trim_ascii(), b"");
+    /// ```
+    #[unstable(feature = "byte_slice_trim_ascii", issue = "94035")]
+    pub const fn trim_ascii(&self) -> &[u8] {
+        self.trim_ascii_start().trim_ascii_end()
     }
 }
 
@@ -93,13 +200,14 @@ impl_fn_for_zst! {
 ///
 /// This `struct` is created by the [`slice::escape_ascii`] method. See its
 /// documentation for more information.
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 #[derive(Clone)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct EscapeAscii<'a> {
     inner: iter::FlatMap<super::Iter<'a, u8>, ascii::EscapeDefault, EscapeByte>,
 }
 
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 impl<'a> iter::Iterator for EscapeAscii<'a> {
     type Item = u8;
     #[inline]
@@ -131,23 +239,21 @@ impl<'a> iter::Iterator for EscapeAscii<'a> {
     }
 }
 
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 impl<'a> iter::DoubleEndedIterator for EscapeAscii<'a> {
     fn next_back(&mut self) -> Option<u8> {
         self.inner.next_back()
     }
 }
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
-impl<'a> iter::ExactSizeIterator for EscapeAscii<'a> {}
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 impl<'a> iter::FusedIterator for EscapeAscii<'a> {}
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 impl<'a> fmt::Display for EscapeAscii<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.clone().try_for_each(|b| f.write_char(b as char))
     }
 }
-#[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+#[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 impl<'a> fmt::Debug for EscapeAscii<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EscapeAscii").finish_non_exhaustive()
@@ -157,9 +263,27 @@ impl<'a> fmt::Debug for EscapeAscii<'a> {
 /// Returns `true` if any byte in the word `v` is nonascii (>= 128). Snarfed
 /// from `../str/mod.rs`, which does something similar for utf8 validation.
 #[inline]
-fn contains_nonascii(v: usize) -> bool {
-    const NONASCII_MASK: usize = 0x80808080_80808080u64 as usize;
+const fn contains_nonascii(v: usize) -> bool {
+    const NONASCII_MASK: usize = usize::repeat_u8(0x80);
     (NONASCII_MASK & v) != 0
+}
+
+/// ASCII test *without* the chunk-at-a-time optimizations.
+///
+/// This is carefully structured to produce nice small code -- it's smaller in
+/// `-O` than what the "obvious" ways produces under `-C opt-level=s`.  If you
+/// touch it, be sure to run (and update if needed) the assembly test.
+#[unstable(feature = "str_internals", issue = "none")]
+#[doc(hidden)]
+#[inline]
+pub const fn is_ascii_simple(mut bytes: &[u8]) -> bool {
+    while let [rest @ .., last] = bytes {
+        if !last.is_ascii() {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes.is_empty()
 }
 
 /// Optimized ASCII test that will use usize-at-a-time operations instead of
@@ -175,7 +299,7 @@ fn contains_nonascii(v: usize) -> bool {
 /// If any of these loads produces something for which `contains_nonascii`
 /// (above) returns true, then we know the answer is false.
 #[inline]
-fn is_ascii(s: &[u8]) -> bool {
+const fn is_ascii(s: &[u8]) -> bool {
     const USIZE_SIZE: usize = mem::size_of::<usize>();
 
     let len = s.len();
@@ -187,7 +311,7 @@ fn is_ascii(s: &[u8]) -> bool {
     // We also do this for architectures where `size_of::<usize>()` isn't
     // sufficient alignment for `usize`, because it's a weird edge case.
     if len < USIZE_SIZE || len < align_offset || USIZE_SIZE < mem::align_of::<usize>() {
-        return s.iter().all(|b| b.is_ascii());
+        return is_ascii_simple(s);
     }
 
     // We always read the first word unaligned, which means `align_offset` is
@@ -216,18 +340,26 @@ fn is_ascii(s: &[u8]) -> bool {
     // Paranoia check about alignment, since we're about to do a bunch of
     // unaligned loads. In practice this should be impossible barring a bug in
     // `align_offset` though.
-    debug_assert_eq!((word_ptr as usize) % mem::align_of::<usize>(), 0);
+    // While this method is allowed to spuriously fail in CTFE, if it doesn't
+    // have alignment information it should have given a `usize::MAX` for
+    // `align_offset` earlier, sending things through the scalar path instead of
+    // this one, so this check should pass if it's reachable.
+    debug_assert!(word_ptr.is_aligned_to(mem::align_of::<usize>()));
 
     // Read subsequent words until the last aligned word, excluding the last
     // aligned word by itself to be done in tail check later, to ensure that
     // tail is always one `usize` at most to extra branch `byte_pos == len`.
     while byte_pos < len - USIZE_SIZE {
-        debug_assert!(
-            // Sanity check that the read is in bounds
-            (word_ptr as usize + USIZE_SIZE) <= (start.wrapping_add(len) as usize) &&
-            // And that our assumptions about `byte_pos` hold.
-            (word_ptr as usize) - (start as usize) == byte_pos
-        );
+        // Sanity check that the read is in bounds
+        debug_assert!(byte_pos + USIZE_SIZE <= len);
+        // And that our assumptions about `byte_pos` hold.
+        debug_assert!(matches!(
+            word_ptr.cast::<u8>().guaranteed_eq(start.wrapping_add(byte_pos)),
+            // These are from the same allocation, so will hopefully always be
+            // known to match even in CTFE, but if it refuses to compare them
+            // that's ok since it's just a debug check anyway.
+            None | Some(true),
+        ));
 
         // SAFETY: We know `word_ptr` is properly aligned (because of
         // `align_offset`), and we know that we have enough bytes between `word_ptr` and the end

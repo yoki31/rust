@@ -1,7 +1,8 @@
 // These functions are used by macro expansion for bug! and span_bug!
 
 use crate::ty::{tls, TyCtxt};
-use rustc_span::{MultiSpan, Span};
+use rustc_errors::MultiSpan;
+use rustc_span::Span;
 use std::fmt;
 use std::panic::{panic_any, Location};
 
@@ -28,14 +29,13 @@ fn opt_span_bug_fmt<S: Into<MultiSpan>>(
     location: &Location<'_>,
 ) -> ! {
     tls::with_opt(move |tcx| {
-        let msg = format!("{}: {}", location, args);
+        let msg = format!("{location}: {args}");
         match (tcx, span) {
-            (Some(tcx), Some(span)) => tcx.sess.diagnostic().span_bug(span, &msg),
-            (Some(tcx), None) => tcx.sess.diagnostic().bug(&msg),
+            (Some(tcx), Some(span)) => tcx.sess.diagnostic().span_bug(span, msg),
+            (Some(tcx), None) => tcx.sess.diagnostic().bug(msg),
             (None, _) => panic_any(msg),
         }
-    });
-    unreachable!();
+    })
 }
 
 /// A query to trigger a `delay_span_bug`. Clearly, if one has a `tcx` one can already trigger a
@@ -48,6 +48,6 @@ pub fn trigger_delay_span_bug(tcx: TyCtxt<'_>, key: rustc_hir::def_id::DefId) {
     );
 }
 
-pub fn provide(providers: &mut crate::ty::query::Providers) {
-    *providers = crate::ty::query::Providers { trigger_delay_span_bug, ..*providers };
+pub fn provide(providers: &mut crate::query::Providers) {
+    *providers = crate::query::Providers { trigger_delay_span_bug, ..*providers };
 }

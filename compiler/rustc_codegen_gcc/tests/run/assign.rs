@@ -5,8 +5,8 @@
 //     7 8
 //     10
 
-#![allow(unused_attributes)]
-#![feature(auto_traits, lang_items, no_core, start, intrinsics, track_caller)]
+#![allow(internal_features, unused_attributes)]
+#![feature(auto_traits, lang_items, no_core, start, intrinsics, rustc_attrs, track_caller)]
 
 #![no_std]
 #![no_core]
@@ -51,12 +51,13 @@ mod libc {
         pub fn fflush(stream: *mut i32) -> i32;
         pub fn printf(format: *const i8, ...) -> i32;
 
-        pub static STDOUT: *mut i32;
+        pub static stdout: *mut i32;
     }
 }
 
 mod intrinsics {
     extern "rust-intrinsic" {
+        #[rustc_safe_intrinsic]
         pub fn abort() -> !;
     }
 }
@@ -64,10 +65,10 @@ mod intrinsics {
 #[lang = "panic"]
 #[track_caller]
 #[no_mangle]
-pub fn panic(_msg: &str) -> ! {
+pub fn panic(_msg: &'static str) -> ! {
     unsafe {
         libc::puts("Panicking\0" as *const str as *const u8);
-        libc::fflush(libc::STDOUT);
+        libc::fflush(libc::stdout);
         intrinsics::abort();
     }
 }

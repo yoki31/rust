@@ -9,7 +9,8 @@
 //      12
 //      1
 
-#![feature(auto_traits, lang_items, no_core, start, intrinsics)]
+#![feature(auto_traits, lang_items, no_core, start, intrinsics, rustc_attrs)]
+#![allow(internal_features)]
 
 #![no_std]
 #![no_core]
@@ -21,6 +22,12 @@
 // Because we don't have core yet.
 #[lang = "sized"]
 pub trait Sized {}
+
+#[lang = "destruct"]
+pub trait Destruct {}
+
+#[lang = "drop"]
+pub trait Drop {}
 
 #[lang = "copy"]
 trait Copy {
@@ -39,6 +46,7 @@ mod intrinsics {
     use super::Sized;
 
     extern "rust-intrinsic" {
+        #[rustc_safe_intrinsic]
         pub fn abort() -> !;
     }
 }

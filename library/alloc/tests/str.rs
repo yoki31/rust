@@ -1,3 +1,5 @@
+#![allow(invalid_from_utf8)]
+
 use std::assert_matches::assert_matches;
 use std::borrow::Cow;
 use std::cmp::Ordering::{Equal, Greater, Less};
@@ -162,7 +164,7 @@ fn test_join_for_different_lengths_with_long_separator() {
 }
 
 #[test]
-fn test_join_isue_80335() {
+fn test_join_issue_80335() {
     use core::{borrow::Borrow, cell::Cell};
 
     struct WeirdBorrow {
@@ -1010,11 +1012,11 @@ fn test_as_bytes_fail() {
 fn test_as_ptr() {
     let buf = "hello".as_ptr();
     unsafe {
-        assert_eq!(*buf.offset(0), b'h');
-        assert_eq!(*buf.offset(1), b'e');
-        assert_eq!(*buf.offset(2), b'l');
-        assert_eq!(*buf.offset(3), b'l');
-        assert_eq!(*buf.offset(4), b'o');
+        assert_eq!(*buf.add(0), b'h');
+        assert_eq!(*buf.add(1), b'e');
+        assert_eq!(*buf.add(2), b'l');
+        assert_eq!(*buf.add(3), b'l');
+        assert_eq!(*buf.add(4), b'o');
     }
 }
 
@@ -1116,7 +1118,7 @@ fn test_escape_debug() {
     assert_eq!("abc".escape_debug().to_string(), "abc");
     assert_eq!("a c".escape_debug().to_string(), "a c");
     assert_eq!("éèê".escape_debug().to_string(), "éèê");
-    assert_eq!("\r\n\t".escape_debug().to_string(), "\\r\\n\\t");
+    assert_eq!("\0\r\n\t".escape_debug().to_string(), "\\0\\r\\n\\t");
     assert_eq!("'\"\\".escape_debug().to_string(), "\\'\\\"\\\\");
     assert_eq!("\u{7f}\u{ff}".escape_debug().to_string(), "\\u{7f}\u{ff}");
     assert_eq!("\u{100}\u{ffff}".escape_debug().to_string(), "\u{100}\\u{ffff}");
@@ -1169,12 +1171,54 @@ fn test_iterator() {
 }
 
 #[test]
+fn test_iterator_advance() {
+    let s = "「赤錆」と呼ばれる鉄錆は、水の存在下での鉄の自然酸化によって生じる、オキシ水酸化鉄(III) 等の（含水）酸化物粒子の疎な凝集膜であるとみなせる。";
+    let chars: Vec<char> = s.chars().collect();
+    let mut it = s.chars();
+    it.advance_by(1).unwrap();
+    assert_eq!(it.next(), Some(chars[1]));
+    it.advance_by(33).unwrap();
+    assert_eq!(it.next(), Some(chars[35]));
+}
+
+#[test]
 fn test_rev_iterator() {
     let s = "ศไทย中华Việt Nam";
     let v = ['m', 'a', 'N', ' ', 't', 'ệ', 'i', 'V', '华', '中', 'ย', 'ท', 'ไ', 'ศ'];
 
     let mut pos = 0;
     let it = s.chars().rev();
+
+    for c in it {
+        assert_eq!(c, v[pos]);
+        pos += 1;
+    }
+    assert_eq!(pos, v.len());
+}
+
+#[test]
+fn test_to_lowercase_rev_iterator() {
+    let s = "AÖßÜ💩ΣΤΙΓΜΑΣǅﬁİ";
+    let v = ['\u{307}', 'i', 'ﬁ', 'ǆ', 'σ', 'α', 'μ', 'γ', 'ι', 'τ', 'σ', '💩', 'ü', 'ß', 'ö', 'a'];
+
+    let mut pos = 0;
+    let it = s.chars().flat_map(|c| c.to_lowercase()).rev();
+
+    for c in it {
+        assert_eq!(c, v[pos]);
+        pos += 1;
+    }
+    assert_eq!(pos, v.len());
+}
+
+#[test]
+fn test_to_uppercase_rev_iterator() {
+    let s = "aößü💩στιγμαςǅﬁᾀ";
+    let v =
+        ['Ι', 'Ἀ', 'I', 'F', 'Ǆ', 'Σ', 'Α', 'Μ', 'Γ', 'Ι', 'Τ', 'Σ', '💩', 'Ü', 'S', 'S', 'Ö', 'A'];
+
+    let mut pos = 0;
+    let it = s.chars().flat_map(|c| c.to_uppercase()).rev();
 
     for c in it {
         assert_eq!(c, v[pos]);
@@ -1228,7 +1272,7 @@ fn test_chars_debug() {
     let s = "ศไทย中华Việt Nam";
     let c = s.chars();
     assert_eq!(
-        format!("{:?}", c),
+        format!("{c:?}"),
         r#"Chars(['ศ', 'ไ', 'ท', 'ย', '中', '华', 'V', 'i', 'ệ', 't', ' ', 'N', 'a', 'm'])"#
     );
 }
@@ -1468,13 +1512,25 @@ fn test_split_whitespace() {
 
 #[test]
 fn test_lines() {
-    let data = "\nMäry häd ä little lämb\n\r\nLittle lämb\n";
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
-
-    let data = "\r\nMäry häd ä little lämb\n\nLittle lämb"; // no trailing \n
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
+    fn t(data: &str, expected: &[&str]) {
+        let lines: Vec<&str> = data.lines().collect();
+        assert_eq!(lines, expected);
+    }
+    t("", &[]);
+    t("\n", &[""]);
+    t("\n2nd", &["", "2nd"]);
+    t("\r\n", &[""]);
+    t("bare\r", &["bare\r"]);
+    t("bare\rcr", &["bare\rcr"]);
+    t("Text\n\r", &["Text", "\r"]);
+    t(
+        "\nMäry häd ä little lämb\n\r\nLittle lämb\n",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
+    t(
+        "\r\nMäry häd ä little lämb\n\nLittle lämb",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
 }
 
 #[test]
@@ -1559,11 +1615,27 @@ fn test_bool_from_str() {
     assert_eq!("not even a boolean".parse::<bool>().ok(), None);
 }
 
-fn check_contains_all_substrings(s: &str) {
-    assert!(s.contains(""));
-    for i in 0..s.len() {
-        for j in i + 1..=s.len() {
-            assert!(s.contains(&s[i..j]));
+fn check_contains_all_substrings(haystack: &str) {
+    let mut modified_needle = String::new();
+
+    for i in 0..haystack.len() {
+        // check different haystack lengths since we special-case short haystacks.
+        let haystack = &haystack[0..i];
+        assert!(haystack.contains(""));
+        for j in 0..haystack.len() {
+            for k in j + 1..=haystack.len() {
+                let needle = &haystack[j..k];
+                assert!(haystack.contains(needle));
+                modified_needle.clear();
+                modified_needle.push_str(needle);
+                modified_needle.replace_range(0..1, "\0");
+                assert!(!haystack.contains(&modified_needle));
+
+                modified_needle.clear();
+                modified_needle.push_str(needle);
+                modified_needle.replace_range(needle.len() - 1..needle.len(), "\0");
+                assert!(!haystack.contains(&modified_needle));
+            }
         }
     }
 }
@@ -1582,6 +1654,18 @@ fn strslice_issue_16589() {
 fn strslice_issue_16878() {
     assert!(!"1234567ah012345678901ah".contains("hah"));
     assert!(!"00abc01234567890123456789abc".contains("bcabc"));
+}
+
+#[test]
+fn strslice_issue_104726() {
+    // Edge-case in the simd_contains impl.
+    // The first and last byte are the same so it backtracks by one byte
+    // which aligns with the end of the string. Previously incorrect offset calculations
+    // lead to out-of-bounds slicing.
+    #[rustfmt::skip]
+    let needle =                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaba";
+    let haystack = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+    assert!(!haystack.contains(needle));
 }
 
 #[test]
@@ -1666,6 +1750,28 @@ fn test_utf16_code_units() {
 }
 
 #[test]
+fn test_utf16_size_hint() {
+    assert_eq!("".encode_utf16().size_hint(), (0, Some(0)));
+    assert_eq!("123".encode_utf16().size_hint(), (1, Some(3)));
+    assert_eq!("1234".encode_utf16().size_hint(), (2, Some(4)));
+    assert_eq!("12345678".encode_utf16().size_hint(), (3, Some(8)));
+
+    fn hint_vec(src: &str) -> Vec<(usize, Option<usize>)> {
+        let mut it = src.encode_utf16();
+        let mut result = Vec::new();
+        result.push(it.size_hint());
+        while it.next().is_some() {
+            result.push(it.size_hint())
+        }
+        result
+    }
+
+    assert_eq!(hint_vec("12"), [(1, Some(2)), (1, Some(1)), (0, Some(0))]);
+    assert_eq!(hint_vec("\u{101234}"), [(2, Some(4)), (1, Some(1)), (0, Some(0))]);
+    assert_eq!(hint_vec("\u{101234}a"), [(2, Some(5)), (2, Some(2)), (1, Some(1)), (0, Some(0))]);
+}
+
+#[test]
 fn starts_with_in_unicode() {
     assert!(!"├── Cargo.toml".starts_with("# "));
 }
@@ -1741,6 +1847,20 @@ fn to_lowercase() {
     assert_eq!("ΑΣΑ".to_lowercase(), "ασα");
     assert_eq!("ΑΣ'Α".to_lowercase(), "ασ'α");
     assert_eq!("ΑΣ''Α".to_lowercase(), "ασ''α");
+
+    // a really long string that has it's lowercase form
+    // even longer. this tests that implementations don't assume
+    // an incorrect upper bound on allocations
+    let upper = str::repeat("İ", 512);
+    let lower = str::repeat("i̇", 512);
+    assert_eq!(upper.to_lowercase(), lower);
+
+    // a really long ascii-only string.
+    // This test that the ascii hot-path
+    // functions correctly
+    let upper = str::repeat("A", 511);
+    let lower = str::repeat("a", 511);
+    assert_eq!(upper.to_lowercase(), lower);
 }
 
 #[test]
@@ -1839,7 +1959,7 @@ mod pattern {
         }
 
         if let Some(err) = err {
-            panic!("Input skipped range at {}", err);
+            panic!("Input skipped range at {err}");
         }
 
         if first_index != haystack.len() {
@@ -2156,10 +2276,10 @@ fn utf8() {
     fn check_str_eq(a: String, b: String) {
         let mut i: isize = 0;
         for ab in a.bytes() {
-            println!("{}", i);
-            println!("{}", ab);
+            println!("{i}");
+            println!("{ab}");
             let bb: u8 = b.as_bytes()[i as usize];
-            println!("{}", bb);
+            println!("{bb}");
             assert_eq!(ab, bb);
             i += 1;
         }
@@ -2198,4 +2318,138 @@ fn utf8_chars() {
     assert!((!from_utf8(&[0xf0, 0x10]).is_ok()));
     assert!((!from_utf8(&[0xf0, 0xff, 0x10]).is_ok()));
     assert!((!from_utf8(&[0xf0, 0xff, 0xff, 0x10]).is_ok()));
+}
+
+#[test]
+fn utf8_char_counts() {
+    let strs = [("e", 1), ("é", 1), ("€", 1), ("\u{10000}", 1), ("eé€\u{10000}", 4)];
+    let spread = if cfg!(miri) { 4 } else { 8 };
+    let mut reps = [8, 64, 256, 512]
+        .iter()
+        .copied()
+        .flat_map(|n| n - spread..=n + spread)
+        .collect::<Vec<usize>>();
+    if cfg!(not(miri)) {
+        reps.extend([1024, 1 << 16].iter().copied().flat_map(|n| n - spread..=n + spread));
+    }
+    let counts = if cfg!(miri) { 0..1 } else { 0..8 };
+    let padding = counts.map(|len| " ".repeat(len)).collect::<Vec<String>>();
+
+    for repeat in reps {
+        for (tmpl_str, tmpl_char_count) in strs {
+            for pad_start in &padding {
+                for pad_end in &padding {
+                    // Create a string with padding...
+                    let with_padding =
+                        format!("{}{}{}", pad_start, tmpl_str.repeat(repeat), pad_end);
+                    // ...and then skip past that padding. This should ensure
+                    // that we test several different alignments for both head
+                    // and tail.
+                    let si = pad_start.len();
+                    let ei = with_padding.len() - pad_end.len();
+                    let target = &with_padding[si..ei];
+
+                    assert!(!target.starts_with(" ") && !target.ends_with(" "));
+                    let expected_count = tmpl_char_count * repeat;
+                    assert_eq!(
+                        expected_count,
+                        target.chars().count(),
+                        "wrong count for `{:?}.repeat({})` (padding: `{:?}`)",
+                        tmpl_str,
+                        repeat,
+                        (pad_start.len(), pad_end.len()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn floor_char_boundary() {
+    fn check_many(s: &str, arg: impl IntoIterator<Item = usize>, ret: usize) {
+        for idx in arg {
+            assert_eq!(
+                s.floor_char_boundary(idx),
+                ret,
+                "{:?}.floor_char_boundary({:?}) != {:?}",
+                s,
+                idx,
+                ret
+            );
+        }
+    }
+
+    // edge case
+    check_many("", [0, 1, isize::MAX as usize, usize::MAX], 0);
+
+    // basic check
+    check_many("x", [0], 0);
+    check_many("x", [1, isize::MAX as usize, usize::MAX], 1);
+
+    // 1-byte chars
+    check_many("jp", [0], 0);
+    check_many("jp", [1], 1);
+    check_many("jp", 2..4, 2);
+
+    // 2-byte chars
+    check_many("ĵƥ", 0..2, 0);
+    check_many("ĵƥ", 2..4, 2);
+    check_many("ĵƥ", 4..6, 4);
+
+    // 3-byte chars
+    check_many("日本", 0..3, 0);
+    check_many("日本", 3..6, 3);
+    check_many("日本", 6..8, 6);
+
+    // 4-byte chars
+    check_many("🇯🇵", 0..4, 0);
+    check_many("🇯🇵", 4..8, 4);
+    check_many("🇯🇵", 8..10, 8);
+}
+
+#[test]
+fn ceil_char_boundary() {
+    fn check_many(s: &str, arg: impl IntoIterator<Item = usize>, ret: usize) {
+        for idx in arg {
+            assert_eq!(
+                s.ceil_char_boundary(idx),
+                ret,
+                "{:?}.ceil_char_boundary({:?}) != {:?}",
+                s,
+                idx,
+                ret
+            );
+        }
+    }
+
+    // edge case
+    check_many("", [0], 0);
+
+    // basic check
+    check_many("x", [0], 0);
+    check_many("x", [1], 1);
+
+    // 1-byte chars
+    check_many("jp", [0], 0);
+    check_many("jp", [1], 1);
+    check_many("jp", [2], 2);
+
+    // 2-byte chars
+    check_many("ĵƥ", 0..=0, 0);
+    check_many("ĵƥ", 1..=2, 2);
+    check_many("ĵƥ", 3..=4, 4);
+
+    // 3-byte chars
+    check_many("日本", 0..=0, 0);
+    check_many("日本", 1..=3, 3);
+    check_many("日本", 4..=6, 6);
+
+    // 4-byte chars
+    check_many("🇯🇵", 0..=0, 0);
+    check_many("🇯🇵", 1..=4, 4);
+    check_many("🇯🇵", 5..=8, 8);
+
+    // above len
+    check_many("hello", 5..=10, 5);
 }

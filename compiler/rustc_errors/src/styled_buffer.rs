@@ -26,7 +26,7 @@ impl StyledBuffer {
         StyledBuffer { lines: vec![] }
     }
 
-    /// Returns content of `StyledBuffer` splitted by lines and line styles
+    /// Returns content of `StyledBuffer` split by lines and line styles
     pub fn render(&self) -> Vec<Vec<StyledString>> {
         // Tabs are assumed to have been replaced by spaces in calling code.
         debug_assert!(self.lines.iter().all(|r| !r.iter().any(|sc| sc.chr == '\t')));
@@ -142,7 +142,7 @@ impl StyledBuffer {
     pub fn set_style(&mut self, line: usize, col: usize, style: Style, overwrite: bool) {
         if let Some(ref mut line) = self.lines.get_mut(line) {
             if let Some(StyledChar { style: s, .. }) = line.get_mut(col) {
-                if overwrite || *s == Style::NoStyle || *s == Style::Quotation {
+                if overwrite || matches!(s, Style::NoStyle | Style::Quotation) {
                     *s = style;
                 }
             }

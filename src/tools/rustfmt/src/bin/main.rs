@@ -1,9 +1,12 @@
+#![feature(rustc_private)]
+
 use anyhow::{format_err, Result};
 
 use io::Error as IoError;
 use thiserror::Error;
 
 use rustfmt_nightly as rustfmt;
+use tracing_subscriber::EnvFilter;
 
 use std::collections::HashMap;
 use std::env;
@@ -19,14 +22,23 @@ use crate::rustfmt::{
     FormatReportFormatterBuilder, Input, Session, Verbosity,
 };
 
+const BUG_REPORT_URL: &str = "https://github.com/rust-lang/rustfmt/issues/new?labels=bug";
+
+// N.B. these crates are loaded from the sysroot, so they need extern crate.
+extern crate rustc_driver;
+
 fn main() {
-    env_logger::Builder::from_env("RUSTFMT_LOG").init();
+    rustc_driver::install_ice_hook(BUG_REPORT_URL, |_| ());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_env("RUSTFMT_LOG"))
+        .init();
     let opts = make_opts();
 
     let exit_code = match execute(&opts) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{}", e.to_string());
+            eprintln!("{e:#}");
             1
         }
     };
@@ -74,14 +86,10 @@ pub enum OperationError {
     /// An io error during reading or writing.
     #[error("{0}")]
     IoError(IoError),
-    /// Attempt to use --check with stdin, which isn't currently
-    /// supported.
-    #[error("The `--check` option is not supported with standard input.")]
-    CheckWithStdin,
-    /// Attempt to use --emit=json with stdin, which isn't currently
-    /// supported.
-    #[error("Using `--emit` other than stdout is not supported with standard input.")]
-    EmitWithStdin,
+    /// Attempt to use --emit with a mode which is not currently
+    /// supported with standard input.
+    #[error("Emit mode {0} not supported with standard output.")]
+    StdinBadEmit(EmitMode),
 }
 
 impl From<IoError> for OperationError {
@@ -140,7 +148,7 @@ fn make_opts() -> Options {
         "l",
         "files-with-diff",
         "Prints the names of mismatched files that were formatted. Prints the names of \
-         files that would be formated when used with `--check` mode. ",
+         files that would be formatted when used with `--check` mode. ",
     );
     opts.optmulti(
         "",
@@ -255,15 +263,20 @@ fn format_string(input: String, options: GetOptsOptions) -> Result<i32> {
     let (mut config, _) = load_config(Some(Path::new(".")), Some(options.clone()))?;
 
     if options.check {
-        return Err(OperationError::CheckWithStdin.into());
-    }
-    if let Some(emit_mode) = options.emit_mode {
-        if emit_mode != EmitMode::Stdout {
-            return Err(OperationError::EmitWithStdin.into());
+        config.set().emit_mode(EmitMode::Diff);
+    } else {
+        match options.emit_mode {
+            // Emit modes which work with standard input
+            // None means default, which is Stdout.
+            None | Some(EmitMode::Stdout) | Some(EmitMode::Checkstyle) | Some(EmitMode::Json) => {}
+            Some(emit_mode) => {
+                return Err(OperationError::StdinBadEmit(emit_mode).into());
+            }
         }
+        config
+            .set()
+            .emit_mode(options.emit_mode.unwrap_or(EmitMode::Stdout));
     }
-    // emit mode is always Stdout for Stdin.
-    config.set().emit_mode(EmitMode::Stdout);
     config.set().verbose(Verbosity::Quiet);
 
     // parse file_lines
@@ -271,7 +284,7 @@ fn format_string(input: String, options: GetOptsOptions) -> Result<i32> {
     for f in config.file_lines().files() {
         match *f {
             FileName::Stdin => {}
-            _ => eprintln!("Warning: Extra file listed in file_lines option '{}'", f),
+            _ => eprintln!("Warning: Extra file listed in file_lines option '{f}'"),
         }
     }
 
@@ -367,7 +380,7 @@ fn format_and_emit_report<T: Write>(session: &mut Session<'_, T>, input: Input) 
             }
         }
         Err(msg) => {
-            eprintln!("Error writing files: {}", msg);
+            eprintln!("Error writing files: {msg}");
             session.add_operational_error();
         }
     }
@@ -390,13 +403,9 @@ fn print_usage_to_stdout(opts: &Options, reason: &str) {
     let sep = if reason.is_empty() {
         String::new()
     } else {
-        format!("{}\n\n", reason)
+        format!("{reason}\n\n")
     };
-    let msg = format!(
-        "{}Format Rust code\n\nusage: {} [options] <file>...",
-        sep,
-        env::args_os().next().unwrap().to_string_lossy()
-    );
+    let msg = format!("{sep}Format Rust code\n\nusage: rustfmt [options] <file>...");
     println!("{}", opts.usage(&msg));
 }
 
@@ -410,7 +419,7 @@ are 1-based and inclusive of both end points. Specifying an empty array
 will result in no files being formatted. For example,
 
 ```
-rustfmt --file-lines '[
+rustfmt src/lib.rs src/foo.rs --file-lines '[
     {{\"file\":\"src/lib.rs\",\"range\":[7,13]}},
     {{\"file\":\"src/lib.rs\",\"range\":[21,29]}},
     {{\"file\":\"src/foo.rs\",\"range\":[10,11]}},
@@ -430,7 +439,7 @@ fn print_version() {
         include_str!(concat!(env!("OUT_DIR"), "/commit-info.txt"))
     );
 
-    println!("rustfmt {}", version_info);
+    println!("rustfmt {version_info}");
 }
 
 fn determine_operation(matches: &Matches) -> Result<Operation, OperationError> {
@@ -635,9 +644,9 @@ impl GetOptsOptions {
             match *f {
                 FileName::Real(ref f) if files.contains(f) => {}
                 FileName::Real(_) => {
-                    eprintln!("Warning: Extra file listed in file_lines option '{}'", f)
+                    eprintln!("Warning: Extra file listed in file_lines option '{f}'")
                 }
-                FileName::Stdin => eprintln!("Warning: Not a file '{}'", f),
+                FileName::Stdin => eprintln!("Warning: Not a file '{f}'"),
             }
         }
     }
@@ -693,6 +702,7 @@ fn edition_from_edition_str(edition_str: &str) -> Result<Edition> {
         "2015" => Ok(Edition::Edition2015),
         "2018" => Ok(Edition::Edition2018),
         "2021" => Ok(Edition::Edition2021),
+        "2024" => Ok(Edition::Edition2024),
         _ => Err(format_err!("Invalid value for `--edition`")),
     }
 }

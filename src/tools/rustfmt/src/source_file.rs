@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::config::FileName;
 use crate::emitter::{self, Emitter};
-use crate::syntux::session::ParseSess;
+use crate::parse::session::ParseSess;
 use crate::NewlineStyle;
 
 #[cfg(test)]
@@ -62,7 +62,7 @@ where
     fn ensure_real_path(filename: &FileName) -> &Path {
         match *filename {
             FileName::Real(ref path) => path,
-            _ => panic!("cannot format `{}` and emit to files", filename),
+            _ => panic!("cannot format `{filename}` and emit to files"),
         }
     }
 

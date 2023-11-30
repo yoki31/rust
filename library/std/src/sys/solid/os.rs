@@ -1,6 +1,6 @@
 use super::unsupported;
 use crate::error::Error as StdError;
-use crate::ffi::{CStr, CString, OsStr, OsString};
+use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::io;
 use crate::os::{
@@ -8,10 +8,11 @@ use crate::os::{
     solid::ffi::{OsStrExt, OsStringExt},
 };
 use crate::path::{self, PathBuf};
-use crate::sys_common::rwlock::StaticRWLock;
+use crate::sync::{PoisonError, RwLock};
+use crate::sys::common::small_c_string::run_with_cstr;
 use crate::vec;
 
-use super::{abi, error, itron, memchr};
+use super::{error, itron, memchr};
 
 // `solid` directly maps `errno`s to μITRON error codes.
 impl itron::error::ItronError {
@@ -26,7 +27,7 @@ pub fn errno() -> i32 {
 }
 
 pub fn error_string(errno: i32) -> String {
-    if let Some(name) = error::error_name(errno) { name.to_owned() } else { format!("{}", errno) }
+    if let Some(name) = error::error_name(errno) { name.to_owned() } else { format!("{errno}") }
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
@@ -78,10 +79,42 @@ pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()
 }
 
-static ENV_LOCK: StaticRWLock = StaticRWLock::new();
+static ENV_LOCK: RwLock<()> = RwLock::new(());
+
+pub fn env_read_lock() -> impl Drop {
+    ENV_LOCK.read().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub struct Env {
     iter: vec::IntoIter<(OsString, OsString)>,
+}
+
+// FIXME(https://github.com/rust-lang/rust/issues/114583): Remove this when <OsStr as Debug>::fmt matches <str as Debug>::fmt.
+pub struct EnvStrDebug<'a> {
+    slice: &'a [(OsString, OsString)],
+}
+
+impl fmt::Debug for EnvStrDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { slice } = self;
+        f.debug_list()
+            .entries(slice.iter().map(|(a, b)| (a.to_str().unwrap(), b.to_str().unwrap())))
+            .finish()
+    }
+}
+
+impl Env {
+    pub fn str_debug(&self) -> impl fmt::Debug + '_ {
+        let Self { iter } = self;
+        EnvStrDebug { slice: iter.as_slice() }
+    }
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { iter } = self;
+        f.debug_list().entries(iter.as_slice()).finish()
+    }
 }
 
 impl !Send for Env {}
@@ -105,7 +138,7 @@ pub fn env() -> Env {
     }
 
     unsafe {
-        let _guard = ENV_LOCK.read();
+        let _guard = env_read_lock();
         let mut result = Vec::new();
         if !environ.is_null() {
             while !(*environ).is_null() {
@@ -139,45 +172,43 @@ pub fn env() -> Env {
 pub fn getenv(k: &OsStr) -> Option<OsString> {
     // environment variables with a nul byte can't be set, so their value is
     // always None as well
-    let k = CString::new(k.as_bytes()).ok()?;
-    unsafe {
-        let _guard = ENV_LOCK.read();
-        let s = libc::getenv(k.as_ptr()) as *const libc::c_char;
-        if s.is_null() {
-            None
+    run_with_cstr(k.as_bytes(), |k| {
+        let _guard = env_read_lock();
+        let v = unsafe { libc::getenv(k.as_ptr()) } as *const libc::c_char;
+
+        if v.is_null() {
+            Ok(None)
         } else {
-            Some(OsStringExt::from_vec(CStr::from_ptr(s).to_bytes().to_vec()))
+            // SAFETY: `v` cannot be mutated while executing this line since we've a read lock
+            let bytes = unsafe { CStr::from_ptr(v) }.to_bytes().to_vec();
+
+            Ok(Some(OsStringExt::from_vec(bytes)))
         }
-    }
+    })
+    .ok()
+    .flatten()
 }
 
 pub fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
-    let k = CString::new(k.as_bytes())?;
-    let v = CString::new(v.as_bytes())?;
-
-    unsafe {
-        let _guard = ENV_LOCK.write();
-        cvt_env(libc::setenv(k.as_ptr(), v.as_ptr(), 1)).map(drop)
-    }
+    run_with_cstr(k.as_bytes(), |k| {
+        run_with_cstr(v.as_bytes(), |v| {
+            let _guard = ENV_LOCK.write();
+            cvt_env(unsafe { libc::setenv(k.as_ptr(), v.as_ptr(), 1) }).map(drop)
+        })
+    })
 }
 
 pub fn unsetenv(n: &OsStr) -> io::Result<()> {
-    let nbuf = CString::new(n.as_bytes())?;
-
-    unsafe {
+    run_with_cstr(n.as_bytes(), |nbuf| {
         let _guard = ENV_LOCK.write();
-        cvt_env(libc::unsetenv(nbuf.as_ptr())).map(drop)
-    }
+        cvt_env(unsafe { libc::unsetenv(nbuf.as_ptr()) }).map(drop)
+    })
 }
 
 /// In kmclib, `setenv` and `unsetenv` don't always set `errno`, so this
 /// function just returns a generic error.
 fn cvt_env(t: c_int) -> io::Result<c_int> {
-    if t == -1 {
-        Err(io::Error::new_const(io::ErrorKind::Uncategorized, &"failure"))
-    } else {
-        Ok(t)
-    }
+    if t == -1 { Err(io::const_io_error!(io::ErrorKind::Uncategorized, "failure")) } else { Ok(t) }
 }
 
 pub fn temp_dir() -> PathBuf {
@@ -188,11 +219,8 @@ pub fn home_dir() -> Option<PathBuf> {
     None
 }
 
-pub fn exit(_code: i32) -> ! {
-    let tid = itron::task::try_current_task_id().unwrap_or(0);
-    loop {
-        abi::breakpoint_program_exited(tid as usize);
-    }
+pub fn exit(code: i32) -> ! {
+    rtabort!("exit({}) called", code);
 }
 
 pub fn getpid() -> u32 {

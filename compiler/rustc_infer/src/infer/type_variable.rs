@@ -14,6 +14,7 @@ use std::ops::Range;
 use rustc_data_structures::undo_log::{Rollback, UndoLogs};
 
 /// Represents a single undo-able action that affects a type inference variable.
+#[derive(Clone)]
 pub(crate) enum UndoLog<'tcx> {
     EqRelation(sv::UndoLog<ut::Delegate<TyVidEqKey<'tcx>>>),
     SubRelation(sv::UndoLog<ut::Delegate<ty::TyVid>>),
@@ -58,6 +59,7 @@ impl<'tcx> Rollback<UndoLog<'tcx>> for TypeVariableStorage<'tcx> {
     }
 }
 
+#[derive(Clone)]
 pub struct TypeVariableStorage<'tcx> {
     values: sv::SnapshotVecStorage<Delegate>,
 
@@ -71,10 +73,10 @@ pub struct TypeVariableStorage<'tcx> {
     /// table exists only to help with the occurs check. In particular,
     /// we want to report constraints like these as an occurs check
     /// violation:
-    ///
-    ///     ?1 <: ?3
-    ///     Box<?3> <: ?1
-    ///
+    /// ``` text
+    /// ?1 <: ?3
+    /// Box<?3> <: ?1
+    /// ```
     /// Without this second table, what would happen in a case like
     /// this is that we would instantiate `?1` with a generalized
     /// type like `Box<?6>`. We would then relate `Box<?3> <: Box<?6>`
@@ -120,13 +122,13 @@ pub enum TypeVariableOriginKind {
     MiscVariable,
     NormalizeProjectionType,
     TypeInference,
-    TypeParameterDefinition(Symbol, Option<DefId>),
+    OpaqueTypeInference(DefId),
+    TypeParameterDefinition(Symbol, DefId),
 
-    /// One of the upvars or closure kind parameters in a `ClosureSubsts`
+    /// One of the upvars or closure kind parameters in a `ClosureArgs`
     /// (before it has been determined).
     // FIXME(eddyb) distinguish upvar inference variables from the rest.
     ClosureSynthetic,
-    SubstitutionPlaceholder,
     AutoDeref,
     AdjustmentType,
 
@@ -137,6 +139,7 @@ pub enum TypeVariableOriginKind {
     LatticeVariable,
 }
 
+#[derive(Clone)]
 pub(crate) struct TypeVariableData {
     origin: TypeVariableOrigin,
 }
@@ -165,6 +168,7 @@ impl<'tcx> TypeVariableValue<'tcx> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Instantiate;
 
 pub(crate) struct Delegate;
@@ -184,6 +188,11 @@ impl<'tcx> TypeVariableStorage<'tcx> {
         undo_log: &'a mut InferCtxtUndoLogs<'tcx>,
     ) -> TypeVariableTable<'a, 'tcx> {
         TypeVariableTable { storage: self, undo_log }
+    }
+
+    #[inline]
+    pub(crate) fn eq_relations_ref(&self) -> &ut::UnificationTableStorage<TyVidEqKey<'tcx>> {
+        &self.eq_relations
     }
 }
 
@@ -259,7 +268,7 @@ impl<'tcx> TypeVariableTable<'_, 'tcx> {
         let index = self.values().push(TypeVariableData { origin });
         assert_eq!(eq_key.vid.as_u32(), index as u32);
 
-        debug!("new_var(index={:?}, universe={:?}, origin={:?}", eq_key.vid, universe, origin,);
+        debug!("new_var(index={:?}, universe={:?}, origin={:?})", eq_key.vid, universe, origin);
 
         eq_key.vid
     }
@@ -283,8 +292,9 @@ impl<'tcx> TypeVariableTable<'_, 'tcx> {
     /// related via equality or subtyping will yield the same root
     /// variable (per the union-find algorithm), so `sub_root_var(a)
     /// == sub_root_var(b)` implies that:
-    ///
-    ///     exists X. (a <: X || X <: a) && (b <: X || X <: b)
+    /// ```text
+    /// exists X. (a <: X || X <: a) && (b <: X || X <: b)
+    /// ```
     pub fn sub_root_var(&mut self, vid: ty::TyVid) -> ty::TyVid {
         self.sub_relations().find(vid)
     }
@@ -412,6 +422,7 @@ impl<'tcx> ut::UnifyKey for TyVidEqKey<'tcx> {
     fn index(&self) -> u32 {
         self.vid.as_u32()
     }
+    #[inline]
     fn from_index(i: u32) -> Self {
         TyVidEqKey::from(ty::TyVid::from_u32(i))
     }
@@ -426,7 +437,7 @@ impl<'tcx> ut::UnifyValue for TypeVariableValue<'tcx> {
     fn unify_values(value1: &Self, value2: &Self) -> Result<Self, ut::NoError> {
         match (value1, value2) {
             // We never equate two type variables, both of which
-            // have known types.  Instead, we recursively equate
+            // have known types. Instead, we recursively equate
             // those types.
             (&TypeVariableValue::Known { .. }, &TypeVariableValue::Known { .. }) => {
                 bug!("equating two type variables, both of which have known types")
